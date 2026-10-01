@@ -36,3 +36,23 @@ class ContactFlow(JsonStore):
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
         return sorted((r for r in data.get("followups", []) if r["contact_id"] == contact_id), key=lambda r: r["on"])
+
+    def merge_contacts(self, source_id, target_id):
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        if source_id == target_id:
+            raise ValueError("source_id and target_id must differ")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        if source_id not in contacts or target_id not in contacts:
+            raise ValueError("unknown contact")
+        moved = 0
+        # Reassign entries in place so same-day records keep their stored relative order.
+        for entry in data.get("followups", []):
+            if entry["contact_id"] == source_id:
+                entry["contact_id"] = target_id
+                moved += 1
+        target = contacts[target_id]
+        del contacts[source_id]
+        self._write(data)
+        return {"contact": target, "moved_followups": moved}

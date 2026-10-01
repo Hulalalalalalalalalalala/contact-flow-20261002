@@ -27,6 +27,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `follow-up` → `ContactFlow.follow_up(...)`。参数名见 `core.py` 的公开方法签名。
 - `find` → `ContactFlow.find(...)`。参数名见 `core.py` 的公开方法签名。
 - `timeline` → `ContactFlow.timeline(...)`。参数名见 `core.py` 的公开方法签名。
+- `merge` → `ContactFlow.merge_contacts(source_id, target_id)`：把源联系人的全部跟进记录归入目标联系人后删除源；返回 `{"contact": 目标联系人, "moved_followups": 转移记录数}`。标识去除首尾空白后查找（仍区分大小写）；标识为空、两者相同或任一联系人不存在均报错且不改动数据。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
