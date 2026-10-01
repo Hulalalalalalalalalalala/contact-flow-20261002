@@ -91,6 +91,94 @@ class ProductTests(unittest.TestCase):
         json.loads(partial.stderr)
         self.assertEqual([c["contact_id"] for c in ContactFlow(self.root).find()], ["A"])
 
+    def test_tags_default_empty_normalized_persisted_and_cleared(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.assertEqual(self.app.get_tags(" A "), [])
+        self.assertEqual(self.app.set_tags("A", [" VIP ", "vip", "华东"]), ["vip", "华东"])
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["vip", "华东"])
+        self.assertEqual(self.app.set_tags("A", []), [])
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), [])
+
+    def test_find_filters_by_tags_all_any_and_organization(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip", "north"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tags=["VIP"])], ["A", "B"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tags=["vip", "华东"])], ["A"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tags=["vip", "north"], tag_mode="any")], ["A", "B"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(organization="books", tags=["north"])], ["B"])
+        self.assertEqual(self.app.find(tags=None), self.app.find(tags=[]))
+        self.assertEqual(self.app.find(tags=["missing"]), [])
+        # contact return structure is unchanged
+        self.assertEqual(self.app.find(tags=["vip"])[0], {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+
+    def test_tag_validation_rejects_without_partial_or_file_changes(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for bad_id in ["", "  ", None, 5]:
+            with self.assertRaises(ValueError):
+                self.app.set_tags(bad_id, ["x"])
+            with self.assertRaises(ValueError):
+                self.app.get_tags(bad_id)
+        with self.assertRaises(ValueError):
+            self.app.set_tags("ZZZ", ["x"])
+        for bad_tags in [["ok", 1], ["ok", None], ["  "], "vip", ("vip",), {"vip": 1}]:
+            with self.assertRaises(ValueError):
+                self.app.set_tags("A", bad_tags)
+        self.app.set_tags("A", ["vip"])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_tags("A", ["ok", "   "])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.get_tags("A"), ["vip"])
+        for kwargs in [{"tags": ["x", 1]}, {"tag_mode": "weird"}, {"tags": [], "tag_mode": "ALL"}]:
+            with self.assertRaises(ValueError):
+                self.app.find(**kwargs)
+        empty = Path(self.temp.name) / "empty"
+        fresh = ContactFlow(empty)
+        with self.assertRaises(ValueError):
+            fresh.set_tags("A", ["x"])
+        self.assertFalse(fresh.path.exists())
+
+    def test_merge_unions_normalized_tags_and_removes_source_tags(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["VIP", "华东"])
+        self.app.set_tags("B", ["vip", "north"])
+        self.app.follow_up("B", "2026-10-01", "Note")
+        result = self.app.merge_contacts("B", "A")
+        self.assertEqual(result["contact"], {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["north", "vip", "华东"])
+        with self.assertRaises(ValueError):
+            reopened.get_tags("B")
+
+    def test_cli_tags_and_tagged_find(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        payload = self.root / "tags.json"
+        payload.write_text(json.dumps({"contact_id": "A", "tags": [" VIP ", "华东"]}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "set-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), ["vip", "华东"])
+        payload.write_text(json.dumps({"contact_id": "A"}), encoding="utf-8")
+        got = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "get-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(json.loads(got.stdout), ["vip", "华东"])
+        payload.write_text(json.dumps({"tags": ["VIP"], "tag_mode": "all"}), encoding="utf-8")
+        found = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual([c["contact_id"] for c in json.loads(found.stdout)], ["A"])
+        payload.write_text(json.dumps({"contact_id": "A", "tags": [1]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "set-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        payload.write_text(json.dumps([{"contact_id": "A", "tags": ["x"]}, {"contact_id": "A", "tags": "bad"}]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "set-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["x"])
+
     def test_cli_demo_and_invalid_action(self):
         result = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "demo"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)

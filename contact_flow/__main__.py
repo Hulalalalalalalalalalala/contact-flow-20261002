@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import ContactFlow
 
-ACTIONS = {'add': 'add_contact', 'follow-up': 'follow_up', 'find': 'find', 'timeline': 'timeline', 'merge': 'merge_contacts'}
+ACTIONS = {'add': 'add_contact', 'follow-up': 'follow_up', 'find': 'find', 'timeline': 'timeline', 'merge': 'merge_contacts', 'set-tags': 'set_tags', 'get-tags': 'get_tags'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))
