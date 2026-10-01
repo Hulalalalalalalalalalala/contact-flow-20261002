@@ -1,0 +1,14 @@
+[
+  {
+    "contact_id": "C-001",
+    "name": "陈小明",
+    "email": "Ming@example.test",
+    "organization": "春山书店"
+  },
+  {
+    "contact_id": "C-002",
+    "name": "李小雨",
+    "email": "yu@example.test",
+    "organization": "秋水书店"
+  }
+]
