@@ -838,6 +838,64 @@ class ContactFlow(JsonStore):
 
         return {"records": records, "csv": buffer.getvalue()}
 
+    def stage_change_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
+        start_on = calendar_day(start_on, "start_on")
+        end_on = calendar_day(end_on, "end_on")
+        if start_on > end_on:
+            raise ValueError("start_on must not be later than end_on")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        history_store = data.get("stage_history", {})
+        records = []
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            for entry in history_store.get(opportunity["opportunity_id"], []):
+                # Only saved history with a non-null date inside the inclusive
+                # range counts; nothing is back-filled for deals without records.
+                if entry["on"] is None or not start_on <= entry["on"] <= end_on:
+                    continue
+                records.append({"opportunity_id": opportunity["opportunity_id"],
+                                "contact_id": contact["contact_id"],
+                                "title": opportunity["title"],
+                                "organization": contact["organization"],
+                                "from_stage": entry["from_stage"],
+                                "to_stage": entry["to_stage"],
+                                "on": entry["on"]})
+        # Ascending date, then opportunity id code point; the stable sort keeps
+        # save order among entries sharing the same day and opportunity.
+        records.sort(key=lambda record: (record["on"], record["opportunity_id"]))
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("opportunity_id", "contact_id", "title", "organization",
+                         "from_stage", "to_stage", "on"))
+        for record in records:
+            writer.writerow((record["opportunity_id"], record["contact_id"], record["title"],
+                             record["organization"], record["from_stage"], record["to_stage"],
+                             record["on"]))
+        return {"records": records, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):

@@ -1870,6 +1870,196 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def seed_stage_changes(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_tags("A", ["VIP", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.add_opportunity("O1", "A", "Alpha deal")
+        self.app.add_opportunity("O2", "B", "Beta deal")
+        self.app.add_opportunity("O3", "C", "Gamma deal")
+        self.app.add_opportunity("O4", "A", "Delta deal")
+        # O1: two changes on the same day keep save order; null-on record excluded.
+        self.app.set_stage("O1", "qualified", "2026-10-02")
+        self.app.set_stage("O1", "won", "2026-10-02")
+        # O2: one in-range change, one out-of-range change.
+        self.app.set_stage("O2", "qualified", "2026-10-01")
+        self.app.set_stage("O2", "won", "2026-10-05")
+        # O3: only a null-date change, so it never appears.
+        self.app.set_stage("O3", "qualified")
+        # O4: no history at all; nothing is back-filled.
+
+    def test_stage_change_report_content_and_order(self):
+        self.seed_stage_changes()
+        report = self.app.stage_change_report("2026-10-01", "2026-10-03")
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual([(r["opportunity_id"], r["from_stage"], r["to_stage"], r["on"])
+                          for r in report["records"]],
+                         [("O2", "new", "qualified", "2026-10-01"),
+                          ("O1", "new", "qualified", "2026-10-02"),
+                          ("O1", "qualified", "won", "2026-10-02")])
+        for record in report["records"]:
+            self.assertEqual(set(record), {"opportunity_id", "contact_id", "title",
+                                           "organization", "from_stage", "to_stage", "on"})
+        self.assertEqual(report["records"][1],
+                         {"opportunity_id": "O1", "contact_id": "A", "title": "Alpha deal",
+                          "organization": "Books", "from_stage": "new",
+                          "to_stage": "qualified", "on": "2026-10-02"})
+        # Inclusive bounds: a single-day range returns that day's entries.
+        single = self.app.stage_change_report("2026-10-02", "2026-10-02")
+        self.assertEqual([r["opportunity_id"] for r in single["records"]], ["O1", "O1"])
+        # O3's null-date record and O4's missing history produce nothing.
+        self.assertNotIn("O3", [r["opportunity_id"] for r in report["records"]])
+        self.assertNotIn("O4", [r["opportunity_id"] for r in report["records"]])
+
+    def test_stage_change_report_csv_matches_records(self):
+        self.seed_stage_changes()
+        report = self.app.stage_change_report("2026-10-01", "2026-10-05")
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["opportunity_id", "contact_id", "title", "organization",
+                                   "from_stage", "to_stage", "on"])
+        decoded = [dict(zip(rows[0], row)) for row in rows[1:]]
+        self.assertEqual(decoded, report["records"])
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["records"]) + 1)
+
+    def test_stage_change_report_csv_escapes_and_preserves_internal_newlines(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books, \"店\"")
+        self.app.add_opportunity("O1", "A", "line one\nline two")
+        self.app.set_stage("O1", "qualified", "2026-10-01")
+        report = self.app.stage_change_report("2026-10-01", "2026-10-01")
+        self.assertIn('"line one\nline two","Books, ""店""",new,qualified,2026-10-01',
+                      report["csv"])
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[1][2], "line one\nline two")
+        self.assertEqual(rows[1][3], "Books, \"店\"")
+
+    def test_stage_change_report_filters_organization_tags_and_intersection(self):
+        self.seed_stage_changes()
+        by_org = self.app.stage_change_report("2026-10-01", "2026-10-03", organization=" BOOKS ")
+        self.assertEqual([r["opportunity_id"] for r in by_org["records"]], ["O2", "O1", "O1"])
+        tagged = self.app.stage_change_report("2026-10-01", "2026-10-03", tags=["VIP"])
+        self.assertEqual([r["opportunity_id"] for r in tagged["records"]], ["O2", "O1", "O1"])
+        both = self.app.stage_change_report("2026-10-01", "2026-10-03", tags=["vip", "华东"])
+        self.assertEqual([r["opportunity_id"] for r in both["records"]], ["O1", "O1"])
+        any_tag = self.app.stage_change_report("2026-10-01", "2026-10-03",
+                                               tags=["vip", "missing"], tag_mode="any")
+        self.assertEqual([r["opportunity_id"] for r in any_tag["records"]], ["O2", "O1", "O1"])
+        # Organization and tag conditions intersect.
+        self.assertEqual(self.app.stage_change_report("2026-10-01", "2026-10-03",
+                                                      organization="Music", tags=["vip"])["records"], [])
+        # None and empty list leave tags unrestricted.
+        self.assertEqual(self.app.stage_change_report("2026-10-01", "2026-10-03", tags=None),
+                         self.app.stage_change_report("2026-10-01", "2026-10-03", tags=[]))
+
+    def test_stage_change_report_empty_and_legacy_data(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.stage_change_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"], "opportunity_id,contact_id,title,organization,from_stage,to_stage,on\n")
+        self.assertFalse(fresh_root.exists())
+        # Contacts and opportunities but no stage history: empty records, header-only CSV.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O1", "A", "Deal")
+        report = self.app.stage_change_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"], "opportunity_id,contact_id,title,organization,from_stage,to_stage,on\n")
+
+    def test_stage_change_report_uses_current_ownership_profile_and_tags(self):
+        self.seed_stage_changes()
+        self.app.update_contact("A", {"name": "Alice Wang", "organization": "Music"})
+        report = self.app.stage_change_report("2026-10-01", "2026-10-03")
+        self.assertEqual(report["records"][1]["organization"], "Music")
+        # Organization filter follows the current value.
+        self.assertEqual(self.app.stage_change_report("2026-10-01", "2026-10-03",
+                                                      organization="books")["records"][0]["opportunity_id"], "O2")
+        # Transfer: O1 now belongs to B and displays B's current organization.
+        self.app.transfer_opportunities([{"opportunity_id": "O1", "source_contact_id": "A",
+                                          "target_contact_id": "B"}])
+        moved = self.app.stage_change_report("2026-10-01", "2026-10-03")
+        self.assertEqual([r["contact_id"] for r in moved["records"]], ["B", "B", "B"])
+        self.assertEqual(moved["records"][1]["organization"], "books")
+        # History dates and stages are unchanged and not duplicated.
+        self.assertEqual([(r["from_stage"], r["to_stage"], r["on"]) for r in moved["records"]],
+                         [("new", "qualified", "2026-10-01"),
+                          ("new", "qualified", "2026-10-02"),
+                          ("qualified", "won", "2026-10-02")])
+        # Merge: B's opportunities move to A and filter by A's current profile and tags.
+        self.app.merge_contacts("B", "A")
+        merged = self.app.stage_change_report("2026-10-01", "2026-10-03", tags=["vip"])
+        self.assertEqual([r["contact_id"] for r in merged["records"]], ["A", "A", "A"])
+        self.assertEqual(merged["records"][0]["organization"], "Music")
+
+    def test_stage_change_report_validates_arguments_without_writing(self):
+        self.seed_stage_changes()
+        before = self.app.path.read_bytes()
+        bad_dates = [None, 5, "", "   ", "2026-1-1", "20261002", "2026-13-01", "2026-02-30"]
+        for bad in bad_dates:
+            with self.assertRaises(ValueError):
+                self.app.stage_change_report(bad, "2026-10-02")
+            with self.assertRaises(ValueError):
+                self.app.stage_change_report("2026-10-01", bad)
+        with self.assertRaises(ValueError):
+            self.app.stage_change_report("2026-10-03", "2026-10-02")
+        for kwargs in [{"organization": 5}, {"organization": ["x"]},
+                       {"tags": ["ok", 1]}, {"tags": "vip"},
+                       {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.stage_change_report("2026-10-01", "2026-10-02", **kwargs)
+        with self.assertRaises(TypeError):
+            self.app.stage_change_report()
+        with self.assertRaises(TypeError):
+            self.app.stage_change_report("2026-10-01")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Legal leap day is accepted.
+        self.assertEqual(self.app.stage_change_report("2024-02-29", "2024-02-29")["records"], [])
+        # Validation also applies when there is no data at all, creating nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.stage_change_report("2026-02-30", "2026-10-02")
+        with self.assertRaises(ValueError):
+            fresh.stage_change_report("2026-10-02", "2026-10-01")
+        with self.assertRaises(ValueError):
+            fresh.stage_change_report("2026-10-01", "2026-10-02", tag_mode="weird")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_cli_stage_change_report_success_and_failure(self):
+        self.seed_stage_changes()
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"start_on": "2026-10-01", "end_on": "2026-10-02"}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "stage-change-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual(len(report["records"]), 3)
+        # Filters pass through; array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "organization": "books"},
+            {"start_on": "2026-10-02", "end_on": "2026-10-02", "tags": ["vip", "华东"]},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "stage-change-report", str(payload)], text=True,
+                               capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["opportunity_id"] for r in values[0]["records"]], ["O2", "O1", "O1"])
+        self.assertEqual([r["opportunity_id"] for r in values[1]["records"]], ["O1", "O1"])
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"start_on": "2026-10-02", "end_on": "2026-10-01"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "stage-change-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def seed_inactive(self):
         # A: last on/before 2026-10-05 is the last saved entry on 2026-10-02 (idle 3);
         # B: last 2026-09-01 (idle 34); C: recent 2026-10-04 (idle 1);
