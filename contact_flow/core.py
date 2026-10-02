@@ -457,6 +457,58 @@ class ContactFlow(JsonStore):
             (o for o in data.get("opportunities", {}).values() if matches(o)),
             key=lambda o: o["opportunity_id"])]
 
+    def transfer_opportunities(self, transfers):
+        # The whole batch validates before any ownership changes, so a rejected
+        # transfer never leaves an opportunity on a half-updated contact.
+        if not isinstance(transfers, list):
+            raise ValueError("transfers must be a list")
+        if not transfers:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        TRANSFER_KEYS = {"opportunity_id", "source_contact_id", "target_contact_id"}
+        entries = []
+        seen = set()
+        for item in transfers:
+            if not isinstance(item, dict) or set(item) != TRANSFER_KEYS:
+                raise ValueError(
+                    "each transfer must be an object with exactly opportunity_id, "
+                    "source_contact_id and target_contact_id")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            source_contact_id = text(item["source_contact_id"], "source_contact_id")
+            target_contact_id = text(item["target_contact_id"], "target_contact_id")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even an
+            # identical item, or handing the same deal along twice) rejects it all.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in transfers")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, source_contact_id, target_contact_id))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        opportunities = data.get("opportunities", {})
+        results = []
+        changed = False
+        for opportunity_id, source_contact_id, target_contact_id in entries:
+            if source_contact_id not in contacts or target_contact_id not in contacts:
+                raise ValueError("unknown contact")
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            # The claimed source must match the opportunity's actual current owner.
+            if opportunity["contact_id"] != source_contact_id:
+                raise ValueError("opportunity is not owned by source contact")
+            if opportunity["contact_id"] != target_contact_id:
+                changed = True
+            results.append(dict(opportunity))
+            results[-1]["contact_id"] = target_contact_id
+        if not changed:
+            # Source and target identical for every item: report the originals
+            # without rewriting the file.
+            return results
+        for opportunity_id, _, target_contact_id in entries:
+            opportunities[opportunity_id]["contact_id"] = target_contact_id
+        self._write(data)
+        return results
+
     def merge_contacts(self, source_id, target_id):
         source_id, target_id = text(source_id, "source_id"), text(target_id, "target_id")
         if source_id == target_id:
