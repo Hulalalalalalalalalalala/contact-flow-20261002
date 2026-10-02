@@ -159,6 +159,40 @@ class ContactFlow(JsonStore):
         self._write(data)
         return True
 
+    def complete_reminder(self, contact_id, on, note, next_reminder=None):
+        contact_id = text(contact_id, "contact_id")
+        note = text(note, "note")
+        on = calendar_day(on, "on")
+        next_due = next_note = None
+        if next_reminder is not None:
+            if not isinstance(next_reminder, dict):
+                raise ValueError("next_reminder must be an object")
+            if set(next_reminder) != {"due_on", "note"}:
+                raise ValueError("next_reminder must contain exactly due_on and note")
+            next_note = text(next_reminder["note"], "note")
+            next_due = calendar_day(next_reminder["due_on"], "due_on")
+            if next_due <= on:
+                raise ValueError("next reminder due_on must be later than the completion date")
+        data = self._read()
+        if contact_id not in data.get("contacts", {}):
+            raise ValueError("unknown contact")
+        store = data.get("reminders", {})
+        if contact_id not in store:
+            raise ValueError("no current reminder")
+        # All validation happens above: the followup append and the reminder
+        # replacement commit together in a single atomic write.
+        entry = {"contact_id": contact_id, "on": on, "note": note}
+        data.setdefault("followups", []).append(entry)
+        del store[contact_id]
+        if next_reminder is not None:
+            store[contact_id] = {"contact_id": contact_id, "due_on": next_due, "note": next_note}
+        if not store:
+            data.pop("reminders", None)
+        self._write(data)
+        reminder = ({"contact_id": contact_id, "due_on": next_due, "note": next_note}
+                    if next_reminder is not None else None)
+        return {"followup": entry, "reminder": reminder}
+
     def due_reminders(self, as_of):
         as_of = calendar_day(as_of, "as_of")
         data = self._read()
