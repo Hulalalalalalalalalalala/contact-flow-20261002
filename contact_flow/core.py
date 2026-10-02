@@ -4,6 +4,7 @@ from datetime import date
 from .storage import JsonStore, text, calendar_day
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
+UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
 
@@ -34,6 +35,36 @@ class ContactFlow(JsonStore):
         contacts[contact_id] = contact
         self._write(data)
         return contact
+
+    def update_contact(self, contact_id, changes):
+        contact_id = text(contact_id, "contact_id")
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must be a nonempty object")
+        if any(field not in UPDATABLE_FIELDS for field in changes):
+            raise ValueError("changes may only contain name, email, organization")
+        updates = {}
+        for field, value in changes.items():
+            value = text(value, field)
+            if field == "email":
+                value = value.lower()
+                if value.count("@") != 1 or any(c.isspace() for c in value) or not all(value.split("@")):
+                    raise ValueError("invalid email")
+            updates[field] = value
+        data = self._read()
+        contacts = data.get("contacts", {})
+        contact = contacts.get(contact_id)
+        if contact is None:
+            raise ValueError("unknown contact")
+        new_email = updates.get("email")
+        if new_email is not None and new_email != contact["email"] and \
+                any(other["email"] == new_email for other_id, other in contacts.items() if other_id != contact_id):
+            raise ValueError("email already exists")
+        # Every provided field already matches: report the contact without rewriting.
+        if all(contact[field] == value for field, value in updates.items()):
+            return dict(contact)
+        contact.update(updates)
+        self._write(data)
+        return dict(contact)
 
     def import_contacts(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():

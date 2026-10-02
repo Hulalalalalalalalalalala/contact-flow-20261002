@@ -24,6 +24,7 @@ python3 -m contact_flow --root ./state add examples/contacts.json
 JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后续失败不会回滚整批。重跑登记命令遇到已存在的标识会报错。
 
 - `add` → `ContactFlow.add_contact(...)`。参数名见 `core.py` 的公开方法签名。
+- `update-contact` → `ContactFlow.update_contact(contact_id, changes)`。局部修改已登记联系人的资料，`changes` 为非空对象，只允许 `name`、`email`、`organization` 中的一个或多个字段，未提供的字段保留原值；标识保持不变，返回与 `add` 相同结构的完整联系人。`contact_id` 去除首尾空白后须非空且区分大小写，标识非法或联系人不存在均抛 `ValueError`。`changes` 不是对象、为空、含其他键，或字段值不是字符串、去空白后为空（`None` 不代表清空）均抛 `ValueError`。姓名和组织只去首尾空白、保留内部空白；邮箱去空白后转小写，规则与 `add` 相同，规范化后与其他联系人重复时拒绝（与自身当前邮箱相同则允许）。一次调用的全部字段共同成功或共同失败，任何拒绝都不改写数据文件；所有字段规范化后与当前值相同时返回当前联系人且不写文件。组织修改立即反映到 `find` 的组织筛选和 `funnel-report` 的分组与 CSV，标签、跟进、机会、提醒保持不变；旧邮箱可重新登记，新邮箱受既有登记与导入去重约束。
 - `follow-up` → `ContactFlow.follow_up(...)`。参数名见 `core.py` 的公开方法签名。
 - `find` → `ContactFlow.find(...)`。参数名见 `core.py` 的公开方法签名。
 - `timeline` → `ContactFlow.timeline(...)`。参数名见 `core.py` 的公开方法签名。
