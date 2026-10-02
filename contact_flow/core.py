@@ -38,8 +38,8 @@ class ContactFlow(JsonStore):
         self._write(data)
         return contact
 
-    def update_contact(self, contact_id, changes):
-        contact_id = text(contact_id, "contact_id")
+    @staticmethod
+    def _normalized_changes(changes):
         if not isinstance(changes, dict) or not changes:
             raise ValueError("changes must be a nonempty object")
         normalized = {}
@@ -53,6 +53,11 @@ class ContactFlow(JsonStore):
                 if clean.count("@") != 1 or any(c.isspace() for c in clean) or not all(clean.split("@")):
                     raise ValueError("invalid email")
             normalized[key] = clean
+        return normalized
+
+    def update_contact(self, contact_id, changes):
+        contact_id = text(contact_id, "contact_id")
+        normalized = self._normalized_changes(changes)
         data = self._read()
         contacts = data.get("contacts", {})
         contact = contacts.get(contact_id)
@@ -69,6 +74,52 @@ class ContactFlow(JsonStore):
         contact.update(normalized)
         self._write(data)
         return contact
+
+    def update_contacts(self, updates):
+        # Only a JSON array is accepted; an empty batch reports [] without reading or writing.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            return []
+        entries = []
+        seen_ids = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != {"contact_id", "changes"}:
+                raise ValueError("each update must be an object with exactly contact_id and changes")
+            contact_id = text(item["contact_id"], "contact_id")
+            if contact_id in seen_ids:
+                # Duplicate ids reject the whole batch, even when the changes are identical.
+                raise ValueError("duplicate contact id in updates")
+            seen_ids.add(contact_id)
+            entries.append((contact_id, self._normalized_changes(item["changes"])))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        for contact_id, _ in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+        # Uniqueness is judged on the final state of every contact, including contacts that
+        # do not participate, so swaps and cycles are allowed but taking a bystander's email
+        # is rejected.
+        final_emails = {other_id: other["email"] for other_id, other in contacts.items()}
+        for contact_id, normalized in entries:
+            if "email" in normalized:
+                final_emails[contact_id] = normalized["email"]
+        if len(set(final_emails.values())) != len(final_emails):
+            raise ValueError("contact id or email already exists")
+        results = []
+        changed = False
+        for contact_id, normalized in entries:
+            contact = contacts[contact_id]
+            if not all(contact[key] == value for key, value in normalized.items()):
+                changed = True
+            # Results are collected before mutation, in input order; every check above ran first,
+            # so the batch either commits all changes here or never reaches this point.
+            results.append(contact)
+        if changed:
+            for contact_id, normalized in entries:
+                contacts[contact_id].update(normalized)
+            self._write(data)
+        return results
 
     def import_contacts(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():

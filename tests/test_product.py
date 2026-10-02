@@ -1949,5 +1949,242 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(gone.stdout, "")
         self.assertFalse(empty.exists())
 
+    def test_update_contacts_applies_batch_in_input_order_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        result = self.app.update_contacts([
+            {"contact_id": " B ", "changes": {"name": " Bobby ", "organization": " Games "}},
+            {"contact_id": "A", "changes": {"name": " Ali "}},
+        ])
+        self.assertEqual([c["contact_id"] for c in result], ["B", "A"])
+        self.assertEqual(result[0],
+            {"contact_id": "B", "name": "Bobby", "email": "b@example.test", "organization": "Games"})
+        self.assertEqual(result[1],
+            {"contact_id": "A", "name": "Ali", "email": "a@example.test", "organization": "Books"})
+        reopened = ContactFlow(self.root)
+        by_id = {c["contact_id"]: c for c in reopened.find()}
+        self.assertEqual(by_id["B"], result[0])
+        self.assertEqual(by_id["A"], result[1])
+
+    def test_update_contacts_allows_email_swap_and_cycle(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        result = self.app.update_contacts([
+            {"contact_id": "A", "changes": {"email": " B@Example.test "}},
+            {"contact_id": " B ", "changes": {"email": "a@example.test"}},
+        ])
+        self.assertEqual([c["email"] for c in result], ["b@example.test", "a@example.test"])
+        reopened = ContactFlow(self.root)
+        self.assertEqual({c["contact_id"]: c["email"] for c in reopened.find()},
+                         {"A": "b@example.test", "B": "a@example.test", "C": "c@example.test"})
+        # A three-way cycle is also accepted, including a bystander whose email stays its own.
+        self.app.update_contacts([
+            {"contact_id": "A", "changes": {"email": "a@example.test"}},
+            {"contact_id": "B", "changes": {"email": "c@example.test"}},
+            {"contact_id": "C", "changes": {"email": "b@example.test"}},
+        ])
+        self.assertEqual({c["contact_id"]: c["email"] for c in ContactFlow(self.root).find()},
+                         {"A": "a@example.test", "B": "c@example.test", "C": "b@example.test"})
+
+    def test_update_contacts_empty_list_returns_empty_without_creating_store(self):
+        self.assertEqual(self.app.update_contacts([]), [])
+        self.assertFalse(self.app.path.exists())
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.update_contacts([]), [])
+        self.assertFalse(fresh_root.exists())
+
+    def test_update_contacts_rejects_shape_and_value_errors_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        before = self.app.path.read_bytes()
+        bad_updates = [
+            None, {}, "x", 5, True, [1, 2],
+            ["x"], [42], [None],
+            [{"contact_id": "A"}],
+            [{"changes": {"name": "X"}}],
+            [{"contact_id": "A", "changes": {"name": "X"}, "extra": 1}],
+            [{"contact_id": "A", "changes": {}}],
+            [{"contact_id": "A", "changes": None}],
+            [{"contact_id": "A", "changes": []}],
+            [{"contact_id": "A", "changes": {"contact_id": "B"}}],
+            [{"contact_id": "A", "changes": {"id": "A"}}],
+            [{"contact_id": "A", "changes": {"name": "X", "surname": "Y"}}],
+            [{"contact_id": "A", "changes": {"name": None}}],
+            [{"contact_id": "A", "changes": {"email": None}}],
+            [{"contact_id": "A", "changes": {"organization": None}}],
+            [{"contact_id": "A", "changes": {"name": 5}}],
+            [{"contact_id": "A", "changes": {"name": ""}}],
+            [{"contact_id": "A", "changes": {"name": "   "}}],
+            [{"contact_id": "A", "changes": {"email": "no-at"}}],
+            [{"contact_id": "A", "changes": {"email": "a@b@x.test"}}],
+            [{"contact_id": "A", "changes": {"email": "a b@x.test"}}],
+            [{"contact_id": "A", "changes": {"email": "a@b test"}}],
+            [{"contact_id": "A", "changes": {"email": "@x.test"}}],
+            [{"contact_id": "", "changes": {"name": "X"}}],
+            [{"contact_id": "   ", "changes": {"name": "X"}}],
+            [{"contact_id": None, "changes": {"name": "X"}}],
+            [{"contact_id": 5, "changes": {"name": "X"}}],
+            [{"contact_id": "ZZZ", "changes": {"name": "X"}}],
+            [{"contact_id": "a", "changes": {"name": "X"}}],
+            [{"contact_id": "A", "changes": {"name": "X"}},
+             {"contact_id": " A ", "changes": {"name": "Y"}}],
+            [{"contact_id": "A", "changes": {"name": "X"}},
+             {"contact_id": "A", "changes": {"name": "X"}}],
+        ]
+        for updates in bad_updates:
+            with self.assertRaises(ValueError):
+                self.app.update_contacts(updates)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([c["name"] for c in ContactFlow(self.root).find()], ["Alice", "Bob"])
+        # Any rejection against a missing data file creates neither directory nor file.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.update_contacts([{"contact_id": "ZZZ", "changes": {"name": "X"}}])
+        self.assertFalse(fresh_root.exists())
+
+    def test_update_contacts_rejects_bystander_email_and_final_duplicates(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        before = self.app.path.read_bytes()
+        # Taking a non-participant's email fails even when the second item would free another.
+        with self.assertRaises(ValueError):
+            self.app.update_contacts([
+                {"contact_id": "A", "changes": {"email": "b@example.test"}},
+                {"contact_id": "B", "changes": {"email": "c@example.test"}},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Two participants converging on one normalized email fails.
+        with self.assertRaises(ValueError):
+            self.app.update_contacts([
+                {"contact_id": "A", "changes": {"email": "x@x.test"}},
+                {"contact_id": "B", "changes": {"email": "X@X.test"}},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A single participant taking a bystander's email fails too.
+        with self.assertRaises(ValueError):
+            self.app.update_contacts([{"contact_id": "A", "changes": {"email": "c@example.test"}}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_update_contacts_noop_batch_returns_contacts_without_rewrite(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        before = self.app.path.read_bytes()
+        result = self.app.update_contacts([
+            {"contact_id": " A ", "changes": {"name": "  Alice  ", "email": " A@EXAMPLE.test "}},
+            {"contact_id": "B", "changes": {"organization": " Music "}},
+        ])
+        self.assertEqual([c["contact_id"] for c in result], ["A", "B"])
+        self.assertEqual(result[0],
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_update_contacts_preserves_related_records_and_legacy_shape(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.follow_up("A", "2026-10-01", "first note")
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_reminder("A", "2026-11-05", "call back")
+        totals_before = self.app.funnel_report()["total"]
+        self.app.update_contacts([
+            {"contact_id": "A", "changes": {"organization": "Music"}},
+            {"contact_id": "B", "changes": {"name": " Bobby "}},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip", "华东"])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["first note"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["stage"], "new")
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "A", "due_on": "2026-11-05", "note": "call back"}])
+        self.assertEqual([c["contact_id"] for c in reopened.find(organization="Music")], ["A"])
+        self.assertEqual(reopened.funnel_report()["total"], totals_before)
+        # Legacy document without optional collections still updates.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        result = legacy.update_contacts([{"contact_id": "L", "changes": {"organization": "New"}}])
+        self.assertEqual(result[0]["organization"], "New")
+        self.assertEqual(ContactFlow(legacy_root).find_opportunities(contact_id="L"), [])
+
+    def test_update_contacts_missing_argument_is_type_error(self):
+        with self.assertRaises(TypeError):
+            self.app.update_contacts()
+        self.assertFalse(self.app.path.exists())
+
+    def test_cli_update_contacts_success_failure_and_outer_array(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "Deal")
+        payload = self.root / "batch.json"
+
+        def cli(obj, root=self.root):
+            payload.write_text(json.dumps(obj), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "update-contacts", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"updates": [
+            {"contact_id": " B ", "changes": {"email": " A@EXAMPLE.test "}},
+            {"contact_id": "A", "changes": {"email": " b@example.test "}},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        values = json.loads(ok.stdout)
+        self.assertEqual([c["contact_id"] for c in values], ["B", "A"])
+        self.assertEqual([c["email"] for c in values], ["a@example.test", "b@example.test"])
+
+        # Empty batch: [] on stdout, exit 0, nothing created.
+        empty = self.root / "empty"
+        quiet = cli({"updates": []}, empty)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty.exists())
+
+        # Unknown contact in the second item: whole batch rejected, first item not applied.
+        before = self.app.path.read_bytes()
+        failed = cli({"updates": [
+            {"contact_id": "C", "changes": {"name": "OK?"}},
+            {"contact_id": "ZZZ", "changes": {"name": "Ghost"}},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(next(c for c in ContactFlow(self.root).find()
+                             if c["contact_id"] == "C")["name"], "Cara")
+
+        # Missing required parameter and a non-list updates both use the error envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        not_list = cli({"updates": {}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+
+        # Outer JSON array runs independent batches; the first success survives the second failure.
+        partial = cli([
+            {"updates": [{"contact_id": "C", "changes": {"name": "Cara2"}}]},
+            {"updates": [{"contact_id": "ZZZ", "changes": {"name": "Ghost"}}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(next(c for c in reopened.find() if c["contact_id"] == "C")["name"], "Cara2")
+        # Unrelated data and the swapped emails survive the failed second batch.
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["title"], "Deal")
+        self.assertEqual({c["contact_id"]: c["email"] for c in reopened.find()
+                          if c["contact_id"] in ("A", "B")},
+                         {"A": "b@example.test", "B": "a@example.test"})
+
 if __name__ == "__main__":
     unittest.main()
