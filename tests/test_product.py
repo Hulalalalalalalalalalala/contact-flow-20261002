@@ -2432,5 +2432,171 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(gone.stdout, "")
         self.assertFalse(empty.exists())
 
+    def seed_transfer_opportunities(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Books")
+        self.app.add_opportunity("O-1", "A", "First deal")
+        self.app.add_opportunity("O-2", "A", "Second deal")
+        self.app.set_stage("O-2", "qualified")
+        self.app.set_opportunity_amount("O-2", "10.5")
+        self.app.add_opportunity("O-3", "B", "Third deal")
+        self.app.set_stage("O-3", "lost")
+
+    def test_transfer_opportunities_moves_ownership_only(self):
+        self.seed_transfer_opportunities()
+        # Terminal stages transfer too, and one batch may hand several
+        # opportunities to the same target contact.
+        result = self.app.transfer_opportunities([
+            {"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"},
+            {"opportunity_id": "O-3", "source_contact_id": "B", "target_contact_id": "B"},
+        ])
+        self.assertEqual(result, [
+            {"opportunity_id": "O-1", "contact_id": "B", "title": "First deal", "stage": "new"},
+            {"opportunity_id": "O-3", "contact_id": "B", "title": "Third deal", "stage": "lost"},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual([o["opportunity_id"] for o in reopened.find_opportunities(contact_id="B")],
+                         ["O-1", "O-3"])
+        self.assertEqual([o["opportunity_id"] for o in reopened.find_opportunities(contact_id="A")],
+                         ["O-2"])
+        # The untouched opportunity keeps its amount; transferred ones gain no amount field.
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["amount"], "10.50")
+        self.assertNotIn("amount", reopened.find_opportunities(contact_id="B")[0])
+
+    def test_transfer_opportunities_noop_and_empty_leave_file_untouched(self):
+        self.seed_transfer_opportunities()
+        before = self.app.path.read_bytes()
+        # Source equals target: the original opportunity comes back unchanged.
+        result = self.app.transfer_opportunities(
+            [{"opportunity_id": "O-2", "source_contact_id": "A", "target_contact_id": "A"}])
+        self.assertEqual(result, [{"opportunity_id": "O-2", "contact_id": "A",
+                                   "title": "Second deal", "stage": "qualified", "amount": "10.50"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # An empty batch succeeds with an empty result and never touches storage.
+        self.assertEqual(self.app.transfer_opportunities([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root / "empty").transfer_opportunities([]), [])
+        self.assertFalse((self.root / "empty").exists())
+
+    def test_transfer_opportunities_rejects_whole_batch_without_writing(self):
+        self.seed_transfer_opportunities()
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            "nope",  # not a list
+            [["O-1"]],  # element not an object
+            [{"opportunity_id": "O-1", "source_contact_id": "A"}],  # missing key
+            [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B",
+              "extra": 1}],  # extra key
+            [{"opportunity_id": " ", "source_contact_id": "A", "target_contact_id": "B"}],
+            [{"opportunity_id": 1, "source_contact_id": "A", "target_contact_id": "B"}],
+            [{"opportunity_id": "O-9", "source_contact_id": "A", "target_contact_id": "B"}],
+            [{"opportunity_id": "O-1", "source_contact_id": "Z", "target_contact_id": "B"}],
+            [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "Z"}],
+            [{"opportunity_id": "O-1", "source_contact_id": "B", "target_contact_id": "C"}],
+            # Ids are case-sensitive: o-1 is not O-1.
+            [{"opportunity_id": "o-1", "source_contact_id": "A", "target_contact_id": "B"}],
+            # Identical rows repeat the opportunity id.
+            [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"},
+             {"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"}],
+            # Consecutive transfers of one opportunity repeat the id too.
+            [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"},
+             {"opportunity_id": "O-1", "source_contact_id": "B", "target_contact_id": "C"}],
+            # Normalization happens before the duplicate check.
+            [{"opportunity_id": " O-1 ", "source_contact_id": "A", "target_contact_id": "B"},
+             {"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"}],
+        ]
+        for transfers in bad_batches:
+            with self.assertRaises(ValueError, msg=repr(transfers)):
+                self.app.transfer_opportunities(transfers)
+            self.assertEqual(self.app.path.read_bytes(), before, msg=repr(transfers))
+        with self.assertRaises(TypeError):
+            self.app.transfer_opportunities()
+
+    def test_transfer_opportunities_on_empty_store_creates_nothing(self):
+        empty = ContactFlow(self.root / "empty")
+        with self.assertRaises(ValueError):
+            empty.transfer_opportunities(
+                [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"}])
+        self.assertFalse((self.root / "empty").exists())
+
+    def test_transfer_opportunities_keeps_contact_data_and_reports(self):
+        self.seed_transfer_opportunities()
+        self.app.set_tags("A", ["vip"])
+        self.app.follow_up("A", "2026-10-01", "call")
+        self.app.set_reminder("A", "2026-10-05", "check in")
+        before = self.app.path.read_bytes()
+        totals_before = self.app.funnel_report()["total"]
+        amounts_before = self.app.opportunity_amount_report()["total"]
+        self.app.transfer_opportunities(
+            [{"opportunity_id": "O-1", "source_contact_id": "A", "target_contact_id": "B"}])
+        reopened = ContactFlow(self.root)
+        # Profiles, tags, followups and reminders stay with the source contact.
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.get_tags("B"), [])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["call"])
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "A", "due_on": "2026-10-05", "note": "check in"}])
+        # Reports regroup by the target contact's organization and tags,
+        # while unfiltered totals stay unchanged.
+        self.assertEqual(reopened.funnel_report()["total"], totals_before)
+        self.assertEqual(reopened.opportunity_amount_report()["total"], amounts_before)
+        music = reopened.funnel_report(organization="Music")
+        self.assertEqual(music["total"]["new"], 1)
+        self.assertEqual(reopened.funnel_report(tags=["vip"])["total"]["opportunities"], 1)
+        self.assertNotEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_transfer_opportunities_object_array_and_failure(self):
+        self.seed_transfer_opportunities()
+        payload = self.root / "transfer.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "transfer-opportunities", str(payload)],
+                                  text=True, capture_output=True)
+
+        ok = cli({"transfers": [{"opportunity_id": " O-1 ", "source_contact_id": "A",
+                                 "target_contact_id": "B"}]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         [{"opportunity_id": "O-1", "contact_id": "B",
+                           "title": "First deal", "stage": "new"}])
+
+        # Object failure: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        failed = cli({"transfers": [{"opportunity_id": "O-2", "source_contact_id": "B",
+                                     "target_contact_id": "C"}]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A missing transfers argument goes through the same envelope (TypeError -> exit 2).
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+
+        # Array executes in order: the first success is kept, the second failure stops the run.
+        partial = cli([
+            {"transfers": [{"opportunity_id": "O-2", "source_contact_id": "A",
+                            "target_contact_id": "C"}]},
+            {"transfers": [{"opportunity_id": "O-9", "source_contact_id": "A",
+                            "target_contact_id": "C"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        reopened = ContactFlow(self.root)
+        self.assertEqual([o["opportunity_id"] for o in reopened.find_opportunities(contact_id="C")],
+                         ["O-2"])
+
+        # A failure against a nonexistent root leaves no directory or file behind.
+        empty = self.root / "empty"
+        gone = cli({"transfers": [{"opportunity_id": "O-1", "source_contact_id": "A",
+                                   "target_contact_id": "B"}]}, root=empty)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(empty.exists())
+
 if __name__ == "__main__":
     unittest.main()

@@ -457,6 +457,58 @@ class ContactFlow(JsonStore):
             (o for o in data.get("opportunities", {}).values() if matches(o)),
             key=lambda o: o["opportunity_id"])]
 
+    def transfer_opportunities(self, transfers):
+        # The whole batch validates before any ownership changes, so a rejected
+        # batch leaves the file untouched and never creates the data directory.
+        if not isinstance(transfers, list):
+            raise ValueError("transfers must be a list")
+        if not transfers:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in transfers:
+            if not isinstance(item, dict) or set(item) != {"opportunity_id", "source_contact_id",
+                                                          "target_contact_id"}:
+                raise ValueError(
+                    "each transfer must be an object with exactly "
+                    "opportunity_id, source_contact_id and target_contact_id")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            source_id = text(item["source_contact_id"], "source_contact_id")
+            target_id = text(item["target_contact_id"], "target_contact_id")
+            # Normalized ids are case-sensitive; repeats reject the whole batch,
+            # even for identical rows or consecutive transfers of one opportunity.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in transfers")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, source_id, target_id))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        opportunities = data.get("opportunities", {})
+        planned = []
+        for opportunity_id, source_id, target_id in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            if source_id not in contacts or target_id not in contacts:
+                raise ValueError("unknown contact")
+            if opportunity["contact_id"] != source_id:
+                raise ValueError("source contact does not own the opportunity")
+            planned.append((opportunity, target_id))
+        # Results are the complete opportunities in input order, with only the
+        # ownership changed; a batch that moves nothing never rewrites the file.
+        results = []
+        for opportunity, target_id in planned:
+            result = dict(opportunity)
+            result["contact_id"] = target_id
+            results.append(result)
+        if all(opportunity["contact_id"] == target_id for opportunity, target_id in planned):
+            return results
+        for opportunity, target_id in planned:
+            opportunity["contact_id"] = target_id
+        self._write(data)
+        return results
+
     def merge_contacts(self, source_id, target_id):
         source_id, target_id = text(source_id, "source_id"), text(target_id, "target_id")
         if source_id == target_id:
