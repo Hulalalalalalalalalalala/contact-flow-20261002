@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import ContactFlow
 
-ACTIONS = {'add': 'add_contact', 'update-contact': 'update_contact', 'follow-up': 'follow_up', 'find': 'find', 'timeline': 'timeline', 'merge': 'merge_contacts', 'set-tags': 'set_tags', 'get-tags': 'get_tags', 'import-contacts': 'import_contacts', 'import-followups': 'import_followups', 'add-opportunity': 'add_opportunity', 'set-stage': 'set_stage', 'find-opportunities': 'find_opportunities', 'funnel-report': 'funnel_report', 'set-reminder': 'set_reminder', 'clear-reminder': 'clear_reminder', 'complete-reminder': 'complete_reminder', 'due-reminders': 'due_reminders', 'followup-report': 'followup_report'}
+ACTIONS = {'add': 'add_contact', 'update-contact': 'update_contact', 'follow-up': 'follow_up', 'find': 'find', 'duplicate-candidates': 'duplicate_candidates', 'timeline': 'timeline', 'merge': 'merge_contacts', 'set-tags': 'set_tags', 'get-tags': 'get_tags', 'import-contacts': 'import_contacts', 'import-followups': 'import_followups', 'add-opportunity': 'add_opportunity', 'set-stage': 'set_stage', 'find-opportunities': 'find_opportunities', 'funnel-report': 'funnel_report', 'set-reminder': 'set_reminder', 'clear-reminder': 'clear_reminder', 'complete-reminder': 'complete_reminder', 'due-reminders': 'due_reminders', 'followup-report': 'followup_report'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

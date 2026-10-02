@@ -182,6 +182,154 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.returncode, 2)
         self.assertEqual(ContactFlow(self.root).get_tags("A"), ["x"])
 
+    def seed_duplicates(self):
+        # C1 陈小明, C2 陈晓明, C3 陈晓鸣, C5 陈晓明 (exact-name duplicate),
+        # C4 same name as C1 but a different organization.
+        self.app.add_contact("C1", "陈小明", "c1@example.test", "Acme")
+        self.app.add_contact("C2", "陈晓明", "c2@example.test", "Acme")
+        self.app.add_contact("C3", "陈晓鸣", "c3@example.test", "Acme")
+        self.app.add_contact("C4", "陈小明", "c4@example.test", "Beta")
+        self.app.add_contact("C5", "陈晓明", "c5@example.test", "Acme")
+
+    def test_duplicate_candidates_rules_and_order(self):
+        self.seed_duplicates()
+        result = self.app.duplicate_candidates()
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"], p["distance"]) for p in result],
+                         [("C2", "C5", 0), ("C1", "C2", 1), ("C1", "C5", 1),
+                          ("C2", "C3", 1), ("C3", "C5", 1)])
+        # Transitivity does not invent a pair: C1 and C3 are two operations apart.
+        self.assertNotIn(("C1", "C3"),
+                         [(p["left"]["contact_id"], p["right"]["contact_id"]) for p in result])
+        # A different organization is never paired, and each item has only the three keys.
+        self.assertFalse(any("C4" in (p["left"]["contact_id"], p["right"]["contact_id"]) for p in result))
+        for pair in result:
+            self.assertEqual(set(pair), {"left", "right", "distance"})
+            self.assertIn(pair["distance"], (0, 1))
+            self.assertLess(pair["left"]["contact_id"], pair["right"]["contact_id"])
+            self.assertEqual(pair["left"], {"contact_id": pair["left"]["contact_id"],
+                                            "name": pair["left"]["name"], "email": pair["left"]["email"],
+                                            "organization": pair["left"]["organization"]})
+        # distance ascending, then left id, then right id.
+        keys = [(p["distance"], p["left"]["contact_id"], p["right"]["contact_id"]) for p in result]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_duplicate_candidates_name_normalization_and_swap(self):
+        self.app.add_contact("N1", "J O E", "n1@example.test", "  A C M E ")
+        self.app.add_contact("N2", "joé", "n2@example.test", "acme")
+        # NFKC + casefold + whitespace removal makes the names equal at distance 0.
+        self.app.add_contact("N3", "ＪＯＥ", "n3@example.test", "Acme")
+        result = self.app.duplicate_candidates()
+        ids = {(p["left"]["contact_id"], p["right"]["contact_id"]): p["distance"] for p in result}
+        self.assertEqual(ids.get(("N1", "N3")), 0)
+        # é vs e is one code-point substitution after casefold.
+        self.assertEqual(ids.get(("N1", "N2")), 1)
+        # Original profile values are preserved verbatim.
+        pair = next(p for p in result if p["left"]["contact_id"] == "N1")
+        self.assertEqual(pair["left"]["name"], "J O E")
+        self.assertEqual(pair["left"]["organization"], "A C M E")
+        # An adjacent transposition costs two operations and never matches.
+        swap = ContactFlow(self.root / "swap")
+        swap.add_contact("S1", "ab", "s1@example.test", "O")
+        swap.add_contact("S2", "ba", "s2@example.test", "O")
+        self.assertEqual(swap.duplicate_candidates(), [])
+        # Insertion and deletion at one code point do match.
+        one = ContactFlow(self.root / "one")
+        one.add_contact("D1", "cat", "d1@example.test", "O")
+        one.add_contact("D2", "cats", "d2@example.test", "o")
+        self.assertEqual([p["distance"] for p in one.duplicate_candidates()], [1])
+
+    def test_duplicate_candidates_filters_before_pairing(self):
+        self.seed_duplicates()
+        self.app.set_tags("C1", ["vip", "华东"])
+        self.app.set_tags("C2", ["vip", "north"])
+        self.app.set_tags("C3", ["x"])
+        # all: only C1 and C2 qualify together.
+        result = self.app.duplicate_candidates(tags=["vip"])
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"]) for p in result], [("C1", "C2")])
+        # any: a pair is returned only when both sides match the filter.
+        result = self.app.duplicate_candidates(tags=["vip", "x"], tag_mode="any")
+        self.assertEqual({(p["left"]["contact_id"], p["right"]["contact_id"]) for p in result},
+                         {("C1", "C2"), ("C2", "C3")})
+        # Organization filter uses find semantics (trim + casefold).
+        result = self.app.duplicate_candidates(organization=" acme ")
+        self.assertTrue(result)
+        self.assertTrue(all(p["left"]["organization"].casefold() == "acme"
+                            and p["right"]["organization"].casefold() == "acme" for p in result))
+        self.assertEqual(self.app.duplicate_candidates(organization="missing"), [])
+        self.assertEqual(self.app.duplicate_candidates(tags=["nobody"]), [])
+        # Empty/None inputs mean no restriction, matching find's defaults.
+        self.assertEqual(self.app.duplicate_candidates(), self.app.duplicate_candidates(tags=None))
+        self.assertEqual(self.app.duplicate_candidates(), self.app.duplicate_candidates(tags=[]))
+
+    def test_duplicate_candidates_empty_and_read_only(self):
+        self.assertEqual(self.app.duplicate_candidates(), [])
+        self.assertFalse(self.app.path.exists())
+        self.app.add_contact("L1", "Solo", "l1@example.test", "Acme")
+        self.assertEqual(self.app.duplicate_candidates(), [])
+        # No candidates must not rewrite the file.
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.duplicate_candidates(), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Legacy data without a tags collection is treated as everyone having no tags.
+        legacy = ContactFlow(self.root / "legacy")
+        legacy.add_contact("G1", "陈晓明", "g1@example.test", "Acme")
+        legacy.add_contact("G2", "陈小明", "g2@example.test", "Acme")
+        self.assertEqual([p["distance"] for p in legacy.duplicate_candidates()], [1])
+
+    def test_duplicate_candidates_reflects_updates_imports_and_merges(self):
+        self.seed_duplicates()
+        # Moving U1 onto U2's organization creates a pair only after the update.
+        self.app.add_contact("U1", "张三", "u1@example.test", "OldOrg")
+        self.app.add_contact("U2", "张三", "u2@example.test", "NewOrg")
+        self.assertEqual(self.app.duplicate_candidates(organization="neworg"), [])
+        self.app.update_contact("U1", {"organization": "NewOrg"})
+        result = self.app.duplicate_candidates(organization="neworg")
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"], p["distance"]) for p in result],
+                         [("U1", "U2", 0)])
+        # Merge removes the source from every later candidate list.
+        self.app.merge_contacts("C5", "C2")
+        ids = {(p["left"]["contact_id"], p["right"]["contact_id"])
+               for p in self.app.duplicate_candidates(organization="acme")}
+        self.assertTrue(all("C5" not in pair for pair in ids))
+
+    def test_duplicate_candidates_validates_arguments_even_when_empty(self):
+        for kwargs in [{"organization": 5}, {"organization": ["x"]},
+                       {"tags": ["ok", 1]}, {"tags": "vip"}, {"tags": ("vip",)},
+                       {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.duplicate_candidates(**kwargs)
+        self.assertFalse(self.app.path.exists())
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.duplicate_candidates(tag_mode="weird")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_cli_duplicate_candidates_success_and_failure(self):
+        self.seed_duplicates()
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "duplicate-candidates"], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(len(json.loads(ok.stdout)), 5)
+        payload = self.root / "dup.json"
+        payload.write_text(json.dumps({"organization": "acme"}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "duplicate-candidates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertTrue(json.loads(ok.stdout))
+        payload.write_text(json.dumps([{}, {"organization": "beta"}]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "duplicate-candidates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        self.assertEqual([len(part) for part in json.loads(batch.stdout)], [5, 0])
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"tags": ["ok", 1]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "duplicate-candidates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def test_cli_demo_and_invalid_action(self):
         result = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "demo"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)

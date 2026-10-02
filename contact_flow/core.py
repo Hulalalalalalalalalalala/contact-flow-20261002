@@ -1,5 +1,6 @@
 import csv
 import io
+import unicodedata
 from datetime import date
 from .storage import JsonStore, text, calendar_day
 
@@ -395,6 +396,71 @@ class ContactFlow(JsonStore):
             return True
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
+
+    def duplicate_candidates(self, organization=None, tags=None, tag_mode="all"):
+        # Validate before touching storage, so even an empty root gets the same rejections.
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {}).values()
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        filtered = sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
+
+        def compare_key(value):
+            # Comparison only: NFKC, then casefold, then drop every Unicode whitespace
+            # character; stored profiles keep their original values.
+            folded = unicodedata.normalize("NFKC", value).casefold()
+            return "".join(ch for ch in folded if not ch.isspace())
+
+        def name_distance(a, b):
+            # Levenshtein distance limited to the values 0 and 1; anything larger returns None.
+            if a == b:
+                return 0
+            if abs(len(a) - len(b)) > 1:
+                return None
+            if len(a) == len(b):
+                # Same length: distance 1 only when exactly one code point is substituted.
+                # An adjacent swap differs at two positions and therefore costs 2.
+                differing = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+                return 1 if len(differing) == 1 else None
+            short, long = (a, b) if len(a) < len(b) else (b, a)
+            for i in range(len(short)):
+                if short[i] != long[i]:
+                    return 1 if short[i:] == long[i + 1:] else None
+            return 1
+
+        groups = {}
+        for contact in filtered:
+            groups.setdefault(compare_key(contact["organization"]), []).append(contact)
+
+        pairs = []
+        for members in groups.values():
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    left, right = members[i], members[j]
+                    distance = name_distance(compare_key(left["name"]), compare_key(right["name"]))
+                    if distance is None:
+                        continue
+                    pairs.append((distance, left["contact_id"], right["contact_id"], left, right))
+        pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [{"left": dict(left), "right": dict(right), "distance": distance}
+                for distance, _left_id, _right_id, left, right in pairs]
 
     def funnel_report(self, organization=None, tags=None, tag_mode="all"):
         if organization is not None and not isinstance(organization, str):
