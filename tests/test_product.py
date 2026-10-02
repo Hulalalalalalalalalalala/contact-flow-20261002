@@ -117,6 +117,93 @@ class ProductTests(unittest.TestCase):
         # contact return structure is unchanged
         self.assertEqual(self.app.find(tags=["vip"])[0], {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
 
+    def test_duplicate_candidates_pairs_and_ordering(self):
+        self.app.add_contact("A", "陈小明", "a@example.test", "Books")
+        self.app.add_contact("B", "陈晓明", "b@example.test", "Books")
+        self.app.add_contact("C", "陈晓鸣", "c@example.test", "Books")
+        self.app.add_contact("D", "陈 晓明", "d@example.test", "books")
+        pairs = self.app.duplicate_candidates()
+        self.assertEqual([(p["distance"], p["left"]["contact_id"], p["right"]["contact_id"]) for p in pairs],
+                         [(0, "B", "D"), (1, "A", "B"), (1, "A", "D"), (1, "B", "C"), (1, "C", "D")])
+        # No transitive completion: 陈小明 vs 陈晓鸣 needs two operations.
+        self.assertNotIn(("A", "C"), [(p["left"]["contact_id"], p["right"]["contact_id"]) for p in pairs])
+        first = pairs[0]
+        self.assertEqual(set(first), {"left", "right", "distance"})
+        self.assertEqual(first["left"], {"contact_id": "B", "name": "陈晓明", "email": "b@example.test", "organization": "Books"})
+        # Originals keep their stored values; only the comparison normalizes.
+        self.assertEqual(self.app.find()[3]["name"], "陈 晓明")
+
+    def test_duplicate_candidates_requires_same_organization_and_one_edit(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Alicia", "b@example.test", "Music")
+        self.app.add_contact("C", "Alic", "c@example.test", "Books")
+        self.app.add_contact("D", "Laice", "d@example.test", "Books")
+        self.assertEqual(self.app.duplicate_candidates(), [
+            {"left": self.app.find()[0], "right": self.app.find()[2], "distance": 1}])
+        # Adjacent transposition (Alice/Laice) is two operations, never a match.
+        self.assertNotIn("D", [p["left"]["contact_id"] for p in self.app.duplicate_candidates()])
+
+    def test_duplicate_candidates_filters_like_find(self):
+        self.app.add_contact("A", "陈小明", "a@example.test", "Books")
+        self.app.add_contact("B", "陈晓明", "b@example.test", "Books")
+        self.app.add_contact("C", "陈晓鸣", "c@example.test", "Music")
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"]) for p in self.app.duplicate_candidates()],
+                         [("A", "B")])
+        self.assertEqual(self.app.duplicate_candidates(organization="music"), [])
+        self.app.set_tags("A", ["vip"])
+        self.assertEqual(self.app.duplicate_candidates(tags=["vip"]), [])
+        self.app.set_tags("B", ["vip"])
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"])
+                          for p in self.app.duplicate_candidates(tags=["VIP"])], [("A", "B")])
+
+    def test_duplicate_candidates_empty_and_readonly(self):
+        self.assertEqual(self.app.duplicate_candidates(), [])
+        self.assertFalse(self.app.path.exists())
+        self.app.add_contact("A", "陈小明", "a@example.test", "Books")
+        self.assertEqual(self.app.duplicate_candidates(), [])
+        self.app.add_contact("B", "陈晓明", "b@example.test", "Books")
+        before = self.app.path.read_bytes()
+        self.assertEqual(len(self.app.duplicate_candidates()), 1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_duplicate_candidates_validation_and_merge(self):
+        for kwargs in [{"organization": 5}, {"organization": ["Books"]}, {"tags": "vip"},
+                       {"tags": ["ok", 1]}, {"tag_mode": "weird"}, {"tag_mode": "ALL"}]:
+            with self.assertRaises(ValueError):
+                self.app.duplicate_candidates(**kwargs)
+        # The same validation runs against an empty store.
+        self.assertFalse(self.app.path.exists())
+        self.app.add_contact("A", "陈小明", "a@example.test", "Books")
+        self.app.add_contact("B", "陈晓明", "b@example.test", "Books")
+        self.app.add_contact("C", "陈晓鸣", "c@example.test", "Books")
+        self.app.merge_contacts("C", "B")
+        pairs = ContactFlow(self.root).duplicate_candidates()
+        self.assertEqual([(p["left"]["contact_id"], p["right"]["contact_id"]) for p in pairs], [("A", "B")])
+
+    def test_cli_duplicate_candidates(self):
+        self.app.add_contact("A", "陈小明", "a@example.test", "Books")
+        self.app.add_contact("B", "陈晓明", "b@example.test", "Books")
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"organization": "books"}), encoding="utf-8")
+        found = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "duplicate-candidates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        result = json.loads(found.stdout)
+        self.assertEqual([(p["distance"], p["left"]["contact_id"], p["right"]["contact_id"]) for p in result],
+                         [(1, "A", "B")])
+        payload.write_text(json.dumps({"tag_mode": "weird"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "duplicate-candidates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        empty = self.root / "empty"
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "duplicate-candidates"], text=True, capture_output=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty.exists())
+
     def test_tag_validation_rejects_without_partial_or_file_changes(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         for bad_id in ["", "  ", None, 5]:

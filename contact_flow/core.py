@@ -1,5 +1,6 @@
 import csv
 import io
+import unicodedata
 from datetime import date
 from .storage import JsonStore, text, calendar_day
 
@@ -395,6 +396,57 @@ class ContactFlow(JsonStore):
             return True
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
+
+    @staticmethod
+    def _comparison_value(value):
+        # NFKC, then casefold, then drop every Unicode whitespace code point.
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return "".join(char for char in normalized if not char.isspace())
+
+    @staticmethod
+    def _name_distance(left, right):
+        # Levenshtein distance capped at 1: a single code point insert, delete,
+        # or substitute. A transposition is two operations and never matches.
+        if left == right:
+            return 0
+        if len(left) == len(right):
+            differences = sum(1 for a, b in zip(left, right) if a != b)
+            return 1 if differences == 1 else None
+        if abs(len(left) - len(right)) != 1:
+            return None
+        if len(left) > len(right):
+            left, right = right, left
+        index = 0
+        while index < len(left) and left[index] == right[index]:
+            index += 1
+        return 1 if left[index:] == right[index + 1:] else None
+
+    def duplicate_candidates(self, organization=None, tags=None, tag_mode="all"):
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        # Filtering (and its validation) is exactly find's; pairing happens only
+        # inside the filtered set, so a pair with a non-matching member is dropped.
+        contacts = self.find(organization=organization, tags=tags, tag_mode=tag_mode)
+        entries = [(self._comparison_value(contact["organization"]),
+                    self._comparison_value(contact["name"]), contact)
+                   for contact in contacts]
+        pairs = []
+        for first in range(len(entries)):
+            for second in range(first + 1, len(entries)):
+                org_a, name_a, contact_a = entries[first]
+                org_b, name_b, contact_b = entries[second]
+                if org_a != org_b:
+                    continue
+                distance = self._name_distance(name_a, name_b)
+                if distance is None:
+                    continue
+                left, right = ((contact_a, contact_b)
+                               if contact_a["contact_id"] < contact_b["contact_id"]
+                               else (contact_b, contact_a))
+                pairs.append({"left": left, "right": right, "distance": distance})
+        pairs.sort(key=lambda pair: (pair["distance"], pair["left"]["contact_id"],
+                                     pair["right"]["contact_id"]))
+        return pairs
 
     def funnel_report(self, organization=None, tags=None, tag_mode="all"):
         if organization is not None and not isinstance(organization, str):
