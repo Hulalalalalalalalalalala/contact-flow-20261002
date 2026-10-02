@@ -2432,5 +2432,268 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(gone.stdout, "")
         self.assertFalse(empty.exists())
 
+class StageHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = ContactFlow(self.root)
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+
+    def test_history_records_every_real_change_in_order_without_mixing_into_opportunity(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        first = self.app.set_stage(" O1 ", "qualified", on=" 2026-05-01 ")
+        # The returned opportunity object never carries history fields.
+        self.assertEqual(first, {"opportunity_id": "O1", "contact_id": "A", "title": "Deal",
+                                 "stage": "qualified"})
+        second = self.app.set_stage("O1", "won", on="2026-06-01")
+        self.assertEqual(second["stage"], "won")
+        # new -> qualified -> won is exactly two records, in change order.
+        self.assertEqual(self.app.stage_history("O1"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-05-01"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-06-01"},
+        ])
+        # Records are copies: mutating the result never mutates storage.
+        self.app.stage_history("O1")[0]["on"] = "hacked"
+        self.assertEqual(ContactFlow(self.root).stage_history("O1")[0]["on"], "2026-05-01")
+
+    def test_history_is_not_reordered_by_date_and_persists_across_reopen(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-05-10")
+        # A null-dated change appends after the dated one without moving the floor.
+        self.app.set_stage("O1", "won", on=None)
+        expected = [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-05-10"},
+            {"from_stage": "qualified", "to_stage": "won", "on": None},
+        ]
+        self.assertEqual(self.app.stage_history("O1"), expected)
+        self.assertEqual(ContactFlow(self.root).stage_history(" O1 "), expected)
+
+    def test_omitted_null_and_json_null_dates_save_null(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified")
+        self.app.set_stage("O1", "won", None)
+        self.assertEqual([entry["on"] for entry in self.app.stage_history("O1")], [None, None])
+
+    def test_dates_allow_past_future_leap_day_and_trim_whitespace(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on=" 2024-02-29 ")
+        self.app.set_stage("O1", "won", on="2099-12-31")
+        self.assertEqual([entry["on"] for entry in self.app.stage_history("O1")],
+                         ["2024-02-29", "2099-12-31"])
+
+    def test_date_floor_uses_latest_nonnull_record_only(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-05-10")
+        # Same day as the floor is allowed (two real changes on one date).
+        self.assertEqual(self.app.set_stage("O1", "won", on="2026-05-10")["stage"], "won")
+        before = self.app.path.read_bytes()
+        # Even a same-stage call cannot carry a date before the floor.
+        with self.assertRaises(ValueError):
+            self.app.set_stage("O1", "won", on="2026-05-09")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A null-dated change never establishes or moves the floor: a fresh
+        # opportunity with only a null change accepts any real date afterwards.
+        self.app.add_opportunity("O2", "B", "Other")
+        self.app.set_stage("O2", "qualified", on=None)
+        self.assertEqual(self.app.set_stage("O2", "won", on="2000-01-01")["stage"], "won")
+
+    def test_same_stage_is_a_noop_but_still_validates_the_date(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-05-10")
+        before = self.app.path.read_bytes()
+        result = self.app.set_stage("O1", "qualified", on="2026-05-10")
+        self.assertEqual(result["stage"], "qualified")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.stage_history("O1")), 1)
+        # A backward date on a same-stage call still rejects, atomically.
+        with self.assertRaises(ValueError):
+            self.app.set_stage("O1", "qualified", on="2026-05-09")
+        with self.assertRaises(ValueError):
+            self.app.set_stage("O1", "qualified", on="2026-02-30")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.stage_history("O1")), 1)
+
+    def test_invalid_dates_stages_transitions_and_ids_reject_without_changes(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-05-10")
+        # A terminal opportunity: any change out of it is rejected, even a valid target.
+        self.app.add_opportunity("O3", "A", "Done")
+        self.app.set_stage("O3", "lost", on="2026-05-01")
+        before = self.app.path.read_bytes()
+        bad_dates = [5, True, "", "   ", "2026-1-1", "20261010", "2026-13-01",
+                     "2026-02-30", "2023-02-29", "2026-05-09"]
+        for bad in bad_dates:
+            with self.assertRaises(ValueError):
+                self.app.set_stage("O1", "won", on=bad)
+        for kwargs in [
+            {"opportunity_id": "O1", "stage": "pending", "on": "2026-05-11"},   # illegal stage
+            {"opportunity_id": "O1", "stage": "new", "on": "2026-05-11"},       # illegal transition
+            {"opportunity_id": "O3", "stage": "new", "on": "2026-05-11"},       # terminal is frozen
+            {"opportunity_id": "O3", "stage": "qualified", "on": "2026-05-11"}, # terminal is frozen
+            {"opportunity_id": "ZZZ", "stage": "won", "on": "2026-05-11"},      # unknown opportunity
+            {"opportunity_id": "o1", "stage": "won", "on": "2026-05-11"},       # case-sensitive id
+            {"opportunity_id": "  ", "stage": "won", "on": "2026-05-11"},       # blank id
+            {"opportunity_id": None, "stage": "won", "on": "2026-05-11"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.set_stage(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stage_history("O1"),
+                         [{"from_stage": "new", "to_stage": "qualified", "on": "2026-05-10"}])
+        self.assertEqual(self.app.stage_history("O3"),
+                         [{"from_stage": "new", "to_stage": "lost", "on": "2026-05-01"}])
+        # A rejected call against a root that never existed creates nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.set_stage("O1", "qualified", on="2026-05-11")
+        with self.assertRaises(ValueError):
+            fresh.set_stage("O1", "qualified", on="2026-02-30")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_missing_required_arguments_are_type_errors(self):
+        # A fresh root never gets a file created by the missing-argument calls.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(TypeError):
+            fresh.set_stage()
+        with self.assertRaises(TypeError):
+            fresh.set_stage("O1")
+        with self.assertRaises(TypeError):
+            fresh.stage_history()
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_new_imported_and_legacy_opportunities_start_with_empty_history(self):
+        self.app.add_opportunity("NEW", "A", "Fresh")
+        self.assertEqual(self.app.stage_history("NEW"), [])
+        csv_path = self.root / "opps.csv"
+        csv_path.write_text(
+            "opportunity_id,contact_id,title,stage\n"
+            "OLD1,A,already won,won\nOLD2,B,mid stage,qualified\n", encoding="utf-8")
+        self.app.import_opportunities(str(csv_path))
+        self.assertEqual(self.app.stage_history("OLD1"), [])
+        self.assertEqual(self.app.stage_history("OLD2"), [])
+        # Existing stage is the starting point for later records; no history is backfilled.
+        self.app.set_stage("OLD2", "won", on="2026-01-01")
+        self.assertEqual(self.app.stage_history("OLD2"),
+                         [{"from_stage": "qualified", "to_stage": "won", "on": "2026-01-01"}])
+        # Legacy data with opportunities but no stage_history collection reads as empty.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                               "organization": "Old"}},
+            "opportunities": {"LX": {"opportunity_id": "LX", "contact_id": "L",
+                                     "title": "Legacy", "stage": "qualified"}}}), encoding="utf-8")
+        self.assertEqual(ContactFlow(legacy_root).stage_history("LX"), [])
+
+    def test_stage_history_query_validation_and_readonly(self):
+        for bad_id in ["", "  ", None, 5]:
+            with self.assertRaises(ValueError):
+                self.app.stage_history(bad_id)
+        with self.assertRaises(ValueError):
+            self.app.stage_history("ZZZ")
+        self.app.add_opportunity("O1", "A", "Deal")
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.stage_history("O1"), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing opportunities collection in old data means the opportunity is unknown.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                               "organization": "Old"}}}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            ContactFlow(legacy_root).stage_history("LX")
+        # A query against a root with no data file creates nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.stage_history("O1")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_amount_transfer_and_merge_preserve_history_under_original_id(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-05-10")
+        self.app.set_stage("O1", "won", on="2026-06-01")
+        expected = [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-05-10"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-06-01"},
+        ]
+        self.app.set_opportunity_amount(" O1 ", "12.50")
+        self.assertEqual(ContactFlow(self.root).stage_history("O1"), expected)
+        self.app.transfer_opportunities([
+            {"opportunity_id": "O1", "source_contact_id": "A", "target_contact_id": "B"}])
+        self.assertEqual(ContactFlow(self.root).stage_history("O1"), expected)
+        self.app.merge_contacts("B", "A")
+        self.assertEqual(ContactFlow(self.root).stage_history("O1"), expected)
+        opportunity = self.app.find_opportunities(contact_id="A")[0]
+        self.assertEqual((opportunity["contact_id"], opportunity["stage"], opportunity["amount"]),
+                         ("A", "won", "12.50"))
+
+    def test_cli_set_stage_and_stage_history_object_null_and_array(self):
+        self.app.add_opportunity("O1", "A", "Deal")
+        payload = self.root / "stage.json"
+
+        def cli(action, obj):
+            payload.write_text(json.dumps(obj), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                   action, str(payload)], text=True, capture_output=True)
+
+        # Old-style call without on stays compatible.
+        old = cli("set-stage", {"opportunity_id": "O1", "stage": "qualified"})
+        self.assertEqual(old.returncode, 0, old.stderr)
+        self.assertEqual(json.loads(old.stdout)["stage"], "qualified")
+        # Explicit JSON null stores a null date.
+        ok = cli("set-stage", {"opportunity_id": "O1", "stage": "won", "on": None})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         {"opportunity_id": "O1", "contact_id": "A", "title": "Deal", "stage": "won"})
+        queried = cli("stage-history", {"opportunity_id": " O1 "})
+        self.assertEqual(queried.returncode, 0, queried.stderr)
+        self.assertEqual(json.loads(queried.stdout), [
+            {"from_stage": "new", "to_stage": "qualified", "on": None},
+            {"from_stage": "qualified", "to_stage": "won", "on": None},
+        ])
+        # Failures: exit 2, empty stdout, JSON error on stderr.
+        for bad in [
+            {"opportunity_id": "O1", "stage": "lost", "on": "2026-02-30"},
+            {"opportunity_id": "ZZZ", "stage": "new"},
+            {"stage": "new"},
+        ]:
+            failed = cli("set-stage", bad)
+            self.assertEqual(failed.returncode, 2)
+            self.assertEqual(failed.stdout, "")
+            self.assertIn("error", json.loads(failed.stderr))
+        missing = cli("stage-history", {})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        unknown = cli("stage-history", {"opportunity_id": "ZZZ"})
+        self.assertEqual(unknown.returncode, 2)
+
+        # Array runs item by item in order; the later backward-date failure keeps
+        # the earlier successful change, and the third item never executes.
+        self.app.add_opportunity("O2", "B", "Other")
+        partial = cli("set-stage", [
+            {"opportunity_id": "O2", "stage": "qualified", "on": "2026-07-01"},
+            {"opportunity_id": "O2", "stage": "won", "on": "2026-06-01"},
+            {"opportunity_id": "O2", "stage": "lost", "on": "2026-08-01"},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.stage_history("O2"),
+                         [{"from_stage": "new", "to_stage": "qualified", "on": "2026-07-01"}])
+        self.assertEqual(reopened.find_opportunities(contact_id="B")[0]["stage"], "qualified")
+
+        # stage-history over a nonexistent root returns an error and creates nothing.
+        empty = self.root / "empty"
+        gone = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                               "stage-history"], text=True, capture_output=True)
+        self.assertEqual(gone.returncode, 2)
+        self.assertFalse(empty.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

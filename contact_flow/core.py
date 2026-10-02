@@ -402,11 +402,15 @@ class ContactFlow(JsonStore):
         self._write(data)
         return {"opportunity_id": opportunity_id, "contact_id": contact_id, "title": title, "stage": "new"}
 
-    def set_stage(self, opportunity_id, stage):
+    def set_stage(self, opportunity_id, stage, on=None):
         opportunity_id = text(opportunity_id, "opportunity_id")
         stage = text(stage, "stage")
         if stage not in STAGES:
             raise ValueError("invalid stage")
+        # The optional business date validates before any storage access, so a
+        # rejected call against a missing data file never creates the directory.
+        if on is not None:
+            on = calendar_day(on, "on")
         data = self._read()
         opportunity = data.get("opportunities", {}).get(opportunity_id)
         if opportunity is None:
@@ -414,10 +418,30 @@ class ContactFlow(JsonStore):
         current = opportunity["stage"]
         if stage != current and stage not in STAGE_TRANSITIONS.get(current, ()):
             raise ValueError("invalid stage transition")
+        # Every provided date is fully validated, including on a no-op call: the
+        # floor is the latest dated change on record; null-dated changes and
+        # same-day changes never move it. Everything validates before mutation,
+        # so a backward date rejects without writing.
+        if on is not None:
+            history = data.get("stage_history", {}).get(opportunity_id, [])
+            dated = [entry["on"] for entry in history if entry["on"] is not None]
+            if dated and on < max(dated):
+                raise ValueError("stage change date must not be earlier than the latest recorded date")
         if stage != current:
             opportunity["stage"] = stage
+            data.setdefault("stage_history", {}).setdefault(opportunity_id, []).append(
+                {"from_stage": current, "to_stage": stage, "on": on})
             self._write(data)
         return dict(opportunity)
+
+    def stage_history(self, opportunity_id):
+        opportunity_id = text(opportunity_id, "opportunity_id")
+        data = self._read()
+        if opportunity_id not in data.get("opportunities", {}):
+            raise ValueError("unknown opportunity")
+        # Save order is the order of successful changes; it is never reordered by date.
+        return [dict(entry)
+                for entry in data.get("stage_history", {}).get(opportunity_id, [])]
 
     def set_opportunity_amount(self, opportunity_id, amount):
         opportunity_id = text(opportunity_id, "opportunity_id")
