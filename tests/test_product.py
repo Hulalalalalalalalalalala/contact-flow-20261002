@@ -667,6 +667,191 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("b")],
                          ["leap", "y"])
 
+    def test_import_opportunities_returns_file_order_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("b", "Bob", "b@example.test", "Music")
+        self.app.add_contact("陈", "Chen", "chen@example.test", "Games")
+        self.app.add_opportunity("OLD", "A", "Existing")
+        csv_path = self.write_csv("opportunities.csv",
+            "﻿stage,title,contact_id,opportunity_id\r\n"
+            "won,\"line1\nline2, end\", A , O1 \r\n"
+            "lost,second,b,O2\n"
+            "qualified,third,陈,O3\n"
+            "\r\n\r\n")  # zero-field blank lines ignored
+        result = self.app.import_opportunities(str(csv_path))
+        self.assertEqual(result, [
+            {"opportunity_id": "O1", "contact_id": "A", "title": "line1\nline2, end", "stage": "won"},
+            {"opportunity_id": "O2", "contact_id": "b", "title": "second", "stage": "lost"},
+            {"opportunity_id": "O3", "contact_id": "陈", "title": "third", "stage": "qualified"},
+        ])
+        for entry in result:
+            self.assertEqual(set(entry), {"opportunity_id", "contact_id", "title", "stage"})
+        # Historical stages are preserved as filled; multiple opportunities per contact allowed.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([o["opportunity_id"] for o in reopened.find_opportunities()],
+                         ["O1", "O2", "O3", "OLD"])
+        self.assertEqual([(o["opportunity_id"], o["stage"])
+                          for o in reopened.find_opportunities(contact_id="A")],
+                         [("O1", "won"), ("OLD", "new")])
+        report = reopened.funnel_report()
+        self.assertEqual(report["total"],
+                         {"contacts": 3, "new": 1, "qualified": 1, "won": 1, "lost": 1,
+                          "opportunities": 4})
+
+    def test_import_opportunities_header_only_and_empty(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for content in ["", "﻿", "\n", "\r\n"]:
+            path = self.write_csv("empty-%d.csv" % len(content.encode("utf-8")), content)
+            with self.assertRaises(ValueError):
+                fresh.import_opportunities(str(path))
+        self.assertFalse(fresh_root.exists())
+        for content in [
+            "opportunity_id,contact_id,title,stage\n",
+            "stage,opportunity_id,contact_id,title\n\n\r\n\n",
+        ]:
+            path = self.write_csv("header-%d.csv" % len(content), content)
+            self.assertEqual(fresh.import_opportunities(str(path)), [])
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_opportunities_rejects_bad_headers(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        bad_headers = [
+            "opportunity_id,contact_id,title\n",
+            "opportunity_id,contact_id,title,stage,extra\n",
+            "opportunity_id,contact_id,title,title\n",
+            "Opportunity_ID,contact_id,title,stage\n",
+            "opportunity_id,contact_id,Title,stage\n",
+            "opportunity_id,contact_id,title,stage,x\nO1,A,x,new,extra\n",
+        ]
+        for content in bad_headers:
+            path = self.write_csv("bad-%d.csv" % len(content), content)
+            with self.assertRaises(ValueError):
+                fresh.import_opportunities(str(path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_opportunities_rejects_bad_records_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("EXISTING", "A", "Old")
+        before = self.app.path.read_bytes()
+        bad_files = [
+            "opportunity_id,contact_id,title,stage\nO1,A,x,new,extra\n",   # too many fields
+            "opportunity_id,contact_id,title,stage\nO1,A,x\n",             # too few fields
+            "opportunity_id,contact_id,title,stage\n,A,x,new\n",           # blank opportunity id
+            "opportunity_id,contact_id,title,stage\n  ,A,x,new\n",
+            "opportunity_id,contact_id,title,stage\nO1,,x,new\n",          # blank contact id
+            "opportunity_id,contact_id,title,stage\nO1, ,x,new\n",
+            "opportunity_id,contact_id,title,stage\nO1,A,,new\n",          # blank title
+            "opportunity_id,contact_id,title,stage\nO1,A,  ,new\n",
+            "opportunity_id,contact_id,title,stage\nO1,A,x,\n",            # blank stage
+            "opportunity_id,contact_id,title,stage\nO1,A,x,NEW\n",         # case not accepted
+            "opportunity_id,contact_id,title,stage\nO1,A,x,pending\n",     # illegal stage
+            "opportunity_id,contact_id,title,stage\n,,,\n",  # empty row is not a zero-field blank
+            'opportunity_id,contact_id,title,stage\nO1,A,"x,new\n',        # unterminated quote
+            "opportunity_id,contact_id,title,stage\nO9,ZZZ,x,new\n",        # unknown contact
+            "opportunity_id,contact_id,title,stage\nO1,ZZZ,x,new\nO2,A,y,won\n",
+            "opportunity_id,contact_id,title,stage\nEXISTING,A,x,new\n",   # existing opportunity
+            "opportunity_id,contact_id,title,stage\nDUP,A,x,won\nDUP,A,x,won\n",  # in-batch dup
+            "opportunity_id,contact_id,title,stage\nO1,a,x,new\n",        # case-sensitive contact
+        ]
+        for i, content in enumerate(bad_files):
+            path = self.write_csv("bad-record-%d.csv" % i, content)
+            with self.assertRaises(ValueError):
+                self.app.import_opportunities(str(path))
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Opportunity ids and contact ids share no namespace: a contact whose id
+        # equals an existing opportunity id still works, and vice versa.
+        path = self.write_csv("shared.csv",
+            "opportunity_id,contact_id,title,stage\nA,A,shared id space,new\n")
+        self.assertEqual(self.app.import_opportunities(str(path))[0]["opportunity_id"], "A")
+
+    def test_import_opportunities_rejects_invalid_utf8(self):
+        path = self.write_csv("latin.csv",
+            b"opportunity_id,contact_id,title,stage\nO1,A,x,new\n\xff\n")
+        with self.assertRaises(ValueError):
+            self.app.import_opportunities(str(path))
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_opportunities_validates_path_and_permissions(self):
+        with self.assertRaises(TypeError):
+            self.app.import_opportunities()
+        for bad in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.import_opportunities(bad)
+        with self.assertRaises(FileNotFoundError):
+            self.app.import_opportunities(str(self.root / "missing.csv"))
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        path = self.write_csv("locked.csv",
+            "opportunity_id,contact_id,title,stage\nO1,A,x,new\n")
+        path.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                self.app.import_opportunities(str(path))
+        finally:
+            path.chmod(0o644)
+
+    def test_import_opportunities_relative_path_and_legacy_data(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.write_csv("opps.csv", "opportunity_id,contact_id,title,stage\nO1,A,x,won\n")
+        old_cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(self.app.import_opportunities("opps.csv")[0]["stage"], "won")
+        finally:
+            os.chdir(old_cwd)
+        # Legacy data without an opportunities collection imports as if it were empty.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        path = self.write_csv("legacy.csv",
+            "opportunity_id,contact_id,title,stage\nOL,L,deal,lost\n")
+        legacy = ContactFlow(legacy_root)
+        self.assertEqual(legacy.import_opportunities(str(path)),
+                         [{"opportunity_id": "OL", "contact_id": "L", "title": "deal",
+                           "stage": "lost"}])
+        self.assertEqual(ContactFlow(legacy_root).find_opportunities()[0]["stage"], "lost")
+
+    def test_import_opportunities_leaves_other_data_unchanged(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.follow_up("A", "2026-10-01", "called")
+        self.app.set_reminder("A", "2099-01-01", "call")
+        path = self.write_csv("opportunities.csv",
+            "opportunity_id,contact_id,title,stage\nO1,A,x,won\nO2,B,y,qualified\n")
+        self.app.import_opportunities(str(path))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["called"])
+        self.assertEqual(reopened.due_reminders("2099-12-31"),
+                         [{"contact_id": "A", "due_on": "2099-01-01", "note": "call"}])
+        self.assertEqual([c["contact_id"] for c in reopened.find()], ["A", "B"])
+
+    def test_cli_import_opportunities_success_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        csv_path = self.write_csv("opportunities.csv",
+            "contact_id,opportunity_id,title,stage\n A , O1 , ok , won \n")
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"csv_path": str(csv_path)}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "import-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         [{"opportunity_id": "O1", "contact_id": "A", "title": "ok",
+                           "stage": "won"}])
+        # Reimporting the same file rejects the whole batch (duplicate id), exit 2, no write.
+        before = self.app.path.read_bytes()
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "import-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def seed_funnel(self):
         # Books (casefold group): A with two opportunities (new + won), D with one qualified.
         # books: B with one lost. Music: C with no opportunities.
