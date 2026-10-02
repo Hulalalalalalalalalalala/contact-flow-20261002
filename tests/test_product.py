@@ -375,6 +375,210 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertFalse(fresh_root.exists())
 
+    def test_import_followups_returns_file_order_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("陈", "Chen", "chen@example.test", "Games")
+        self.app.follow_up("A", "2026-10-02", "old same day")
+        csv_path = self.write_csv("followups.csv",
+            "note,contact_id,on\r\n"
+            "\"line1\nline2, end\", A , 2026-10-02 \r\n"
+            "leap day, 陈 ,2024-02-29\r\n"
+            "future,B,2099-01-01\r\n"
+            "leap day, 陈 ,2024-02-29\r\n")  # in-batch duplicate kept verbatim
+        result = self.app.import_followups(str(csv_path))
+        self.assertEqual(result, [
+            {"contact_id": "A", "on": "2026-10-02", "note": "line1\nline2, end"},
+            {"contact_id": "陈", "on": "2024-02-29", "note": "leap day"},
+            {"contact_id": "B", "on": "2099-01-01", "note": "future"},
+            {"contact_id": "陈", "on": "2024-02-29", "note": "leap day"},
+        ])
+        for entry in result:
+            self.assertEqual(set(entry), {"contact_id", "on", "note"})
+        # Same day, same contact: the pre-existing entry sorts before the imported batch.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")],
+                         [("2026-10-02", "old same day"), ("2026-10-02", "line1\nline2, end")])
+        self.assertEqual([r["note"] for r in reopened.timeline("陈")], ["leap day", "leap day"])
+        report = reopened.followup_report("2024-01-01", "2100-01-01")
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in report["records"]],
+                         [("陈", "2024-02-29", "leap day"), ("陈", "2024-02-29", "leap day"),
+                          ("A", "2026-10-02", "old same day"),
+                          ("A", "2026-10-02", "line1\nline2, end"),
+                          ("B", "2099-01-01", "future")])
+
+    def test_import_followups_bom_header_only_and_empty(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        csv_path = self.write_csv("followups.csv",
+            "﻿on,note,contact_id\n 2024-02-29 , ok ,A\n")
+        self.assertEqual(self.app.import_followups(str(csv_path)),
+                         [{"contact_id": "A", "on": "2024-02-29", "note": "ok"}])
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for content in ["", "﻿", "\n", "\r\n"]:
+            path = self.write_csv("empty-%d.csv" % len(content.encode("utf-8")), content)
+            with self.assertRaises(ValueError):
+                fresh.import_followups(str(path))
+        self.assertFalse(fresh_root.exists())
+        for content in ["contact_id,on,note\n", "contact_id,on,note\n\n\r\n\n"]:
+            path = self.write_csv("header-%d.csv" % len(content), content)
+            self.assertEqual(fresh.import_followups(str(path)), [])
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_followups_rejects_bad_headers(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        bad_headers = [
+            "contact_id,note\n",
+            "contact_id,on,note,extra\n",
+            "contact_id,on,on\n",
+            "Contact_ID,on,note\n",
+            "contact_id,On,note\n",
+            "contact_id,on,note,x\nA,2026-10-01,x,extra\n",
+        ]
+        for content in bad_headers:
+            path = self.write_csv("bad-%d.csv" % len(content), content)
+            with self.assertRaises(ValueError):
+                fresh.import_followups(str(path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_followups_rejects_bad_records_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        bad_files = [
+            "contact_id,on,note\nA,2026-10-01\n",                # too few fields
+            "contact_id,on,note\nA,2026-10-01,x,extra\n",       # too many fields
+            "contact_id,on,note\n,2026-10-01,x\n",              # blank id
+            "contact_id,on,note\n   ,2026-10-01,x\n",
+            "contact_id,on,note\nA,2026-10-01,  \n",            # blank note
+            "contact_id,on,note\nA,,x\n",                       # blank date
+            "contact_id,on,note\nA,  ,x\n",
+            "contact_id,on,note\nA,2026-02-30,x\n",             # impossible date
+            "contact_id,on,note\nA,2026-1-1,x\n",
+            "contact_id,on,note\nA,20261001,x\n",
+            "contact_id,on,note\n,,x\n",                        # row of empties is not a blank line
+            'contact_id,on,note\nA,"2026-10-01,x\n',            # unterminated quoted field
+            "contact_id,on,note\nZZZ,2026-10-01,x\n",           # unknown contact
+            "contact_id,on,note\nA,2026-10-01,ok\nZ,2026-10-01,x\n",  # later row unknown
+        ]
+        for i, content in enumerate(bad_files):
+            path = self.write_csv("bad-record-%d.csv" % i, content)
+            with self.assertRaises(ValueError):
+                self.app.import_followups(str(path))
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Ids are case-sensitive: "a" does not match contact "A".
+        path = self.write_csv("case.csv", "contact_id,on,note\na,2026-10-01,x\n")
+        with self.assertRaises(ValueError):
+            self.app.import_followups(str(path))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_import_followups_rejects_invalid_utf8(self):
+        path = self.write_csv("latin.csv", b"contact_id,on,note\nA,2026-10-01,\xff\n")
+        with self.assertRaises(ValueError):
+            self.app.import_followups(str(path))
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_followups_keeps_duplicates_and_reimport_appends(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.follow_up("A", "2026-10-01", "same")
+        path = self.write_csv("followups.csv", "contact_id,on,note\n A ,2026-10-01, same \n")
+        first = self.app.import_followups(str(path))
+        second = self.app.import_followups(str(path))
+        self.assertEqual(first, second)
+        # Existing copy, then batch one, then re-imported batch one, all kept.
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("A")],
+                         ["same", "same", "same"])
+
+    def test_import_followups_validates_path_and_permissions(self):
+        for bad in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.import_followups(bad)
+        with self.assertRaises(FileNotFoundError):
+            self.app.import_followups(str(self.root / "missing.csv"))
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        path = self.write_csv("locked.csv", "contact_id,on,note\nA,2026-10-01,x\n")
+        path.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                self.app.import_followups(str(path))
+        finally:
+            path.chmod(0o644)
+
+    def test_import_followups_relative_path_and_legacy_data(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.write_csv("people.csv", "contact_id,on,note\nA,2026-10-01,x\n")
+        old_cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(self.app.import_followups("people.csv")[0]["contact_id"], "A")
+        finally:
+            os.chdir(old_cwd)
+        # Legacy data without a followups collection imports as if it were empty.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        path = self.write_csv("legacy.csv", "contact_id,on,note\nL,2026-10-01,note\n")
+        legacy = ContactFlow(legacy_root)
+        self.assertEqual(legacy.import_followups(str(path)),
+                         [{"contact_id": "L", "on": "2026-10-01", "note": "note"}])
+        self.assertEqual(ContactFlow(legacy_root).timeline("L")[0]["note"], "note")
+
+    def test_import_followups_leaves_other_data_unchanged(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_reminder("A", "2099-01-01", "call")
+        funnel_before = self.app.funnel_report()
+        path = self.write_csv("followups.csv",
+            "contact_id,on,note\nA,2026-10-03,x\nA,2026-10-04,y\n")
+        self.app.import_followups(str(path))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["title"], "Deal")
+        self.assertEqual(reopened.due_reminders("2099-12-31"),
+                         [{"contact_id": "A", "due_on": "2099-01-01", "note": "call"}])
+        self.assertEqual(reopened.funnel_report(), funnel_before)
+        self.assertEqual([c["contact_id"] for c in reopened.find()], ["A", "B"])
+
+    def test_cli_import_followups_success_failure_and_array(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("b", "Bob", "b@example.test", "Music")
+        csv_path = self.write_csv("followups.csv",
+            "contact_id,on,note\n A , 2026-10-01 , ok \nb,2024-02-29,leap\n")
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"csv_path": str(csv_path)}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         [{"contact_id": "A", "on": "2026-10-01", "note": "ok"},
+                          {"contact_id": "b", "on": "2024-02-29", "note": "leap"}])
+        # Unknown contact: stderr JSON, exit 2, empty stdout, no write.
+        before = self.app.path.read_bytes()
+        bad_csv = self.write_csv("bad.csv", "contact_id,on,note\nZZZ,2026-10-01,x\n")
+        payload.write_text(json.dumps({"csv_path": str(bad_csv)}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Array input: each import is independent and a later failure keeps earlier writes.
+        other = self.write_csv("other.csv", "contact_id,on,note\nb,2026-10-05,y\n")
+        payload.write_text(json.dumps([{"csv_path": str(other)}, {"csv_path": str(bad_csv)}]),
+                           encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("b")],
+                         ["leap", "y"])
+
     def seed_funnel(self):
         # Books (casefold group): A with two opportunities (new + won), D with one qualified.
         # books: B with one lost. Music: C with no opportunities.
