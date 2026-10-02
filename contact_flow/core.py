@@ -1,5 +1,17 @@
+import csv
 from datetime import date
+import io
+from pathlib import Path
 from .storage import JsonStore, text
+
+IMPORT_COLUMNS = ("contact_id", "name", "email", "organization")
+
+def contact_record(contact_id, name, email, organization):
+    contact_id, name = text(contact_id, "contact_id"), text(name, "name")
+    email, organization = text(email, "email").lower(), text(organization, "organization")
+    if email.count("@") != 1 or any(c.isspace() for c in email) or not all(email.split("@")):
+        raise ValueError("invalid email")
+    return {"contact_id": contact_id, "name": name, "email": email, "organization": organization}
 
 def normalize_tags(value):
     if not isinstance(value, list):
@@ -16,18 +28,52 @@ def normalize_tags(value):
 
 class ContactFlow(JsonStore):
     def add_contact(self, contact_id, name, email, organization):
-        contact_id, name = text(contact_id, "contact_id"), text(name, "name")
-        email, organization = text(email, "email").lower(), text(organization, "organization")
-        if email.count("@") != 1 or any(c.isspace() for c in email) or not all(email.split("@")):
-            raise ValueError("invalid email")
+        contact = contact_record(contact_id, name, email, organization)
         data = self._read()
         contacts = data.setdefault("contacts", {})
-        if contact_id in contacts or any(c["email"] == email for c in contacts.values()):
+        if contact["contact_id"] in contacts or any(c["email"] == contact["email"] for c in contacts.values()):
             raise ValueError("contact id or email already exists")
-        contact = {"contact_id": contact_id, "name": name, "email": email, "organization": organization}
-        contacts[contact_id] = contact
+        contacts[contact["contact_id"]] = contact
         self._write(data)
         return contact
+
+    def import_contacts(self, csv_path):
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        try:
+            raw = Path(csv_path).read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise ValueError("csv file must be valid UTF-8") from error
+        try:
+            rows = [row for row in csv.reader(io.StringIO(raw), strict=True) if row]
+        except csv.Error as error:
+            raise ValueError("invalid csv syntax") from error
+        if not rows:
+            raise ValueError("csv file must have a header row")
+        header = rows[0]
+        if len(header) != len(IMPORT_COLUMNS) or sorted(header) != sorted(IMPORT_COLUMNS):
+            raise ValueError("csv header must contain exactly: " + ", ".join(IMPORT_COLUMNS))
+        records = []
+        for row in rows[1:]:
+            if len(row) != len(IMPORT_COLUMNS):
+                raise ValueError("csv record has wrong number of fields")
+            values = dict(zip(header, row))
+            records.append(contact_record(values["contact_id"], values["name"], values["email"], values["organization"]))
+        data = self._read()
+        contacts = data.setdefault("contacts", {})
+        seen_ids = set(contacts)
+        seen_emails = {c["email"] for c in contacts.values()}
+        for record in records:
+            if record["contact_id"] in seen_ids or record["email"] in seen_emails:
+                raise ValueError("contact id or email already exists")
+            seen_ids.add(record["contact_id"])
+            seen_emails.add(record["email"])
+        if not records:
+            return []
+        for record in records:
+            contacts[record["contact_id"]] = record
+        self._write(data)
+        return records
 
     def follow_up(self, contact_id, on, note):
         note = text(note, "note")

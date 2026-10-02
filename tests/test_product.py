@@ -179,6 +179,94 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.returncode, 2)
         self.assertEqual(ContactFlow(self.root).get_tags("A"), ["x"])
 
+    def test_import_contacts_basic_order_and_persistence(self):
+        source = self.root / "in.csv"
+        source.write_text('name,contact_id,organization,email\n Alice , A , Books , Alice@EXAMPLE.test \n"Bob, Jr.",B,"Music, ""Live""",b@example.test\n"Cara\nC",C,Games,c@example.test\n', encoding="utf-8")
+        result = self.app.import_contacts(str(source))
+        self.assertEqual([c["contact_id"] for c in result], ["A", "B", "C"])
+        self.assertEqual(result[0], {"contact_id": "A", "name": "Alice", "email": "alice@example.test", "organization": "Books"})
+        self.assertEqual(result[1]["name"], "Bob, Jr.")
+        self.assertEqual(result[2]["name"], "Cara\nC")
+        reopened = ContactFlow(self.root)
+        self.assertEqual([c["contact_id"] for c in reopened.find()], ["A", "B", "C"])
+
+    def test_import_contacts_utf8_bom_and_empty_sections(self):
+        source = self.root / "bom.csv"
+        source.write_bytes("\ufeffcontact_id,name,email,organization\nA,Alice,a@example.test,Books\n".encode("utf-8"))
+        self.assertEqual([c["contact_id"] for c in self.app.import_contacts(str(source))], ["A"])
+        header_only = self.root / "header.csv"
+        header_only.write_text("contact_id,name,email,organization\n\n\n", encoding="utf-8")
+        empty_root = self.root / "fresh"
+        self.assertEqual(ContactFlow(empty_root).import_contacts(str(header_only)), [])
+        self.assertFalse((empty_root / "data.json").exists())
+        self.assertFalse(empty_root.exists())
+
+    def test_import_contacts_rejects_bad_files_without_writing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        cases = {
+            "empty.csv": "",
+            "blank.csv": "\n\n",
+            "missing.csv": "contact_id,name,email\nA,Alice,a@example.test\n",
+            "extra.csv": "contact_id,name,email,organization,age\nA,Alice,a@example.test,Books,3\n",
+            "dup.csv": "contact_id,name,email,email\nA,Alice,a@example.test,b@example.test\n",
+            "spaced.csv": "contact_id, name,email,organization\nA,Alice,a@example.test,Books\n",
+            "ragged.csv": "contact_id,name,email,organization\nB,Bob,b@example.test\n",
+            "badfield.csv": "contact_id,name,email,organization\nB, ,b@example.test,Books\n",
+            "bademail.csv": "contact_id,name,email,organization\nB,Bob,nope,Books\n",
+            "dupid.csv": "contact_id,name,email,organization\nA,Other,o@example.test,Books\n",
+            "dupemail.csv": "contact_id,name,email,organization\nB,Bob, A@example.test ,Books\n",
+            "batchdup.csv": "contact_id,name,email,organization\nB,Bob,b@example.test,Books\nC,Cara,B@EXAMPLE.TEST,Games\n",
+            "batchsame.csv": "contact_id,name,email,organization\nB,Bob,b@example.test,Books\nB,Bob,b@example.test,Books\n",
+        }
+        for name, content in cases.items():
+            source = self.root / name
+            source.write_text(content, encoding="utf-8")
+            with self.assertRaises(ValueError, msg=name):
+                self.app.import_contacts(str(source))
+        bad_bytes = self.root / "latin1.csv"
+        bad_bytes.write_bytes("contact_id,name,email,organization\nB,Bébé,b@example.test,Books\n".encode("latin-1"))
+        with self.assertRaises(ValueError):
+            self.app.import_contacts(str(bad_bytes))
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([c["contact_id"] for c in ContactFlow(self.root).find()], ["A"])
+
+    def test_import_contacts_rejection_creates_no_storage(self):
+        source = self.root / "bad.csv"
+        source.write_text("contact_id,name,email,organization\nA,Alice,not-an-email,Books\n", encoding="utf-8")
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.import_contacts(str(source))
+        self.assertFalse(fresh.path.exists())
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_import_contacts_path_errors(self):
+        with self.assertRaises(FileNotFoundError):
+            self.app.import_contacts(str(self.root / "missing.csv"))
+        for bad in [None, 5, ["x"], "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.import_contacts(bad)
+        self.assertFalse(self.app.path.exists())
+
+    def test_cli_import_contacts(self):
+        source = self.root / "in.csv"
+        source.write_text("contact_id,name,email,organization\nA,Alice,Alice@EXAMPLE.test,Books\nB,Bob,b@example.test,Music\n", encoding="utf-8")
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"csv_path": str(source)}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "import-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([c["contact_id"] for c in json.loads(ok.stdout)], ["A", "B"])
+        self.assertEqual([c["contact_id"] for c in ContactFlow(self.root).find()], ["A", "B"])
+        payload.write_text(json.dumps({"csv_path": str(self.root / "missing.csv")}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "import-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        payload.write_text(json.dumps({"csv_path": str(source)}), encoding="utf-8")
+        again = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "import-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(again.returncode, 2)
+        self.assertEqual([c["contact_id"] for c in ContactFlow(self.root).find()], ["A", "B"])
+
     def test_cli_demo_and_invalid_action(self):
         result = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "demo"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
