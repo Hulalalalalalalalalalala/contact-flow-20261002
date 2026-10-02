@@ -225,6 +225,71 @@ class ContactFlow(JsonStore):
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
 
+    def funnel_report(self, organization=None, tags=None, tag_mode="all"):
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        tag_store = data.get("tags", {})
+        target_org = None if organization is None else organization.strip().casefold()
+
+        def matches(contact):
+            if target_org is not None and contact["organization"].casefold() != target_org:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        selected = {c["contact_id"]: c for c in data.get("contacts", {}).values() if matches(c)}
+        groups = {}
+
+        def bucket(key):
+            return groups.setdefault(key, {"contacts": 0, "new": 0, "qualified": 0, "won": 0,
+                                          "lost": 0, "opportunities": 0, "names": []})
+
+        for contact in selected.values():
+            entry = bucket(contact["organization"].casefold())
+            entry["contacts"] += 1
+            entry["names"].append(contact["organization"])
+
+        for opportunity in data.get("opportunities", {}).values():
+            contact = selected.get(opportunity["contact_id"])
+            if contact is None:
+                continue
+            entry = groups[contact["organization"].casefold()]
+            entry["opportunities"] += 1
+            entry[opportunity["stage"]] += 1
+
+        total = {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0}
+        organizations = []
+        for key in sorted(groups):
+            entry = groups[key]
+            for field in ("contacts", "new", "qualified", "won", "lost", "opportunities"):
+                total[field] += entry[field]
+            organizations.append({
+                "organization": min(entry["names"]),
+                "contacts": entry["contacts"],
+                "new": entry["new"],
+                "qualified": entry["qualified"],
+                "won": entry["won"],
+                "lost": entry["lost"],
+                "opportunities": entry["opportunities"],
+            })
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "contacts", "new", "qualified", "won", "lost", "opportunities"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["contacts"], row["new"], row["qualified"],
+                             row["won"], row["lost"], row["opportunities"]))
+        return {"total": total, "organizations": organizations, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):

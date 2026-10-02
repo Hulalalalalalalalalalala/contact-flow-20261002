@@ -373,5 +373,144 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertFalse(fresh_root.exists())
 
+    def test_funnel_report_totals_groups_and_csv(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Games")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.add_opportunity("O1", "A", "One")
+        self.app.add_opportunity("O2", "A", "Two")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_stage("O2", "won")
+        self.app.add_opportunity("O3", "B", "Three")
+        self.app.set_stage("O3", "lost")
+        self.app.add_opportunity("O4", "C", "Four")
+        self.app.set_stage("O4", "qualified")
+        report = self.app.funnel_report()
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"], {"contacts": 4, "new": 1, "qualified": 1, "won": 1, "lost": 1, "opportunities": 4})
+        # Contacts without opportunities still appear, with every stage at zero.
+        self.assertEqual([o["organization"] for o in report["organizations"]], ["Books", "Games", "Music"])
+        self.assertEqual(report["organizations"][0], {"organization": "Books", "contacts": 2, "new": 1, "qualified": 0, "won": 1, "lost": 1, "opportunities": 3})
+        self.assertEqual(report["organizations"][1], {"organization": "Games", "contacts": 1, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(report["organizations"][2], {"organization": "Music", "contacts": 1, "new": 0, "qualified": 1, "won": 0, "lost": 0, "opportunities": 1})
+        # CSV mirrors the organizations rows, LF-separated with a trailing newline.
+        self.assertEqual(report["csv"], "organization,contacts,new,qualified,won,lost,opportunities\n"
+                                        "Books,2,1,0,1,1,3\n"
+                                        "Games,1,0,0,0,0,0\n"
+                                        "Music,1,0,1,0,0,1\n")
+        self.assertNotIn("\r", report["csv"])
+
+    def test_funnel_report_display_name_min_codepoint_in_filtered_set(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "BOOKS")
+        # Filtering keeps only "books" and "BOOKS"; "Books" is excluded and cannot win the name.
+        report = self.app.funnel_report(tags=["x"])
+        self.assertEqual(report["organizations"], [])
+        self.app.set_tags("A", ["x"])
+        self.app.set_tags("C", ["x"])
+        report = self.app.funnel_report(tags=["x"])
+        self.assertEqual(len(report["organizations"]), 1)
+        self.assertEqual(report["organizations"][0]["organization"], "BOOKS")
+
+    def test_funnel_report_filters_intersect(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.add_opportunity("O1", "A", "One")
+        self.app.set_stage("O1", "qualified")
+        self.app.set_stage("O1", "won")
+        self.app.add_opportunity("O2", "B", "Two")
+        report = self.app.funnel_report(organization="books", tags=["vip"])
+        self.assertEqual(report["total"], {"contacts": 1, "new": 0, "qualified": 0, "won": 1, "lost": 0, "opportunities": 1})
+        self.assertEqual([o["organization"] for o in report["organizations"]], ["Books"])
+        self.assertEqual(self.app.funnel_report(organization="books", tags=["华东", "north"])["total"]["contacts"], 0)
+        self.assertEqual(self.app.funnel_report(organization="books", tags=["华东", "north"], tag_mode="any")["total"]["contacts"], 1)
+        empty = self.app.funnel_report(organization="missing")
+        self.assertEqual(empty["total"], {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(empty["organizations"], [])
+        self.assertEqual(empty["csv"], "organization,contacts,new,qualified,won,lost,opportunities\n")
+
+    def test_funnel_report_csv_escaping(self):
+        self.app.add_contact("A", "Alice", "a@example.test", 'A,B "店"\n二楼')
+        report = self.app.funnel_report()
+        self.assertEqual(
+            report["csv"],
+            'organization,contacts,new,qualified,won,lost,opportunities\n'
+            '"A,B ""店""\n二楼",1,0,0,0,0,0\n')
+
+    def test_funnel_report_validation_and_read_only(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for kwargs in [{"organization": 5}, {"organization": []}, {"tags": [1]}, {"tags": "x"}, {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.funnel_report(**kwargs)
+        self.app.funnel_report(organization=None, tags=None, tag_mode="all")
+        # Querying a root with no data file neither creates it nor its directory.
+        empty = self.root / "empty"
+        result = ContactFlow(empty).funnel_report()
+        self.assertFalse(empty.exists())
+        self.assertEqual(result["total"], {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(result["organizations"], [])
+        # Legacy data without an opportunities collection reports zero stages.
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({"contacts": {
+            "A": {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Org"}}}), encoding="utf-8")
+        legacy_report = ContactFlow(legacy).funnel_report()
+        self.assertEqual(legacy_report["organizations"], [
+            {"organization": "Org", "contacts": 1, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0}])
+
+    def test_funnel_report_regroups_after_merge(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "B", "One")
+        self.app.set_stage("O1", "qualified")
+        self.app.set_stage("O1", "won")
+        self.app.add_opportunity("O2", "B", "Two")
+        self.app.set_stage("O2", "lost")
+        self.app.merge_contacts("B", "A")
+        report = self.app.funnel_report()
+        self.assertEqual(report["total"], {"contacts": 1, "new": 0, "qualified": 0, "won": 1, "lost": 1, "opportunities": 2})
+        self.assertEqual([o["organization"] for o in report["organizations"]], ["Books"])
+        self.assertEqual(report["organizations"][0]["opportunities"], 2)
+        # Merged tags apply to the regrouped contact.
+        self.assertEqual(self.app.funnel_report(tags=["vip"])["total"]["contacts"], 1)
+
+    def test_cli_funnel_report(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O1", "A", "One")
+        self.app.set_stage("O1", "qualified")
+        self.app.set_stage("O1", "won")
+        # No input file reports every contact.
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "funnel-report"], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"]["contacts"], 2)
+        self.assertEqual(report["total"]["won"], 1)
+        # Object and array inputs behave like the other commands.
+        payload = self.root / "funnel.json"
+        payload.write_text(json.dumps({"organization": "books"}), encoding="utf-8")
+        filtered = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "funnel-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        self.assertEqual(json.loads(filtered.stdout)["total"]["contacts"], 1)
+        payload.write_text(json.dumps([{}, {"organization": "music"}]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "funnel-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        self.assertEqual([r["total"]["contacts"] for r in json.loads(batch.stdout)], [2, 1])
+        # Invalid arguments fail with exit 2, empty stdout and JSON on stderr.
+        for body in [{"organization": 5}, {"tags": [1]}, {"tag_mode": "ALL"}]:
+            payload.write_text(json.dumps(body), encoding="utf-8")
+            failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "funnel-report", str(payload)], text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 2, body)
+            self.assertEqual(failed.stdout, "")
+            json.loads(failed.stderr)
+
 if __name__ == "__main__":
     unittest.main()
