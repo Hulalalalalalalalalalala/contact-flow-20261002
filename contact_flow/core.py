@@ -357,6 +357,78 @@ class ContactFlow(JsonStore):
         return {"followup": dict(entry),
                 "reminder": dict(pending) if pending is not None else None}
 
+    def complete_reminders(self, completions):
+        # The whole batch validates against the pre-call state before any followup
+        # or reminder changes, so a rejected item never leaves half the batch
+        # applied; every followup append and reminder clear/replace commits in a
+        # single write.
+        if not isinstance(completions, list):
+            raise ValueError("completions must be a list")
+        if not completions:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        allowed_keys = {"contact_id", "expected_due_on", "on", "note", "next_reminder"}
+        entries = []
+        seen = set()
+        for item in completions:
+            if (not isinstance(item, dict)
+                    or not {"contact_id", "expected_due_on", "on", "note"} <= set(item)
+                    or not set(item) <= allowed_keys):
+                raise ValueError(
+                    "each completion must be an object with contact_id, expected_due_on, "
+                    "on, note and an optional next_reminder")
+            contact_id = text(item["contact_id"], "contact_id")
+            expected_due_on = calendar_day(item["expected_due_on"], "expected_due_on")
+            on = calendar_day(item["on"], "on")
+            note = text(item["note"], "note")
+            pending = None
+            next_reminder = item.get("next_reminder")
+            if next_reminder is not None:
+                if not isinstance(next_reminder, dict) or set(next_reminder) != {"due_on", "note"}:
+                    raise ValueError("next_reminder must be an object with exactly due_on and note")
+                due_on = calendar_day(next_reminder["due_on"], "due_on")
+                if due_on <= on:
+                    raise ValueError("next reminder due_on must be later than the completion date")
+                pending = {"contact_id": contact_id, "due_on": due_on,
+                           "note": text(next_reminder["note"], "note")}
+            # Normalized ids are case-sensitive; a repeated contact id (even an
+            # identical item) rejects the whole batch.
+            if contact_id in seen:
+                raise ValueError("duplicate contact id in completions")
+            seen.add(contact_id)
+            entries.append((contact_id, expected_due_on, on, note, pending))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        store = data.get("reminders", {})
+        planned = []
+        for contact_id, expected_due_on, on, note, pending in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            current = store.get(contact_id)
+            if current is None:
+                raise ValueError("no current reminder")
+            # Only the due date is checked against the claim; the reminder's
+            # note never participates in the comparison.
+            if current["due_on"] != expected_due_on:
+                raise ValueError("expected_due_on does not match the current reminder")
+            planned.append((contact_id, on, note, pending))
+        # Followup appends and reminder clears/replacements commit in a single write.
+        followups = data.setdefault("followups", [])
+        results = []
+        for contact_id, on, note, pending in planned:
+            entry = {"contact_id": contact_id, "on": on, "note": note}
+            followups.append(entry)
+            if pending is None:
+                del store[contact_id]
+            else:
+                store[contact_id] = pending
+            results.append({"followup": dict(entry),
+                            "reminder": dict(pending) if pending is not None else None})
+        if not store:
+            data.pop("reminders", None)
+        self._write(data)
+        return results
+
     def due_reminders(self, as_of):
         as_of = calendar_day(as_of, "as_of")
         data = self._read()
