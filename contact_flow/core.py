@@ -40,19 +40,7 @@ class ContactFlow(JsonStore):
 
     def update_contact(self, contact_id, changes):
         contact_id = text(contact_id, "contact_id")
-        if not isinstance(changes, dict) or not changes:
-            raise ValueError("changes must be a nonempty object")
-        normalized = {}
-        for key, value in changes.items():
-            if key not in UPDATABLE_FIELDS:
-                raise ValueError("changes contains an unsupported field: " + str(key))
-            # None and other non-strings can never clear a field; a trimmed value must stay nonempty.
-            clean = text(value, key)
-            if key == "email":
-                clean = clean.lower()
-                if clean.count("@") != 1 or any(c.isspace() for c in clean) or not all(clean.split("@")):
-                    raise ValueError("invalid email")
-            normalized[key] = clean
+        normalized = self._normalize_changes(changes)
         data = self._read()
         contacts = data.get("contacts", {})
         contact = contacts.get(contact_id)
@@ -69,6 +57,68 @@ class ContactFlow(JsonStore):
         contact.update(normalized)
         self._write(data)
         return contact
+
+    @staticmethod
+    def _normalize_changes(changes):
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must be a nonempty object")
+        normalized = {}
+        for key, value in changes.items():
+            if key not in UPDATABLE_FIELDS:
+                raise ValueError("changes contains an unsupported field: " + str(key))
+            # None and other non-strings can never clear a field; a trimmed value must stay nonempty.
+            clean = text(value, key)
+            if key == "email":
+                clean = clean.lower()
+                if clean.count("@") != 1 or any(c.isspace() for c in clean) or not all(clean.split("@")):
+                    raise ValueError("invalid email")
+            normalized[key] = clean
+        return normalized
+
+    def update_contacts(self, updates):
+        # The whole batch validates before any contact changes, so emails can be
+        # swapped or cycled within the batch while final duplicates still reject it.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != {"contact_id", "changes"}:
+                raise ValueError("each update must be an object with exactly contact_id and changes")
+            contact_id = text(item["contact_id"], "contact_id")
+            if contact_id in seen:
+                raise ValueError("duplicate contact id in updates")
+            seen.add(contact_id)
+            entries.append((contact_id, self._normalize_changes(item["changes"])))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        planned = []
+        updated_by_id = {}
+        for contact_id, normalized in entries:
+            contact = contacts.get(contact_id)
+            if contact is None:
+                raise ValueError("unknown contact")
+            updated = dict(contact)
+            updated.update(normalized)
+            planned.append((contact, updated))
+            updated_by_id[contact_id] = updated
+        # Uniqueness is judged on the final whole-store state, including non-participants;
+        # members swapping or cycling emails among themselves therefore stays unique.
+        final_emails = [updated_by_id[cid]["email"] if cid in updated_by_id else contact["email"]
+                        for cid, contact in contacts.items()]
+        if len(set(final_emails)) != len(final_emails):
+            raise ValueError("contact id or email already exists")
+        # Results are the complete contacts in input order, unchanged when the batch is a no-op.
+        results = [updated for _, updated in planned]
+        if all(contact == updated for contact, updated in planned):
+            return results
+        for contact, updated in planned:
+            contact.update(updated)
+        self._write(data)
+        return results
 
     def import_contacts(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():
