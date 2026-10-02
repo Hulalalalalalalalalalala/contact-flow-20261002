@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import ContactFlow
 
-ACTIONS = {'add': 'add_contact', 'follow-up': 'follow_up', 'find': 'find', 'timeline': 'timeline', 'merge': 'merge_contacts', 'set-tags': 'set_tags', 'get-tags': 'get_tags', 'import-contacts': 'import_contacts', 'add-opportunity': 'add_opportunity', 'set-stage': 'set_stage', 'find-opportunities': 'find_opportunities', 'funnel-report': 'funnel_report'}
+ACTIONS = {'add': 'add_contact', 'follow-up': 'follow_up', 'find': 'find', 'timeline': 'timeline', 'merge': 'merge_contacts', 'set-tags': 'set_tags', 'get-tags': 'get_tags', 'set-reminder': 'set_reminder', 'clear-reminder': 'clear_reminder', 'due-reminders': 'due_reminders', 'import-contacts': 'import_contacts', 'add-opportunity': 'add_opportunity', 'set-stage': 'set_stage', 'find-opportunities': 'find_opportunities', 'funnel-report': 'funnel_report'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

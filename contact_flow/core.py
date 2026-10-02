@@ -1,11 +1,22 @@
 import csv
 import io
+import re
 from datetime import date
 from .storage import JsonStore, text
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def iso_date(value, label):
+    value = text(value, label)
+    if not ISO_DATE_RE.match(value):
+        raise ValueError(label + " must be a valid YYYY-MM-DD date")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as error:
+        raise ValueError(label + " must be a valid YYYY-MM-DD date") from error
 
 def normalize_tags(value):
     if not isinstance(value, list):
@@ -121,6 +132,38 @@ class ContactFlow(JsonStore):
             raise ValueError("unknown contact")
         return list(data.get("tags", {}).get(contact_id, []))
 
+    def set_reminder(self, contact_id, due_on, note):
+        contact_id = text(contact_id, "contact_id")
+        due_on = iso_date(due_on, "due_on")
+        note = text(note, "note")
+        data = self._read()
+        if contact_id not in data.get("contacts", {}):
+            raise ValueError("unknown contact")
+        reminder = {"contact_id": contact_id, "due_on": due_on, "note": note}
+        data.setdefault("reminders", {})[contact_id] = reminder
+        self._write(data)
+        return dict(reminder)
+
+    def clear_reminder(self, contact_id):
+        contact_id = text(contact_id, "contact_id")
+        data = self._read()
+        if contact_id not in data.get("contacts", {}):
+            raise ValueError("unknown contact")
+        store = data.get("reminders", {})
+        existed = store.pop(contact_id, None) is not None
+        if existed:
+            if not store:
+                data.pop("reminders", None)
+            self._write(data)
+        return existed
+
+    def due_reminders(self, as_of):
+        as_of = iso_date(as_of, "as_of")
+        data = self._read()
+        due = [dict(reminder) for reminder in data.get("reminders", {}).values()
+               if reminder["due_on"] <= as_of]
+        return sorted(due, key=lambda reminder: (reminder["due_on"], reminder["contact_id"]))
+
     def add_opportunity(self, opportunity_id, contact_id, title):
         opportunity_id = text(opportunity_id, "opportunity_id")
         title = text(title, "title")
@@ -200,6 +243,16 @@ class ContactFlow(JsonStore):
             tag_store.pop(target_id, None)
         if not tag_store:
             data.pop("tags", None)
+        reminder_store = data.get("reminders")
+        if reminder_store is not None:
+            source_reminder = reminder_store.pop(source_id, None)
+            if source_reminder is not None:
+                target_reminder = reminder_store.get(target_id)
+                if target_reminder is None or source_reminder["due_on"] < target_reminder["due_on"]:
+                    source_reminder["contact_id"] = target_id
+                    reminder_store[target_id] = source_reminder
+            if not reminder_store:
+                data.pop("reminders", None)
         del contacts[source_id]
         self._write(data)
         return {"contact": contacts[target_id], "moved_followups": moved}
