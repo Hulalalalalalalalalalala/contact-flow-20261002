@@ -1008,6 +1008,209 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.funnel_report()["total"]["opportunities"], 4)
 
+    def seed_win_cycle(self):
+        # Books/books share one casefold group (display "Books"): A has O1
+        # (qualified 2024-02-29, won 2024-03-01: one day across a leap day) and
+        # O2 (undated qualified, won 2024-03-10: unmeasured); B has O3
+        # (qualified 2023-12-31, won 2024-01-01: one day across years).
+        # Music: C has O4 imported directly as won (no history: never counted).
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.set_stage("O1", "qualified", "2024-02-29")
+        self.app.set_stage("O1", "won", "2024-03-01")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_stage("O2", "won", "2024-03-10")
+        self.app.add_opportunity("O3", "B", "Third")
+        self.app.set_stage("O3", "qualified", "2023-12-31")
+        self.app.set_stage("O3", "won", "2024-01-01")
+        csv_path = self.write_csv("won.csv",
+            "opportunity_id,contact_id,title,stage\nO4,C,Fourth,won\n")
+        self.app.import_opportunities(str(csv_path))
+
+    def test_win_cycle_report_counts_measured_and_unmeasured(self):
+        self.seed_win_cycle()
+        report = self.app.win_cycle_report("2024-01-01", "2024-12-31")
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"],
+            {"won": 3, "measured": 2, "unmeasured": 1, "days": 2, "average": "1.00"})
+        # Only the shared Books/books group has counted wins; Music drops out.
+        self.assertEqual(report["organizations"], [
+            {"organization": "Books", "won": 3, "measured": 2, "unmeasured": 1,
+             "days": 2, "average": "1.00"}])
+        # Reopening the same root recomputes from stored history.
+        self.assertEqual(ContactFlow(self.root).win_cycle_report("2024-01-01", "2024-12-31"),
+                         report)
+
+    def test_win_cycle_report_same_day_zero_and_average_rounding(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O1", "A", "Same day")
+        self.app.set_stage("O1", "qualified", "2024-05-01")
+        self.app.set_stage("O1", "won", "2024-05-01")
+        self.app.add_opportunity("O2", "A", "Cross month")
+        self.app.set_stage("O2", "qualified", "2024-04-30")
+        self.app.set_stage("O2", "won", "2024-05-01")
+        report = self.app.win_cycle_report("2024-05-01", "2024-05-01")
+        self.assertEqual(report["total"],
+            {"won": 2, "measured": 2, "unmeasured": 0, "days": 1, "average": "0.50"})
+        # A third same-day win makes 1/3 of a day per deal.
+        self.app.add_opportunity("O3", "A", "Third")
+        self.app.set_stage("O3", "qualified", "2024-05-01")
+        self.app.set_stage("O3", "won", "2024-05-01")
+        self.assertEqual(self.app.win_cycle_report("2024-05-01", "2024-05-01")["total"]["average"],
+                         "0.33")
+
+    def test_win_cycle_report_range_and_undated_events(self):
+        self.seed_win_cycle()
+        # The qualified start may predate the range; only the win date is ranged.
+        report = self.app.win_cycle_report("2024-01-01", "2024-01-01")
+        self.assertEqual(report["total"],
+            {"won": 1, "measured": 1, "unmeasured": 0, "days": 1, "average": "1.00"})
+        # Wins outside the range are excluded.
+        report = self.app.win_cycle_report("2024-03-02", "2024-12-31")
+        self.assertEqual(report["total"],
+            {"won": 1, "measured": 0, "unmeasured": 1, "days": 0, "average": None})
+        # An undated win never counts, even inside the range.
+        self.app.add_opportunity("O5", "A", "Fifth")
+        self.app.set_stage("O5", "qualified", "2024-04-01")
+        self.app.set_stage("O5", "won")
+        report = self.app.win_cycle_report("2024-01-01", "2024-12-31")
+        self.assertEqual(report["total"]["won"], 3)
+
+    def test_win_cycle_report_filters_organization_and_tags(self):
+        self.seed_win_cycle()
+        by_org = self.app.win_cycle_report("2024-01-01", "2024-12-31", organization=" BOOKS ")
+        self.assertEqual(by_org["total"]["won"], 3)
+        tagged = self.app.win_cycle_report("2024-01-01", "2024-12-31", tags=["VIP"])
+        self.assertEqual(tagged["total"],
+            {"won": 2, "measured": 1, "unmeasured": 1, "days": 1, "average": "1.00"})
+        missing = self.app.win_cycle_report("2024-01-01", "2024-12-31", tags=["vip", "missing"])
+        self.assertEqual(missing["total"]["won"], 0)
+        self.assertEqual(missing["organizations"], [])
+        any_tag = self.app.win_cycle_report("2024-01-01", "2024-12-31",
+                                            tags=["vip", "missing"], tag_mode="any")
+        self.assertEqual(any_tag["total"]["won"], 2)
+
+    def test_win_cycle_report_csv_matches_organizations(self):
+        self.seed_win_cycle()
+        report = self.app.win_cycle_report("2024-01-01", "2024-12-31")
+        self.assertEqual(report["csv"],
+            "organization,won,measured,unmeasured,days,average\nBooks,3,2,1,2,1.00\n")
+        # An all-unmeasured group writes an empty average field.
+        report = self.app.win_cycle_report("2024-03-02", "2024-12-31")
+        self.assertEqual(report["csv"],
+            "organization,won,measured,unmeasured,days,average\nBooks,1,0,1,0,\n")
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["organization", "won", "measured", "unmeasured", "days", "average"])
+
+    def test_win_cycle_report_empty_and_legacy_data(self):
+        # No data file at all: counts are zero and nothing is created.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.win_cycle_report("2024-01-01", "2024-12-31")
+        self.assertEqual(report["total"],
+            {"won": 0, "measured": 0, "unmeasured": 0, "days": 0, "average": None})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"], "organization,won,measured,unmeasured,days,average\n")
+        self.assertFalse(fresh_root.exists())
+        # Legacy store: a won opportunity without any stage history collection.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["opportunities"] = {"O1": {"opportunity_id": "O1", "contact_id": "A",
+                                        "title": "Old", "stage": "won"}}
+        self.app.path.write_text(json.dumps(data), encoding="utf-8")
+        report = ContactFlow(self.root).win_cycle_report("2020-01-01", "2030-01-01")
+        self.assertEqual(report["total"]["won"], 0)
+        self.assertEqual(report["organizations"], [])
+
+    def test_win_cycle_report_regroups_after_transfer_and_merge(self):
+        self.seed_win_cycle()
+        self.app.transfer_opportunities([
+            {"opportunity_id": "O3", "source_contact_id": "B", "target_contact_id": "C"}])
+        report = self.app.win_cycle_report("2024-01-01", "2024-12-31")
+        by_org = {row["organization"]: row for row in report["organizations"]}
+        self.assertEqual(by_org["Music"],
+            {"organization": "Music", "won": 1, "measured": 1, "unmeasured": 0,
+             "days": 1, "average": "1.00"})
+        self.assertEqual(by_org["Books"]["won"], 2)
+        self.assertEqual(report["total"]["won"], 3)
+        # Merging the owner into another contact regroups by the target's profile.
+        self.app.merge_contacts("B", "A")
+        report = self.app.win_cycle_report("2024-01-01", "2024-12-31")
+        self.assertEqual(report["total"]["won"], 3)
+
+    def test_win_cycle_report_validates_arguments_without_writing(self):
+        self.seed_win_cycle()
+        before = self.app.path.read_bytes()
+        bad = [
+            {"start_on": "2024-13-01"},
+            {"start_on": "2024-02-30"},
+            {"start_on": "  "},
+            {"start_on": 5},
+            {"end_on": "2024-2-3"},
+            {"start_on": "2024-12-31", "end_on": "2024-01-01"},
+            {"organization": 5},
+            {"tags": "vip"},
+            {"tags": ["ok", 1]},
+            {"tag_mode": "ALL"},
+        ]
+        for overrides in bad:
+            kwargs = {"start_on": "2024-01-01", "end_on": "2024-12-31"}
+            kwargs.update(overrides)
+            with self.assertRaises(ValueError):
+                self.app.win_cycle_report(**kwargs)
+        with self.assertRaises(TypeError):
+            self.app.win_cycle_report()
+        with self.assertRaises(TypeError):
+            self.app.win_cycle_report("2024-01-01")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A fresh root validates too, without creating the data directory.
+        fresh_root = self.root / "fresh"
+        with self.assertRaises(ValueError):
+            ContactFlow(fresh_root).win_cycle_report("2024-02-30", "2024-12-31")
+        self.assertFalse(fresh_root.exists())
+
+    def test_cli_win_cycle_report_success_and_failure(self):
+        self.seed_win_cycle()
+        # No input file means missing required arguments: exit 2, empty stdout.
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "win-cycle-report"], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        json.loads(missing.stderr)
+        payload = self.root / "win.json"
+        payload.write_text(json.dumps({"start_on": "2024-01-01", "end_on": "2024-12-31"}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "win-cycle-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(report["total"],
+            {"won": 3, "measured": 2, "unmeasured": 1, "days": 2, "average": "1.00"})
+        # Array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"start_on": "2024-01-01", "end_on": "2024-12-31", "tags": ["vip"]},
+            {"start_on": "2024-01-01", "end_on": "2024-01-01"}]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "win-cycle-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"]["won"], 2)
+        self.assertEqual(values[1]["total"]["won"], 1)
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"start_on": "2024-02-30", "end_on": "2024-12-31"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "win-cycle-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def test_set_reminder_replaces_and_persists_trimmed_values(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         result = self.app.set_reminder(" A ", "2024-02-29", "  call  him  ")
