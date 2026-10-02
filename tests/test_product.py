@@ -3257,6 +3257,352 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(gone.stdout, "")
         self.assertFalse(empty.exists())
 
+    def test_complete_reminders_batch_clears_replaces_and_appends_in_order(self):
+        self.seed_complete()
+        result = self.app.complete_reminders([
+            {"contact_id": " B ", "expected_due_on": " 2026-09-30 ", "on": " 2026-10-02 ",
+             "note": " 已电话\n约好下次 "},
+            {"contact_id": "A", "expected_due_on": "2026-10-05", "on": "2026-10-02",
+             "note": "a three", "next_reminder": {"due_on": " 2026-11-01 ", "note": " a next "}},
+            {"contact_id": "陈", "expected_due_on": "2099-01-01", "on": "2024-02-29",
+             "note": "leap 完成", "next_reminder": None},
+        ])
+        # Results follow input order; each item has exactly followup and reminder.
+        self.assertEqual([set(item) for item in result],
+                         [{"followup", "reminder"}] * 3)
+        self.assertEqual(result, [
+            {"followup": {"contact_id": "B", "on": "2026-10-02",
+                          "note": "已电话\n约好下次"}, "reminder": None},
+            {"followup": {"contact_id": "A", "on": "2026-10-02", "note": "a three"},
+             "reminder": {"contact_id": "A", "due_on": "2026-11-01", "note": "a next"}},
+            {"followup": {"contact_id": "陈", "on": "2024-02-29", "note": "leap 完成"},
+             "reminder": None},
+        ])
+        reopened = ContactFlow(self.root)
+        # New same-day followups for A come after A's original same-day records.
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")],
+                         [("2026-10-02", "a one"), ("2026-10-02", "a two"),
+                          ("2026-10-02", "a two"), ("2026-10-02", "a three")])
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("B")],
+                         [("2026-10-01", "b note"), ("2026-10-02", "已电话\n约好下次")])
+        # B and 陈 cleared; only A's replaced reminder remains.
+        self.assertEqual(reopened.due_reminders("2099-12-31"),
+                         [{"contact_id": "A", "due_on": "2026-11-01", "note": "a next"}])
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(list(raw["reminders"]), ["A"])
+        self.assertEqual(len(raw["followups"]), 7)
+
+    def test_complete_reminders_matches_sequential_single_calls_bytes(self):
+        self.seed_complete()
+        twin_root = self.root / "twin"
+        twin_root.mkdir()
+        (twin_root / "data.json").write_bytes(self.app.path.read_bytes())
+        rows = [
+            {"contact_id": "A", "expected_due_on": "2026-10-05", "on": "2026-10-02",
+             "note": "a three", "next_reminder": {"due_on": "2026-11-01", "note": "a next"}},
+            {"contact_id": "B", "expected_due_on": "2026-09-30", "on": "2026-10-01",
+             "note": "b done"},
+        ]
+        values = self.app.complete_reminders(rows)
+        twin_app = ContactFlow(twin_root)
+        expected = [twin_app.complete_reminder(
+            row["contact_id"], row["on"], row["note"], row.get("next_reminder"))
+            for row in rows]
+        self.assertEqual(values, expected)
+        self.assertEqual((self.root / "data.json").read_bytes(),
+                         (twin_root / "data.json").read_bytes())
+
+    def test_complete_reminders_expected_due_note_is_not_checked(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2026-10-05", "the reminder note")
+        # Only the due date is matched; the reminder's note plays no role.
+        result = self.app.complete_reminders([
+            {"contact_id": "A", "expected_due_on": "2026-10-05", "on": "2026-10-06",
+             "note": "done late", "next_reminder": {"due_on": "2026-12-01", "note": "new"}}])
+        self.assertEqual(result[0]["followup"]["on"], "2026-10-06")
+        # A mismatched expected due date rejects the batch; completion may be earlier
+        # or later than the real due date, but the expectation must be exact.
+        before = self.app.path.read_bytes()
+        for expected_due_on in ("2026-11-30", "2026-12-02", "  "):
+            with self.assertRaises(ValueError):
+                self.app.complete_reminders([
+                    {"contact_id": "A", "expected_due_on": expected_due_on,
+                     "on": "2026-12-03", "note": "x"}])
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_complete_reminders_requires_list_and_missing_argument_is_type_error(self):
+        for bad in [None, {}, "x", 5, True, ({"contact_id": "A"},)]:
+            with self.assertRaises(ValueError):
+                self.app.complete_reminders(bad)
+        self.assertFalse(self.app.path.exists())
+        with self.assertRaises(TypeError):
+            self.app.complete_reminders()
+
+    def test_complete_reminders_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.complete_reminders([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_complete()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.complete_reminders([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_complete_reminders_validates_item_shape_and_fields_without_partial_changes(self):
+        self.seed_complete()
+        before = self.app.path.read_bytes()
+        good = {"contact_id": "A", "expected_due_on": "2026-10-05",
+                "on": "2026-10-02", "note": "x"}
+        bad_batches = [
+            [None], [5], ["x"], [[]], [{}],
+            [{"contact_id": "A", "expected_due_on": "2026-10-05", "on": "2026-10-02"}],
+            [{"contact_id": "A", "expected_due_on": "2026-10-05", "note": "x"}],
+            [{"contact_id": "A", "on": "2026-10-02", "note": "x"}],
+            [{"expected_due_on": "2026-10-05", "on": "2026-10-02", "note": "x"}],
+            [dict(good, extra="y")],
+            [dict(good, contact_id=None)], [dict(good, contact_id=5)], [dict(good, contact_id="  ")],
+            [dict(good, note=None)], [dict(good, note=5)], [dict(good, note="  ")],
+            [dict(good, on=None)], [dict(good, on=5)], [dict(good, on="2026-02-30")],
+            [dict(good, on="2026-1-1")], [dict(good, on="2023-02-29")],
+            [dict(good, expected_due_on=None)], [dict(good, expected_due_on=5)],
+            [dict(good, expected_due_on="not-a-date")], [dict(good, expected_due_on="2026-02-30")],
+            [dict(good, next_reminder=[])], [dict(good, next_reminder="x")],
+            [dict(good, next_reminder=True)],
+            [dict(good, next_reminder={"due_on": "2026-11-01"})],
+            [dict(good, next_reminder={"note": "x"})],
+            [dict(good, next_reminder={"due_on": "2026-11-01", "note": "x", "extra": 1})],
+            [dict(good, next_reminder={"due_on": "2026-02-30", "note": "x"})],
+            [dict(good, next_reminder={"due_on": 5, "note": "x"})],
+            [dict(good, next_reminder={"due_on": "2026-10-02", "note": "x"})],
+            [dict(good, next_reminder={"due_on": "2026-10-01", "note": "x"})],
+            # A valid first item followed by an invalid second item rolls both back.
+            [good,
+             {"contact_id": "B", "expected_due_on": "2026-09-30", "on": "2026-10-02"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.complete_reminders(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # No rejection appended a followup or touched a reminder.
+        reopened = ContactFlow(self.root)
+        self.assertEqual(len(reopened.timeline("A")), 3)
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2099-12-31")],
+                         [("B", "2026-09-30"), ("A", "2026-10-05"), ("陈", "2099-01-01")])
+
+    def test_complete_reminders_rejects_duplicate_unknown_missing_and_mismatch_atomically(self):
+        self.seed_complete()
+        before = self.app.path.read_bytes()
+        good_a = {"contact_id": "A", "expected_due_on": "2026-10-05",
+                  "on": "2026-10-02", "note": "x"}
+        # Duplicate normalized id, even with identical content, rejects the batch.
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                dict(good_a, contact_id=" A "),
+                dict(good_a, contact_id="A", note="different")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([good_a, dict(good_a, note="again")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Ids are case-sensitive: lowercase a is unknown.
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([dict(good_a, contact_id="a")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Unknown contact, a contact without a reminder, and a due date mismatch
+        # each reject a batch where an earlier item was otherwise valid.
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                {"contact_id": "ZZZ", "expected_due_on": "2026-10-05",
+                 "on": "2026-10-02", "note": "x"}])
+        self.app.add_contact("N", "Nina", "n@example.test", "Books")
+        # Adding N itself commits; re-snapshot so the rejected batch is what is compared.
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                good_a,
+                {"contact_id": "N", "expected_due_on": "2026-10-05",
+                 "on": "2026-10-02", "note": "x"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                good_a,
+                {"contact_id": "B", "expected_due_on": "2026-09-29",
+                 "on": "2026-10-02", "note": "x"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual([r["note"] for r in reopened.timeline("A")],
+                         ["a one", "a two", "a two"])
+        self.assertEqual(len(reopened.due_reminders("2099-12-31")), 3)
+        # A rejected batch against a root that never existed creates neither directory nor file.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.complete_reminders([
+                {"contact_id": "ZZZ", "expected_due_on": "2026-10-05",
+                 "on": "2026-10-02", "note": "x"}])
+        self.assertFalse(fresh_root.exists())
+
+    def test_complete_reminders_preserves_contacts_tags_deals_and_reports(self):
+        self.seed_complete()
+        before_contacts = {c["contact_id"]: dict(c) for c in self.app.find()}
+        funnel_before = self.app.funnel_report()
+        self.app.complete_reminders([
+            {"contact_id": "A", "expected_due_on": "2026-10-05", "on": "2026-10-02",
+             "note": "a three", "next_reminder": {"due_on": "2026-11-01", "note": "next"}}])
+        reopened = ContactFlow(self.root)
+        self.assertEqual({c["contact_id"]: c for c in reopened.find()}, before_contacts)
+        self.assertEqual(reopened.get_tags("A"), ["vip", "华东"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A"),
+                         [{"opportunity_id": "O1", "contact_id": "A", "title": "Deal",
+                           "stage": "new"}])
+        self.assertEqual(reopened.funnel_report(), funnel_before)
+        self.assertEqual([r["note"] for r in reopened.timeline("B")], ["b note"])
+
+    def test_complete_reminders_on_legacy_data_missing_collections(self):
+        contact = {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                   "organization": "Old"}
+        # Legacy document with a reminder but no followups collection: still completable.
+        legacy1 = self.root / "legacy-clear"
+        legacy1.mkdir()
+        (legacy1 / "data.json").write_text(json.dumps(
+            {"contacts": {"L": contact},
+             "reminders": {"L": {"contact_id": "L", "due_on": "2026-10-05", "note": "old"}}}),
+            encoding="utf-8")
+        app = ContactFlow(legacy1)
+        result = app.complete_reminders(
+            [{"contact_id": "L", "expected_due_on": "2026-10-05",
+              "on": "2026-10-02", "note": "done"}])
+        self.assertEqual(result, [{"followup": {"contact_id": "L", "on": "2026-10-02",
+                                                "note": "done"},
+                                  "reminder": None}])
+        raw = json.loads((legacy1 / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("reminders", raw)
+        self.assertEqual(raw["followups"],
+                         [{"contact_id": "L", "on": "2026-10-02", "note": "done"}])
+        # Legacy document without a reminders collection: a nonempty batch is rejected
+        # as having no current reminder, and the file bytes stay unchanged.
+        legacy2 = self.root / "legacy-no-reminders"
+        legacy2.mkdir()
+        (legacy2 / "data.json").write_text(json.dumps({"contacts": {"L": dict(contact)}}),
+                                           encoding="utf-8")
+        app2 = ContactFlow(legacy2)
+        before = (legacy2 / "data.json").read_bytes()
+        for item_kwargs in ({}, {"next_reminder": {"due_on": "2026-11-01", "note": "x"}}):
+            with self.assertRaises(ValueError):
+                app2.complete_reminders([
+                    dict({"contact_id": "L", "expected_due_on": "2026-10-05",
+                          "on": "2026-10-02", "note": "done"}, **item_kwargs)])
+            self.assertEqual((legacy2 / "data.json").read_bytes(), before)
+        self.assertEqual(ContactFlow(legacy2).timeline("L"), [])
+
+    def test_cli_complete_reminders_object_array_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Music")
+        self.app.follow_up("A", "2026-10-02", "prior")
+        self.app.set_reminder("A", "2026-10-05", "a note")
+        self.app.set_reminder("B", "2026-10-05", "b note")
+        self.app.set_reminder("C", "2026-10-05", "c note")
+        self.app.set_reminder("D", "2026-10-05", "d note")
+        payload = self.root / "completions.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "complete-reminders", str(payload)],
+                                  text=True, capture_output=True)
+
+        # Object input: one atomic batch with mixed clear/replace results, exit 0.
+        ok = cli({"completions": [
+            {"contact_id": " A ", "expected_due_on": " 2026-10-05 ",
+             "on": " 2026-10-02 ", "note": " done\nline2 ", "next_reminder": None},
+            {"contact_id": "B", "expected_due_on": "2026-10-05", "on": "2026-10-01",
+             "note": "b done",
+             "next_reminder": {"due_on": " 2026-12-01 ", "note": " b next "}},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"followup": {"contact_id": "A", "on": "2026-10-02", "note": "done\nline2"},
+             "reminder": None},
+            {"followup": {"contact_id": "B", "on": "2026-10-01", "note": "b done"},
+             "reminder": {"contact_id": "B", "due_on": "2026-12-01", "note": "b next"}},
+        ])
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("A")],
+                         ["prior", "done\nline2"])
+
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"completions": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+
+        # Validation failure (due date mismatch): exit 2, empty stdout, JSON error
+        # on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"completions": [
+            {"contact_id": "C", "expected_due_on": "2026-10-04",
+             "on": "2026-10-01", "note": "never"},
+            {"contact_id": "D", "expected_due_on": "2026-10-05",
+             "on": "2026-10-01", "note": "never"},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.due_reminders("2026-10-05"),
+                         [{"contact_id": "C", "due_on": "2026-10-05", "note": "c note"},
+                          {"contact_id": "D", "due_on": "2026-10-05", "note": "d note"}])
+        self.assertEqual(reopened.timeline("C"), [])
+        self.assertEqual(reopened.timeline("D"), [])
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # completions must be a list.
+        not_list = cli({"completions": {"contact_id": "C"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"completions": [
+            {"contact_id": "ZZZ", "expected_due_on": "2026-10-05",
+             "on": "2026-10-01", "note": "x"}]}, root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_complete_reminders_outer_array_keeps_earlier_batches(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_reminder("A", "2026-10-05", "a note")
+        self.app.set_reminder("B", "2026-10-05", "b note")
+        payload = self.root / "batches.json"
+        # Outer array runs whole batches independently; a later failed batch keeps
+        # the earlier successful batch (unlike atomicity inside one completions list).
+        payload.write_text(json.dumps([
+            {"completions": [
+                {"contact_id": "A", "expected_due_on": "2026-10-05",
+                 "on": "2026-10-02", "note": "a done"}]},
+            {"completions": [
+                {"contact_id": "B", "expected_due_on": "2026-09-30",
+                 "on": "2026-10-02", "note": "b never"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "complete-reminders", str(payload)],
+                                 text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        reopened = ContactFlow(self.root)
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["a done"])
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "B", "due_on": "2026-10-05", "note": "b note"}])
+        self.assertEqual(reopened.timeline("B"), [])
+
     def seed_stage_deals(self):
         self.app.add_contact("A", "Alice", "alice@example.test", "Books")
         self.app.add_contact("B", "Bob", "bob@example.test", "Music")
