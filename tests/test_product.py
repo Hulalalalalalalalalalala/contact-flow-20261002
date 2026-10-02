@@ -925,5 +925,175 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def seed_followups(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.follow_up("B", "2026-10-02", "b second day")
+        self.app.follow_up("A", "2026-10-02", "a later save")
+        self.app.follow_up("A", "2026-10-01", "a first day")
+        self.app.follow_up("A", "2026-10-02", "a earlier save")
+        self.app.follow_up("A", "2026-10-02", "a earlier save")  # duplicate kept verbatim
+        self.app.follow_up("C", "2026-10-03", "c out of range day")
+        # D has no followups; opportunities and reminders do not affect the report.
+        self.app.add_opportunity("O1", "D", "Deal")
+        self.app.set_reminder("D", "2026-10-01", "nudge")
+
+    def test_followup_report_records_content_and_order(self):
+        self.seed_followups()
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in report["records"]],
+                         [("A", "2026-10-01", "a first day"),
+                          ("A", "2026-10-02", "a later save"),
+                          ("A", "2026-10-02", "a earlier save"),
+                          ("A", "2026-10-02", "a earlier save"),
+                          ("B", "2026-10-02", "b second day")])
+        for record in report["records"]:
+            self.assertEqual(set(record), {"contact_id", "name", "email", "organization", "on", "note"})
+        self.assertEqual(report["records"][0],
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+             "organization": "Books", "on": "2026-10-01", "note": "a first day"})
+        # Inclusive bounds: a single-day range returns that day's entries.
+        single = self.app.followup_report("2026-10-02", "2026-10-02")
+        self.assertEqual([r["on"] for r in single["records"]], ["2026-10-02"] * 4)
+        # D has no followups and produces nothing; C's entry is outside the range.
+        self.assertNotIn("D", [r["contact_id"] for r in report["records"]])
+        self.assertNotIn("C", [r["contact_id"] for r in report["records"]])
+
+    def test_followup_report_csv_matches_records(self):
+        self.seed_followups()
+        report = self.app.followup_report("2026-10-01", "2026-10-03")
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["contact_id", "name", "email", "organization", "on", "note"])
+        decoded = [dict(zip(rows[0], row)) for row in rows[1:]]
+        self.assertEqual(decoded, report["records"])
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["records"]) + 1)
+
+    def test_followup_report_csv_escapes_and_preserves_internal_newlines(self):
+        self.app.add_contact("A", "Al, \"店\"", "a@example.test", "Books")
+        self.app.follow_up("A", "2026-10-01", "line one\nline two")
+        report = self.app.followup_report("2026-10-01", "2026-10-01")
+        self.assertIn('"Al, ""店""",a@example.test,Books,2026-10-01,"line one\nline two"', report["csv"])
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[1][1], "Al, \"店\"")
+        self.assertEqual(rows[1][5], "line one\nline two")
+
+    def test_followup_report_filters_organization_tags_and_intersection(self):
+        self.seed_followups()
+        by_org = self.app.followup_report("2026-10-01", "2026-10-03", organization=" BOOKS ")
+        self.assertEqual([r["contact_id"] for r in by_org["records"]], ["A", "A", "A", "A", "B"])
+        tagged = self.app.followup_report("2026-10-01", "2026-10-03", tags=["VIP"])
+        self.assertEqual([r["contact_id"] for r in tagged["records"]], ["A", "A", "A", "A", "B"])
+        both = self.app.followup_report("2026-10-01", "2026-10-03", tags=["vip", "华东"])
+        self.assertEqual([r["contact_id"] for r in both["records"]], ["A", "A", "A", "A"])
+        any_tag = self.app.followup_report("2026-10-01", "2026-10-03",
+                                           tags=["vip", "missing"], tag_mode="any")
+        self.assertEqual([r["contact_id"] for r in any_tag["records"]], ["A", "A", "A", "A", "B"])
+        # Organization and tag conditions intersect.
+        self.assertEqual(self.app.followup_report("2026-10-01", "2026-10-03",
+                                                  organization="Music", tags=["vip"])["records"], [])
+        # None and empty list leave tags unrestricted.
+        self.assertEqual(self.app.followup_report("2026-10-01", "2026-10-03", tags=None),
+                         self.app.followup_report("2026-10-01", "2026-10-03", tags=[]))
+
+    def test_followup_report_empty_and_legacy_data(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"], "contact_id,name,email,organization,on,note\n")
+        self.assertFalse(fresh_root.exists())
+        # Contacts but no followups yet: empty records, header-only CSV.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"], "contact_id,name,email,organization,on,note\n")
+
+    def test_followup_report_uses_current_profile_and_tags_after_update_and_merge(self):
+        self.seed_followups()
+        self.app.update_contact("A", {"name": "Alice Wang", "organization": "Music"})
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["records"][0]["name"], "Alice Wang")
+        self.assertEqual(report["records"][0]["organization"], "Music")
+        # Organization filter follows the current value.
+        self.assertEqual(self.app.followup_report("2026-10-01", "2026-10-02",
+                                                  organization="books")["records"][0]["contact_id"], "B")
+        # Merge: B's followups move to A and display A's current profile and tags.
+        self.app.merge_contacts("B", "A")
+        merged = self.app.followup_report("2026-10-01", "2026-10-02", tags=["vip"])
+        self.assertEqual([r["contact_id"] for r in merged["records"]], ["A"] * 5)
+        # B's entry was saved first, so stable ordering places it before A's same-day notes.
+        self.assertEqual([r["note"] for r in merged["records"]],
+                         ["a first day", "b second day", "a later save", "a earlier save", "a earlier save"])
+        self.assertEqual(merged["records"][1]["name"], "Alice Wang")
+
+    def test_followup_report_validates_arguments_without_writing(self):
+        self.seed_followups()
+        before = self.app.path.read_bytes()
+        bad_dates = [None, 5, "", "   ", "2026-1-1", "20261002", "2026-13-01", "2026-02-30"]
+        for bad in bad_dates:
+            with self.assertRaises(ValueError):
+                self.app.followup_report(bad, "2026-10-02")
+            with self.assertRaises(ValueError):
+                self.app.followup_report("2026-10-01", bad)
+        with self.assertRaises(ValueError):
+            self.app.followup_report("2026-10-03", "2026-10-02")
+        for kwargs in [{"organization": 5}, {"organization": ["x"]},
+                       {"tags": ["ok", 1]}, {"tags": "vip"},
+                       {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.followup_report("2026-10-01", "2026-10-02", **kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Legal leap day is accepted.
+        self.assertEqual(self.app.followup_report("2024-02-29", "2024-02-29")["records"], [])
+        # Validation also applies when there is no data at all, creating nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.followup_report("2026-02-30", "2026-10-02")
+        with self.assertRaises(ValueError):
+            fresh.followup_report("2026-10-02", "2026-10-01")
+        with self.assertRaises(ValueError):
+            fresh.followup_report("2026-10-01", "2026-10-02", tag_mode="weird")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_cli_followup_report_success_and_failure(self):
+        self.seed_followups()
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"start_on": "2026-10-01", "end_on": "2026-10-02"}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual(len(report["records"]), 5)
+        # Filters pass through; array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "organization": "books"},
+            {"start_on": "2026-10-02", "end_on": "2026-10-02", "tags": ["vip", "华东"]},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["contact_id"] for r in values[0]["records"]], ["A", "A", "A", "A", "B"])
+        self.assertEqual([r["contact_id"] for r in values[1]["records"]], ["A", "A", "A"])
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"start_on": "2026-10-02", "end_on": "2026-10-01"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
 if __name__ == "__main__":
     unittest.main()
