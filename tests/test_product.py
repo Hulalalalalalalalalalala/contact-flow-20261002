@@ -205,6 +205,176 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(json.loads(quiet.stdout), [])
         self.assertFalse(empty.exists())
 
+    def test_search_contacts_normalization_exact_and_distances(self):
+        self.app.add_contact("A", "Alice Chen", "a@example.test", "Books")
+        result = self.app.search_contacts("lice")
+        self.assertEqual(set(result), {"total", "matches"})
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(set(result["matches"][0]), {"contact", "distance"})
+        self.assertEqual(result["matches"][0]["distance"], 0)
+        # casefold and full whitespace stripping on both sides
+        self.assertEqual(self.app.search_contacts(" LICE ")["matches"][0]["distance"], 0)
+        # NFKC full-width letters and an ideographic space normalize away
+        self.app.add_contact("B", "Ａlice 　Chen", "b@example.test", "Books")
+        result = self.app.search_contacts("alicechen")
+        self.assertEqual([m["contact"]["contact_id"] for m in result["matches"]], ["A", "B"])
+        self.assertEqual(result["matches"][1]["contact"]["name"], "Ａlice 　Chen")
+        # insertion against the best fragment is one code-point edit
+        self.app.add_contact("C", "Jo", "c@example.test", "Books")
+        self.assertEqual(self.app.search_contacts("joe", max_distance=1)["matches"][0]["distance"], 1)
+        # exact-only threshold
+        self.assertEqual(self.app.search_contacts("joe", max_distance=0)["total"], 0)
+        self.assertEqual(self.app.search_contacts("jo", max_distance=0)["total"], 1)
+        # a two-edit fragment (zqf vs the "def" slice: two substitutions) is only
+        # reachable at max_distance 2; the other names share no z/q/f code point.
+        self.app.add_contact("D", "abcdef", "d@example.test", "Books")
+        self.assertEqual(self.app.search_contacts("zqf"), {"total": 0, "matches": []})
+        result = self.app.search_contacts("zqf", max_distance=2)
+        self.assertEqual([(m["contact"]["contact_id"], m["distance"]) for m in result["matches"]],
+                         [("D", 2)])
+
+    def test_search_contacts_ordering_pagination_and_defaults(self):
+        self.app.add_contact("m3", "xabex", "m3@example.test", "Books")
+        self.app.add_contact("a2", "abd", "a2@example.test", "Books")
+        self.app.add_contact("z1", "abc", "z1@example.test", "Books")
+        result = self.app.search_contacts("abe")
+        self.assertEqual([(m["contact"]["contact_id"], m["distance"]) for m in result["matches"]],
+                         [("m3", 0), ("a2", 1), ("z1", 1)])
+        self.assertEqual(result["total"], 3)
+        page = self.app.search_contacts("abe", limit=2)
+        self.assertEqual(page["total"], 3)
+        self.assertEqual([m["contact"]["contact_id"] for m in page["matches"]], ["m3", "a2"])
+        page = self.app.search_contacts("abe", limit=2, offset=2)
+        self.assertEqual(page["total"], 3)
+        self.assertEqual([m["contact"]["contact_id"] for m in page["matches"]], ["z1"])
+        page = self.app.search_contacts("abe", offset=3)
+        self.assertEqual(page, {"total": 3, "matches": []})
+        for index in range(25):
+            self.app.add_contact("p%02d" % index, "person %d" % index,
+                                 "p%02d@example.test" % index, "Music")
+        result = self.app.search_contacts("person")
+        self.assertEqual(result["total"], 25)
+        self.assertEqual(len(result["matches"]), 20)
+        self.assertEqual(result["matches"][0]["contact"]["contact_id"], "p00")
+        self.assertEqual(len(self.app.search_contacts("person", limit=20, offset=20)["matches"]), 5)
+
+    def test_search_contacts_filters_intersect_with_name(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Alicia", "b@example.test", "Music")
+        self.app.add_contact("C", "Alice", "c@example.test", "Books")
+        self.app.set_tags("A", ["vip"])
+        self.app.set_tags("C", ["north"])
+        self.assertEqual([m["contact"]["contact_id"] for m in
+                          self.app.search_contacts("ali", organization="books")["matches"]],
+                         ["A", "C"])
+        self.assertEqual([m["contact"]["contact_id"] for m in
+                          self.app.search_contacts("ali", tags=["vip"])["matches"]], ["A"])
+        self.assertEqual([m["contact"]["contact_id"] for m in
+                          self.app.search_contacts("ali", tags=["vip", "north"], tag_mode="any")["matches"]],
+                         ["A", "C"])
+        self.assertEqual(self.app.search_contacts("ali", tags=["missing"]),
+                         {"total": 0, "matches": []})
+        # name condition intersects the filters
+        self.assertEqual(self.app.search_contacts("bob", organization="books"),
+                         {"total": 0, "matches": []})
+
+    def test_search_contacts_validation_empty_store_and_typeerror(self):
+        self.assertFalse(self.app.path.exists())
+        for bad_query in [5, None, True, [], "", "   ", "　", "\t\n"]:
+            with self.assertRaises(ValueError):
+                self.app.search_contacts(bad_query)
+        for bad_distance in [3, -1, "1", 1.0, True, False, None]:
+            with self.assertRaises(ValueError):
+                self.app.search_contacts("ali", max_distance=bad_distance)
+        for bad_limit in [0, -1, "20", 1.0, True, False, None]:
+            with self.assertRaises(ValueError):
+                self.app.search_contacts("ali", limit=bad_limit)
+        for bad_offset in [-1, "0", 1.0, True, False, None]:
+            with self.assertRaises(ValueError):
+                self.app.search_contacts("ali", offset=bad_offset)
+        for kwargs in [{"organization": 5}, {"organization": ["Books"]}, {"tags": "vip"},
+                       {"tags": ["ok", 1]}, {"tag_mode": "weird"}, {"tag_mode": "ALL"}]:
+            with self.assertRaises(ValueError):
+                self.app.search_contacts("ali", **kwargs)
+        with self.assertRaises(TypeError):
+            self.app.search_contacts()
+        # Valid parameters on an empty store validate fine and create nothing.
+        self.assertEqual(self.app.search_contacts("ali"), {"total": 0, "matches": []})
+        self.assertEqual(self.app.search_contacts("ali", max_distance=2, limit=1, offset=0),
+                         {"total": 0, "matches": []})
+        self.assertFalse(self.app.path.exists())
+
+    def test_search_contacts_readonly_and_reflects_current_state(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Alicia", "b@example.test", "Books")
+        self.app.set_tags("A", ["vip"])
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.search_contacts("alic")["total"], 2)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Updating the name changes future results.
+        ContactFlow(self.root).update_contact("A", {"name": "Brenda"})
+        reopened = ContactFlow(self.root)
+        self.assertEqual([m["contact"]["contact_id"] for m in reopened.search_contacts("alice")["matches"]],
+                         ["B"])
+        self.assertEqual([m["contact"]["contact_id"]
+                          for m in reopened.search_contacts("ali", tags=["vip"])["matches"]], [])
+        # Tag updates widen the filter again.
+        ContactFlow(self.root).set_tags("B", ["vip"])
+        self.assertEqual([m["contact"]["contact_id"]
+                          for m in ContactFlow(self.root).search_contacts("ali", tags=["VIP"])["matches"]],
+                         ["B"])
+        # Imported contacts become searchable; merged sources disappear.
+        csv_path = self.root / "people.csv"
+        csv_path.write_text("contact_id,name,email,organization\nC,Aline,c@example.test,Books\n",
+                            encoding="utf-8")
+        ContactFlow(self.root).import_contacts(str(csv_path))
+        self.assertEqual([m["contact"]["contact_id"]
+                          for m in ContactFlow(self.root).search_contacts("aline")["matches"]], ["C"])
+        ContactFlow(self.root).merge_contacts("C", "B")
+        self.assertEqual(ContactFlow(self.root).search_contacts("aline"),
+                         {"total": 0, "matches": []})
+
+    def test_cli_search_contacts(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Alicia", "b@example.test", "Music")
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"query": "alice", "max_distance": 0, "limit": 5, "offset": 0}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "search-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         {"total": 1, "matches": [
+                             {"contact": {"contact_id": "A", "name": "Alice",
+                                          "email": "a@example.test", "organization": "Books"},
+                              "distance": 0}]})
+        payload.write_text(json.dumps({"query": 5}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "search-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # Missing the required query is a TypeError, still wrapped as exit 2.
+        payload.write_text(json.dumps({"max_distance": 1}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "search-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # Arrays run one search per object.
+        payload.write_text(json.dumps([{"query": "ali"}, {"query": "zzz"}]), encoding="utf-8")
+        array = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "search-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(array.returncode, 0, array.stderr)
+        results = json.loads(array.stdout)
+        self.assertEqual([row["total"] for row in results], [2, 0])
+        empty = self.root / "empty"
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "search-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout),
+                         [{"total": 0, "matches": []}, {"total": 0, "matches": []}])
+        self.assertFalse(empty.exists())
+
     def test_tag_validation_rejects_without_partial_or_file_changes(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         for bad_id in ["", "  ", None, 5]:

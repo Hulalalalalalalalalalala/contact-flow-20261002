@@ -773,6 +773,61 @@ class ContactFlow(JsonStore):
             index += 1
         return 1 if left[index:] == right[index + 1:] else None
 
+    @staticmethod
+    def _substring_distance(keyword, name):
+        # Minimum Levenshtein distance between the keyword and any nonempty
+        # contiguous slice of the name, counted per Unicode code point with
+        # insert/delete/substitute only (a transposition is two operations).
+        # The top row is the standard 0..len(keyword); the first cell of every
+        # later row is 0, so the alignment may start at any name position for
+        # free. The answer is the bottom row's minimum, so the matched fragment
+        # can also end anywhere; that fragment is never empty.
+        previous = list(range(len(keyword) + 1))
+        best = None
+        for char in name:
+            current = [0]
+            for index in range(1, len(keyword) + 1):
+                cost = 0 if keyword[index - 1] == char else 1
+                current.append(min(previous[index] + 1, current[index - 1] + 1,
+                                   previous[index - 1] + cost))
+            previous = current
+            if best is None or current[-1] < best:
+                best = current[-1]
+        return best
+
+    def search_contacts(self, query, max_distance=1, organization=None, tags=None,
+                        tag_mode="all", limit=20, offset=0):
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        # type(...) is int rejects bools, which are ints in Python but never a
+        # distance or a page parameter.
+        if type(max_distance) is not int or max_distance not in (0, 1, 2):
+            raise ValueError("max_distance must be 0, 1 or 2")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        keyword = self._comparison_value(query)
+        if not keyword:
+            raise ValueError("query must not be empty")
+        # Filtering (and its validation) is exactly find's, intersected with the
+        # name condition, so a contact failing either side is excluded.
+        contacts = self.find(organization=organization, tags=tags, tag_mode=tag_mode)
+        matches = []
+        for contact in contacts:
+            name = self._comparison_value(contact["name"])
+            if not name:
+                continue
+            distance = self._substring_distance(keyword, name)
+            if distance <= max_distance:
+                matches.append({"contact": dict(contact), "distance": distance})
+        # Ascending distance, then contact id code point; pagination comes after.
+        matches.sort(key=lambda match: (match["distance"], match["contact"]["contact_id"]))
+        total = len(matches)
+        return {"total": total, "matches": matches[offset:offset + limit]}
+
     def duplicate_candidates(self, organization=None, tags=None, tag_mode="all"):
         if organization is not None and not isinstance(organization, str):
             raise ValueError("organization must be a string")
