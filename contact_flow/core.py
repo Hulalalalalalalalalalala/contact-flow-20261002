@@ -1,5 +1,6 @@
 import csv
 import io
+import re
 import unicodedata
 from datetime import date
 from .storage import JsonStore, text, calendar_day, positive
@@ -10,6 +11,27 @@ OPPORTUNITY_FIELDS = ("opportunity_id", "contact_id", "title", "stage")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
+AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
+
+def normalize_amount(value):
+    # A trimmed, non-negative decimal string: ASCII digits only, at most one
+    # decimal point, one or more integer digits, and one or two fraction digits.
+    # Zero and leading zeros are fine; signs, exponents, separators, and
+    # non-string (numeric) values are not.
+    if not isinstance(value, str):
+        raise ValueError("amount must be a decimal string")
+    clean = value.strip()
+    if not AMOUNT_RE.fullmatch(clean):
+        raise ValueError("amount must be a nonnegative decimal string")
+    return format_amount(amount_cents(clean))
+
+def amount_cents(value):
+    # Exact integer cents for a normalized decimal string.
+    whole, dot, fraction = value.partition(".")
+    return int(whole) * 100 + int(fraction.ljust(2, "0")) if dot else int(whole) * 100
+
+def format_amount(cents):
+    return "%d.%02d" % divmod(cents, 100)
 
 def normalize_tags(value):
     if not isinstance(value, list):
@@ -419,6 +441,22 @@ class ContactFlow(JsonStore):
             self._write(data)
         return dict(opportunity)
 
+    def set_opportunity_amount(self, opportunity_id, amount):
+        opportunity_id = text(opportunity_id, "opportunity_id")
+        amount = normalize_amount(amount)
+        data = self._read()
+        opportunity = data.get("opportunities", {}).get(opportunity_id)
+        if opportunity is None:
+            raise ValueError("unknown opportunity")
+        # Terminal stages accept amounts too. An unchanged amount (including
+        # setting zero on an opportunity that never had one) reports success
+        # without rewriting the file.
+        if opportunity.get("amount", "0.00") == amount:
+            return {"opportunity_id": opportunity_id, "amount": amount}
+        opportunity["amount"] = amount
+        self._write(data)
+        return {"opportunity_id": opportunity_id, "amount": amount}
+
     def find_opportunities(self, contact_id=None, stage=None):
         if contact_id is not None:
             contact_id = text(contact_id, "contact_id")
@@ -625,6 +663,77 @@ class ContactFlow(JsonStore):
                             row["won"], row["lost"], row["opportunities"]))
 
         return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
+
+    def opportunity_amount_report(self, organization=None, tags=None, tag_mode="all"):
+        # Filtering (and its validation) is exactly funnel_report's; amounts are
+        # summed as integer cents per current stage and formatted with two decimals.
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        def empty_amounts():
+            return {"new": 0, "qualified": 0, "won": 0, "lost": 0}
+
+        totals = empty_amounts()
+        groups = {}
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "amounts": empty_amounts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among filtered contacts.
+                group["display"] = contact["organization"]
+
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            # An opportunity without an amount counts as 0.00.
+            cents = amount_cents(opportunity.get("amount", "0.00"))
+            amounts = groups[contact["organization"].casefold()]["amounts"]
+            amounts[opportunity["stage"]] += cents
+            totals[opportunity["stage"]] += cents
+
+        def with_amount(amounts):
+            row = {stage: format_amount(amounts[stage]) for stage in STAGES}
+            row["amount"] = format_amount(sum(amounts.values()))
+            return row
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(with_amount(group["amounts"]))
+            organizations.append(row)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "new", "qualified", "won", "lost", "amount"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["new"], row["qualified"],
+                             row["won"], row["lost"], row["amount"]))
+
+        return {"total": with_amount(totals), "organizations": organizations, "csv": buffer.getvalue()}
 
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
