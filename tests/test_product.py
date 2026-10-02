@@ -531,5 +531,191 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.funnel_report()["total"]["opportunities"], 4)
 
+    def test_set_reminder_replaces_and_persists_trimmed_values(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        result = self.app.set_reminder(" A ", "2024-02-29", "  call  him  ")
+        self.assertEqual(result, {"contact_id": "A", "due_on": "2024-02-29", "note": "call  him"})
+        # Past dates and legal leap days are allowed; surrounding whitespace is trimmed.
+        again = self.app.set_reminder("A", " 2026-11-05 ", "later")
+        self.assertEqual(again, {"contact_id": "A", "due_on": "2026-11-05", "note": "later"})
+        # At most one reminder per contact: setting again replaces the whole entry.
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(list(stored["reminders"]), ["A"])
+        self.assertEqual(ContactFlow(self.root).due_reminders("2099-01-01"),
+                         [{"contact_id": "A", "due_on": "2026-11-05", "note": "later"}])
+
+    def test_clear_reminder_reports_presence_and_rewrites_only_when_set(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2026-10-05", "note")
+        self.assertIs(self.app.clear_reminder("A"), True)
+        self.assertEqual(ContactFlow(self.root).due_reminders("2099-01-01"), [])
+        self.assertNotIn("reminders", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # No reminder present: False without touching the file.
+        before = self.app.path.read_bytes()
+        self.assertIs(self.app.clear_reminder("A"), False)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_due_reminders_orders_by_date_then_contact_id_without_system_clock(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("陈", "Chen", "c@example.test", "Games")
+        self.app.set_reminder("A", "2026-11-05", "future")
+        self.app.set_reminder("B", "2026-10-01", "overdue")
+        self.app.set_reminder("陈", "2026-10-02", "same day as target")
+        self.app.set_reminder("陈", "2026-10-02", "replaced")  # replace, still one
+        # as_of includes the due day itself and overdue items; explicit, never today.
+        due = self.app.due_reminders(" 2026-10-02 ")
+        self.assertEqual([(r["contact_id"], r["due_on"], r["note"]) for r in due],
+                         [("B", "2026-10-01", "overdue"), ("陈", "2026-10-02", "replaced")])
+        self.assertTrue(all(set(r) == {"contact_id", "due_on", "note"} for r in due))
+        # Same day orders by contact id code point: "B" < "陈".
+        same_day = ContactFlow(self.root).due_reminders("2026-11-05")
+        self.assertEqual([r["contact_id"] for r in same_day], ["B", "陈", "A"])
+        self.assertEqual(self.app.due_reminders("2026-09-30"), [])
+
+    def test_reminder_validation_rejects_without_changing_data(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for cid in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.set_reminder(cid, "2026-10-02", "x")
+            with self.assertRaises(ValueError):
+                self.app.clear_reminder(cid)
+        for note in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.set_reminder("A", "2026-10-02", note)
+        for day in [None, 5, "", "   ", "2026-02-30", "2026-13-01", "2026-1-1", "20261002"]:
+            with self.assertRaises(ValueError):
+                self.app.set_reminder("A", day, "x")
+            with self.assertRaises(ValueError):
+                self.app.due_reminders(day)
+        # Unknown contact rejects set and clear, never writing.
+        with self.assertRaises(ValueError):
+            self.app.set_reminder("ZZZ", "2026-10-02", "x")
+        with self.assertRaises(ValueError):
+            self.app.clear_reminder("ZZZ")
+        # A store with no data file: unknown-contact set/clear and queries create nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.set_reminder("ZZZ", "2026-10-02", "x")
+        with self.assertRaises(ValueError):
+            fresh.clear_reminder("ZZZ")
+        self.assertEqual(fresh.due_reminders("2026-10-02"), [])
+        self.assertFalse((self.root / "fresh").exists())
+        # Once a reminder exists, a later rejected call leaves the file untouched.
+        self.app.set_reminder("A", "2026-10-02", "keep")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_reminder("A", "2026-02-30", "bad")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).due_reminders("2099-01-01")[0]["note"], "keep")
+
+    def test_follow_up_does_not_clear_reminder(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2026-10-05", "nudge")
+        self.app.follow_up("A", "2026-10-03", "chatted")
+        self.assertEqual(ContactFlow(self.root).due_reminders("2099-01-01"),
+                         [{"contact_id": "A", "due_on": "2026-10-05", "note": "nudge"}])
+
+    def seed_merge_reminders(self):
+        self.app.add_contact("S", "Src", "s@example.test", "X")
+        self.app.add_contact("T", "Tgt", "t@example.test", "Y")
+
+    def test_merge_reminder_selection_rules(self):
+        # Only the source has a reminder: it survives under the target id.
+        self.seed_merge_reminders()
+        self.app.set_reminder("S", "2026-10-01", "src")
+        result = self.app.merge_contacts("S", "T")
+        self.assertEqual(set(result), {"contact", "moved_followups"})
+        self.assertEqual(ContactFlow(self.root).due_reminders("2099-01-01"),
+                         [{"contact_id": "T", "due_on": "2026-10-01", "note": "src"}])
+
+        # Only the target has one: it is retained.
+        root2 = self.root / "two"
+        app2 = ContactFlow(root2)
+        app2.add_contact("S", "Src", "s@example.test", "X")
+        app2.add_contact("T", "Tgt", "t@example.test", "Y")
+        app2.set_reminder("T", "2026-10-01", "tgt")
+        app2.merge_contacts("S", "T")
+        self.assertEqual(ContactFlow(root2).due_reminders("2099-01-01"),
+                         [{"contact_id": "T", "due_on": "2026-10-01", "note": "tgt"}])
+
+        # Both: the earlier due date wins, carrying its note and the target id.
+        root3 = self.root / "three"
+        app3 = ContactFlow(root3)
+        app3.add_contact("S", "Src", "s@example.test", "X")
+        app3.add_contact("T", "Tgt", "t@example.test", "Y")
+        app3.set_reminder("T", "2026-10-05", "tgt")
+        app3.set_reminder("S", "2026-10-01", "src")
+        app3.merge_contacts("S", "T")
+        self.assertEqual(ContactFlow(root3).due_reminders("2099-01-01"),
+                         [{"contact_id": "T", "due_on": "2026-10-01", "note": "src"}])
+
+        # Both due the same day: the target's original reminder is kept.
+        root4 = self.root / "four"
+        app4 = ContactFlow(root4)
+        app4.add_contact("S", "Src", "s@example.test", "X")
+        app4.add_contact("T", "Tgt", "t@example.test", "Y")
+        app4.set_reminder("T", "2026-10-01", "tgt")
+        app4.set_reminder("S", "2026-10-01", "src")
+        app4.merge_contacts("S", "T")
+        self.assertEqual(ContactFlow(root4).due_reminders("2099-01-01"),
+                         [{"contact_id": "T", "due_on": "2026-10-01", "note": "tgt"}])
+
+    def test_reminders_on_legacy_data_read_as_empty(self):
+        # A data file written by an older version has no "reminders" key.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("reminders", raw)
+        self.assertEqual(self.app.due_reminders("2099-01-01"), [])
+        self.assertIs(self.app.clear_reminder("A"), False)
+
+    def test_cli_reminder_commands_success_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        payload = self.root / "reminder.json"
+
+        def cli(action, obj):
+            payload.write_text(json.dumps(obj), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                   action, str(payload)], text=True, capture_output=True)
+
+        ok = cli("set-reminder", {"contact_id": " A ", "due_on": " 2026-10-05 ", "note": " call "})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         {"contact_id": "A", "due_on": "2026-10-05", "note": "call"})
+        cli("set-reminder", {"contact_id": "B", "due_on": "2026-10-01", "note": "b"})
+        due = cli("due-reminders", {"as_of": "2026-10-05"})
+        self.assertEqual(due.returncode, 0, due.stderr)
+        self.assertEqual([r["contact_id"] for r in json.loads(due.stdout)], ["B", "A"])
+        cleared = cli("clear-reminder", {"contact_id": "B"})
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertIs(json.loads(cleared.stdout), True)
+        again = cli("clear-reminder", {"contact_id": "B"})
+        self.assertIs(json.loads(again.stdout), False)
+
+        # Invalid date: exit 2, empty stdout, JSON error on stderr, no change.
+        before = self.app.path.read_bytes()
+        failed = cli("set-reminder", {"contact_id": "A", "due_on": "2026-02-30", "note": "x"})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        bad_as_of = cli("due-reminders", {"as_of": "nope"})
+        self.assertEqual(bad_as_of.returncode, 2)
+        self.assertEqual(bad_as_of.stdout, "")
+
+        # Array executes in order; an early success is kept when a later call fails.
+        payload.write_text(json.dumps([
+            {"contact_id": "A", "due_on": "2030-01-01", "note": "far"},
+            {"contact_id": "ZZZ", "due_on": "2030-01-01", "note": "x"},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "set-reminder", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        self.assertEqual(ContactFlow(self.root).due_reminders("2030-12-31"),
+                         [{"contact_id": "A", "due_on": "2030-01-01", "note": "far"}])
+
 if __name__ == "__main__":
     unittest.main()

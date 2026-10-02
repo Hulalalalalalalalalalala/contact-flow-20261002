@@ -1,7 +1,11 @@
 from pathlib import Path
 import json
 import os
+import re
 import tempfile
+from datetime import date
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 class JsonStore:
     def __init__(self, root):
@@ -37,3 +41,16 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def calendar_day(value, label):
+    # Accept only a trimmed YYYY-MM-DD string naming a real calendar date
+    # (past dates and legal leap days allowed); normalize via round-trip.
+    if not isinstance(value, str):
+        raise ValueError(label + " must be a YYYY-MM-DD string")
+    clean = value.strip()
+    if not DATE_RE.fullmatch(clean):
+        raise ValueError(label + " must be a YYYY-MM-DD string")
+    try:
+        return date.fromisoformat(clean).isoformat()
+    except ValueError as error:
+        raise ValueError(label + " must be a real calendar date") from error
