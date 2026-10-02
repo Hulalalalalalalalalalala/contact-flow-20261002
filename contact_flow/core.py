@@ -4,6 +4,7 @@ from datetime import date
 from .storage import JsonStore, text, calendar_day
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
+FOLLOWUP_FIELDS = ("contact_id", "on", "note")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
@@ -116,6 +117,55 @@ class ContactFlow(JsonStore):
                 imported.append(contact)
         except csv.Error as error:
             raise ValueError("invalid CSV syntax") from error
+        if imported:
+            self._write(data)
+        return imported
+
+    def import_followups(self, csv_path):
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if len(header) != len(FOLLOWUP_FIELDS) or set(header) != set(FOLLOWUP_FIELDS) or len(set(header)) != len(header):
+            raise ValueError("CSV header must contain exactly contact_id,on,note in any order")
+
+        imported = []
+        # Parse and validate every row before reading the store, so malformed
+        # input never creates the data directory.
+        try:
+            for row in rows:
+                if not row:
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                contact_id = text(values["contact_id"], "contact_id")
+                on = calendar_day(values["on"], "on")
+                note = text(values["note"], "note")
+                imported.append({"contact_id": contact_id, "on": on, "note": note})
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        data = self._read()
+        contacts = data.get("contacts", {})
+        for entry in imported:
+            if entry["contact_id"] not in contacts:
+                raise ValueError("unknown contact")
+        # Every row validated and referenced an existing contact; commit in a
+        # single write. Duplicate rows (within the batch or against existing
+        # data) are kept one by one.
+        followups = data.setdefault("followups", [])
+        followups.extend(imported)
         if imported:
             self._write(data)
         return imported

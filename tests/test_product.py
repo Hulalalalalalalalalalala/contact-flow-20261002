@@ -1095,5 +1095,266 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def write_followup_csv(self, name, content, encoding="utf-8"):
+        path = self.root / name
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding=encoding)
+        return path
+
+    def seed_for_followup_import(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Books")
+
+    def test_import_followups_returns_file_order_and_persists(self):
+        self.seed_for_followup_import()
+        csv_path = self.write_followup_csv("followups.csv",
+            "note,contact_id,on\r\n"
+            "\"call, maybe\", A , 2026-10-02 \r\n"
+            "\"line1\nline2\",B,2024-02-29\r\n"
+            "future,C,2099-01-01\r\n")
+        result = self.app.import_followups(str(csv_path))
+        self.assertEqual(result, [
+            {"contact_id": "A", "on": "2026-10-02", "note": "call, maybe"},
+            {"contact_id": "B", "on": "2024-02-29", "note": "line1\nline2"},
+            {"contact_id": "C", "on": "2099-01-01", "note": "future"},
+        ])
+        for entry in result:
+            self.assertEqual(set(entry), {"contact_id", "on", "note"})
+        # Appended in file order; reopening shows identical content.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in reopened.followup_report(
+            "2000-01-01", "2100-01-01")["records"]],
+            [("B", "2024-02-29", "line1\nline2"), ("A", "2026-10-02", "call, maybe"),
+             ("C", "2099-01-01", "future")])
+        self.assertEqual(reopened.timeline("B"),
+                         [{"contact_id": "B", "on": "2024-02-29", "note": "line1\nline2"}])
+
+    def test_import_followups_accepts_bom_and_reordered_header(self):
+        self.seed_for_followup_import()
+        csv_path = self.write_followup_csv("followups.csv",
+            "﻿on,note,contact_id\n2026-10-02,hello,A\n")
+        self.assertEqual(self.app.import_followups(str(csv_path)),
+                         [{"contact_id": "A", "on": "2026-10-02", "note": "hello"}])
+
+    def test_import_followups_empty_inputs_create_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for content in ["", "﻿", "\n", "\r\n"]:
+            csv_path = self.write_followup_csv("empty-%d.csv" % len(content.encode("utf-8")), content)
+            with self.assertRaises(ValueError):
+                fresh.import_followups(str(csv_path))
+            self.assertFalse(fresh_root.exists())
+        # Header alone, or header followed only by zero-field blank lines, returns [] without writing.
+        for content in ["contact_id,on,note\n", "contact_id,on,note\n\n\r\n\n"]:
+            csv_path = self.write_followup_csv("header-%d.csv" % len(content), content)
+            self.assertEqual(fresh.import_followups(str(csv_path)), [])
+            self.assertFalse(fresh_root.exists())
+
+    def test_import_followups_rejects_bad_headers_without_creating_store(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        bad_headers = [
+            "contact_id,on\n",
+            "contact_id,on,note,extra\n",
+            "contact_id,on,contact_id\n",
+            "Contact_ID,on,note\n",
+            "contact_id,On,note\n",
+            "contact_id,on,note,x\nA,2026-10-01,n,y\n",
+        ]
+        for content in bad_headers:
+            csv_path = self.write_followup_csv("bad-%d.csv" % len(content), content)
+            with self.assertRaises(ValueError):
+                fresh.import_followups(str(csv_path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_followups_rejects_malformed_records_without_changes(self):
+        self.seed_for_followup_import()
+        before = self.app.path.read_bytes()
+        bad_files = [
+            # wrong field count
+            "contact_id,on,note\nA,2026-10-01\n",
+            "contact_id,on,note\nA,2026-10-01,x,y\n",
+            # empty/blank required fields
+            "contact_id,on,note\n,2026-10-01,note\n",
+            "contact_id,on,note\n   ,2026-10-01,note\n",
+            "contact_id,on,note\nA,2026-10-01,\n",
+            "contact_id,on,note\nA,2026-10-01,   \n",
+            # invalid dates
+            "contact_id,on,note\nA,2026-02-30,note\n",
+            "contact_id,on,note\nA,2026-13-01,note\n",
+            "contact_id,on,note\nA,2026-1-1,note\n",
+            "contact_id,on,note\nA,,note\n",
+            "contact_id,on,note\nA,  ,note\n",
+            # row of empty fields is not a blank line
+            "contact_id,on,note\n,,\n",
+            # unterminated quoted field
+            'contact_id,on,note\nA,2026-10-01,"oops\n',
+        ]
+        for i, content in enumerate(bad_files):
+            csv_path = self.write_followup_csv("bad-record-%d.csv" % i, content)
+            with self.assertRaises(ValueError):
+                self.app.import_followups(str(csv_path))
+            self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).timeline("A"), [])
+
+    def test_import_followups_rejects_invalid_utf8_without_changes(self):
+        csv_path = self.write_followup_csv("latin.csv", b"contact_id,on,note\nA,2026-10-01,\xff\n")
+        with self.assertRaises(ValueError):
+            self.app.import_followups(str(csv_path))
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_followups_unknown_contact_rejects_whole_batch(self):
+        self.seed_for_followup_import()
+        before = self.app.path.read_bytes()
+        csv_path = self.write_followup_csv("followups.csv",
+            "contact_id,on,note\n"
+            "A,2026-10-01,first\n"
+            "ZZZ,2026-10-01,ghost\n"
+            "B,2026-10-02,second\n")
+        with self.assertRaises(ValueError):
+            self.app.import_followups(str(csv_path))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).followup_report("2000-01-01", "2100-01-01")["records"], [])
+        # Case-sensitive ids: "a" is not "A"; nothing is created on a fresh root.
+        csv_path = self.write_followup_csv("case.csv", "contact_id,on,note\n a ,2026-10-01,x\n")
+        with self.assertRaises(ValueError):
+            self.app.import_followups(str(csv_path))
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        csv_path = self.write_followup_csv("ghost.csv", "contact_id,on,note\nZZZ,2026-10-01,x\n")
+        with self.assertRaises(ValueError):
+            fresh.import_followups(str(csv_path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_followups_keeps_duplicates_and_appends_on_reimport(self):
+        self.seed_for_followup_import()
+        self.app.follow_up("A", "2026-10-01", "existing")
+        content = ("contact_id,on,note\n"
+                   "A,2026-10-01,existing\n"
+                   "A,2026-10-01,same\n"
+                   "A,2026-10-01,same\n")
+        csv_path = self.write_followup_csv("followups.csv", content)
+        first = self.app.import_followups(str(csv_path))
+        self.assertEqual(len(first), 3)
+        second = self.app.import_followups(str(csv_path))
+        self.assertEqual(len(second), 3)
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("A")],
+                         ["existing", "existing", "same", "same", "existing", "same", "same"])
+
+    def test_import_followups_orders_after_existing_same_day_records(self):
+        self.seed_for_followup_import()
+        self.app.follow_up("A", "2026-10-01", "old one")
+        self.app.follow_up("A", "2026-10-01", "old two")
+        csv_path = self.write_followup_csv("batch.csv",
+            "contact_id,on,note\n"
+            "A,2026-10-01,new one\n"
+            "A,2026-10-01,new two\n")
+        self.app.import_followups(str(csv_path))
+        reopened = ContactFlow(self.root)
+        self.assertEqual([r["note"] for r in reopened.timeline("A")],
+                         ["old one", "old two", "new one", "new two"])
+        report = reopened.followup_report("2026-10-01", "2026-10-01")
+        self.assertEqual([r["note"] for r in report["records"]],
+                         ["old one", "old two", "new one", "new two"])
+
+    def test_import_followups_preserves_other_data_and_funnel_stats(self):
+        self.seed_for_followup_import()
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_reminder("A", "2026-11-05", "nudge")
+        before_contacts = {c["contact_id"]: c for c in self.app.find()}
+        before_funnel = self.app.funnel_report()
+        csv_path = self.write_followup_csv("batch.csv",
+            "contact_id,on,note\nA,2026-10-01,note\nB,2026-10-02,other\n")
+        self.app.import_followups(str(csv_path))
+        reopened = ContactFlow(self.root)
+        self.assertEqual({c["contact_id"]: c for c in reopened.find()}, before_contacts)
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["stage"], "new")
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "A", "due_on": "2026-11-05", "note": "nudge"}])
+        self.assertEqual(reopened.funnel_report(), before_funnel)
+
+    def test_import_followups_legacy_missing_collection_treated_as_empty(self):
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        csv_path = self.write_followup_csv("legacy.csv", "contact_id,on,note\n L , 2026-10-01 , hi \n")
+        self.assertEqual(legacy.import_followups(str(csv_path)),
+                         [{"contact_id": "L", "on": "2026-10-01", "note": "hi"}])
+        self.assertEqual(ContactFlow(legacy_root).timeline("L")[0]["note"], "hi")
+
+    def test_import_followups_validates_csv_path(self):
+        for bad in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.import_followups(bad)
+        with self.assertRaises(FileNotFoundError):
+            self.app.import_followups(str(self.root / "missing.csv"))
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_followups_unreadable_file_raises_permission_error(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        csv_path = self.write_followup_csv("locked.csv", "contact_id,on,note\nA,2026-10-01,x\n")
+        csv_path.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                self.app.import_followups(str(csv_path))
+        finally:
+            csv_path.chmod(0o644)
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_followups_resolves_relative_path_from_cwd(self):
+        self.seed_for_followup_import()
+        self.write_followup_csv("notes.csv", "contact_id,on,note\nA,2026-10-01,x\n")
+        old_cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            result = self.app.import_followups("notes.csv")
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(result[0]["contact_id"], "A")
+
+    def test_cli_import_followups_success_failure_and_array(self):
+        self.seed_for_followup_import()
+        csv_path = self.write_followup_csv("notes.csv",
+            "contact_id,on,note\n"
+            " A , 2026-10-02 , call \n"
+            "B,2024-02-29,leap\n")
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"csv_path": str(csv_path)}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         [{"contact_id": "A", "on": "2026-10-02", "note": "call"},
+                          {"contact_id": "B", "on": "2024-02-29", "note": "leap"}])
+        # Unknown contact: stderr JSON, exit 2, empty stdout, no write.
+        bad_csv = self.write_followup_csv("bad.csv", "contact_id,on,note\nZZZ,2026-10-01,x\n")
+        fresh_root = self.root / "fresh"
+        payload.write_text(json.dumps({"csv_path": str(bad_csv)}), encoding="utf-8")
+        rejected = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(fresh_root),
+                                   "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(rejected.stdout, "")
+        json.loads(rejected.stderr)
+        self.assertFalse(fresh_root.exists())
+        # Array: each import is independent; the first batch stays when the second fails.
+        other_csv = self.write_followup_csv("other.csv", "contact_id,on,note\nC,2026-10-03,see\n")
+        payload.write_text(json.dumps([{"csv_path": str(other_csv)}, {"csv_path": str(bad_csv)}]),
+                           encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "import-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("C")], ["see"])
+
 if __name__ == "__main__":
     unittest.main()
