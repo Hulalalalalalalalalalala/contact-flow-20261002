@@ -749,11 +749,79 @@ class ContactFlow(JsonStore):
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
 
+    def search_contacts(self, query, max_distance=1, limit=20, offset=0,
+                        organization=None, tags=None, tag_mode="all"):
+        # query is mandatory; a missing positional argument is a TypeError, like
+        # every other required API parameter.
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        keyword = self._comparison_value(query)
+        if not keyword:
+            raise ValueError("query must be nonempty after normalization")
+        # type(...) is int rejects bools, which are ints in Python but never counts.
+        if type(max_distance) is not int or max_distance not in (0, 1, 2):
+            raise ValueError("max_distance must be 0, 1 or 2")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        # Filtering (and its validation) is exactly find's; the name condition is
+        # then intersected inside the filtered set.
+        contacts = self.find(organization=organization, tags=tags, tag_mode=tag_mode)
+        matches = []
+        for contact in contacts:
+            distance = self._fragment_distance(
+                keyword, self._comparison_value(contact["name"]), max_distance)
+            if distance is not None and distance <= max_distance:
+                matches.append({"contact": dict(contact), "distance": distance})
+        # Distance first, then contact id by Unicode code point; pagination comes last.
+        matches.sort(key=lambda entry: (entry["distance"], entry["contact"]["contact_id"]))
+        total = len(matches)
+        return {"total": total, "matches": matches[offset:offset + limit]}
+
     @staticmethod
     def _comparison_value(value):
         # NFKC, then casefold, then drop every Unicode whitespace code point.
         normalized = unicodedata.normalize("NFKC", value).casefold()
         return "".join(char for char in normalized if not char.isspace())
+
+    @staticmethod
+    def _levenshtein(left, right, cap):
+        # Full Levenshtein distance by Unicode code point (insert, delete and
+        # substitute each cost one; a transposition is two operations), bounded
+        # early once every live cell exceeds cap.
+        previous = list(range(len(right) + 1))
+        for i, char_left in enumerate(left, 1):
+            current = [i] + [0] * len(right)
+            floor = i
+            for j, char_right in enumerate(right, 1):
+                cost = 0 if char_left == char_right else 1
+                current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+                if current[j] < floor:
+                    floor = current[j]
+            if floor > cap:
+                return cap + 1
+            previous = current
+        return previous[-1]
+
+    def _fragment_distance(self, keyword, name, max_distance):
+        # Minimum edit distance between the keyword and any nonempty contiguous
+        # fragment of the name; None when no fragment fits within the keyword's
+        # reach. A zero distance means the keyword occurs in the name verbatim.
+        if not name:
+            return None
+        best = None
+        max_width = len(keyword) + max_distance
+        for start in range(len(name)):
+            for width in range(1, min(max_width, len(name) - start) + 1):
+                distance = self._levenshtein(keyword, name[start:start + width], max_distance)
+                if distance <= max_distance and (best is None or distance < best):
+                    best = distance
+                    if best == 0:
+                        return 0
+        return best
 
     @staticmethod
     def _name_distance(left, right):
