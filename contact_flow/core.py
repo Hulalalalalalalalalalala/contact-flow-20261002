@@ -4,6 +4,7 @@ from datetime import date
 from .storage import JsonStore, text, calendar_day
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
+UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
 
@@ -32,6 +33,38 @@ class ContactFlow(JsonStore):
             raise ValueError("contact id or email already exists")
         contact = {"contact_id": contact_id, "name": name, "email": email, "organization": organization}
         contacts[contact_id] = contact
+        self._write(data)
+        return contact
+
+    def update_contact(self, contact_id, changes):
+        contact_id = text(contact_id, "contact_id")
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must be a nonempty object")
+        normalized = {}
+        for key, value in changes.items():
+            if key not in UPDATABLE_FIELDS:
+                raise ValueError("changes contains an unsupported field: " + str(key))
+            # None and other non-strings can never clear a field; a trimmed value must stay nonempty.
+            clean = text(value, key)
+            if key == "email":
+                clean = clean.lower()
+                if clean.count("@") != 1 or any(c.isspace() for c in clean) or not all(clean.split("@")):
+                    raise ValueError("invalid email")
+            normalized[key] = clean
+        data = self._read()
+        contacts = data.get("contacts", {})
+        contact = contacts.get(contact_id)
+        if contact is None:
+            raise ValueError("unknown contact")
+        new_email = normalized.get("email")
+        if new_email is not None and new_email != contact["email"] and any(
+                other["email"] == new_email for other_id, other in contacts.items() if other_id != contact_id):
+            raise ValueError("contact id or email already exists")
+        # Everything validates before this point; a fully identical update reports the contact
+        # without rewriting the file, so rejected and no-op calls never create the data directory.
+        if all(contact[key] == value for key, value in normalized.items()):
+            return contact
+        contact.update(normalized)
         self._write(data)
         return contact
 

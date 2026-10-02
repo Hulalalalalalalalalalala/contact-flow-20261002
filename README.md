@@ -24,6 +24,7 @@ python3 -m contact_flow --root ./state add examples/contacts.json
 JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后续失败不会回滚整批。重跑登记命令遇到已存在的标识会报错。
 
 - `add` → `ContactFlow.add_contact(...)`。参数名见 `core.py` 的公开方法签名。
+- `update-contact` → `ContactFlow.update_contact(contact_id, changes)`。局部更新已登记联系人的资料：`changes` 是非空对象，仅允许 `name`、`email`、`organization` 中的一个或多个键，未提供的字段保留原值；成功返回与 `add` 相同结构的完整联系人对象，`contact_id` 保持不变。`contact_id` 去除首尾空白后须非空且区分大小写，标识非法或联系人不存在抛 `ValueError`。`changes` 不是对象、为空、含不允许的键，或字段值不是字符串、去首尾空白后为空，均抛 `ValueError`；`None` 不能用于清空字段。姓名与组织只去除首尾空白并保留内部空白；邮箱去除首尾空白后转小写，须恰有一个 `@`、两侧非空且不含任何空白，否则抛 `ValueError`。规范化后的邮箱与其他联系人重复时抛 `ValueError`，与自身当前邮箱相同则允许。一次调用中的所有字段共同成功或共同失败，任何拒绝都保留原数据文件字节；数据目录原本不存在时不创建目录或文件。所有字段规范化后均与当前值相同时返回当前联系人且不改写文件。组织修改立即反映在 `find` 的组织筛选和 `funnel-report` 的组织分组及 CSV 中（该联系人及其全部机会按新组织计入，未筛选的联系人总数、机会总数及各阶段总数不变）；标签、跟进记录、机会归属与阶段、提醒日期与备注均保留，旧数据缺少这些可选集合时也能更新。邮箱修改后旧邮箱可重新登记，新邮箱受既有登记与导入去重规则约束。
 - `follow-up` → `ContactFlow.follow_up(...)`。参数名见 `core.py` 的公开方法签名。
 - `find` → `ContactFlow.find(...)`。参数名见 `core.py` 的公开方法签名。
 - `timeline` → `ContactFlow.timeline(...)`。参数名见 `core.py` 的公开方法签名。

@@ -717,5 +717,213 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(ContactFlow(self.root).due_reminders("2030-12-31"),
                          [{"contact_id": "A", "due_on": "2030-01-01", "note": "far"}])
 
+    def test_update_contact_changes_fields_and_persists_like_add(self):
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        result = self.app.update_contact(" A ", {"name": "  Alice 王 ", "email": " ALICE@Example.TEST "})
+        self.assertEqual(result,
+            {"contact_id": "A", "name": "Alice 王", "email": "alice@example.test", "organization": "Books"})
+        result = self.app.update_contact("A", {"organization": "\t春山 书店\n", "name": "Alice"})
+        self.assertEqual(result,
+            {"contact_id": "A", "name": "Alice", "email": "alice@example.test", "organization": "春山 书店"})
+        # Internal whitespace in name/organization is preserved; reopening shows the update.
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.find(" 春山 书店 ")[0]["name"], "Alice")
+        self.assertEqual(reopened.find("books"), [])
+
+    def test_update_contact_id_is_case_sensitive_and_trimmed(self):
+        self.app.add_contact("a", "Alice", "alice@example.test", "Books")
+        self.assertEqual(self.app.update_contact(" a ", {"name": "Ali"})["contact_id"], "a")
+        with self.assertRaises(ValueError):
+            self.app.update_contact("A", {"name": "Other"})
+        self.assertEqual(ContactFlow(self.root).find()[0]["name"], "Ali")
+
+    def test_update_contact_rejects_bad_id_or_unknown_without_writing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        for bad_id in ["", "   ", None, 5]:
+            with self.assertRaises(ValueError):
+                self.app.update_contact(bad_id, {"name": "X"})
+        with self.assertRaises(ValueError):
+            self.app.update_contact("ZZZ", {"name": "X"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Unknown contact against a missing data file creates neither directory nor file.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.update_contact("ZZZ", {"name": "X"})
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_update_contact_validates_changes_without_partial_write(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        bad_changes = [
+            None, [], [{"name": "X"}], "name", 5, True,
+            {},
+            {"contact_id": "B"}, {"id": "A"}, {"name": "X", "surname": "Y"},
+            {"name": None}, {"email": None}, {"organization": None},
+            {"name": 5}, {"email": ["a@b.test"]}, {"organization": {}},
+            {"name": ""}, {"name": "   "}, {"email": "  "}, {"organization": "\n\t"},
+        ]
+        for changes in bad_changes:
+            with self.assertRaises(ValueError):
+                self.app.update_contact("A", changes)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).find()[0],
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+
+    def test_update_contact_validates_email_format(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        for bad in ["no-at-sign", "a@b@example.test", "a b@example.test", "a@b test",
+                    "@example.test", "a@", "a@ ", " @example.test"]:
+            with self.assertRaises(ValueError):
+                self.app.update_contact("A", {"email": bad})
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_update_contact_email_duplicate_and_identity_rules(self):
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        self.app.add_contact("B", "Bob", "bob@example.test", "Music")
+        before = self.app.path.read_bytes()
+        # Another contact's normalized email (case/whitespace-insensitive) is rejected.
+        for bad in ["BOB@example.test", " Bob@Example.test "]:
+            with self.assertRaises(ValueError):
+                self.app.update_contact("A", {"email": bad})
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The contact's own current email, in any case, is a valid no-op.
+        self.assertEqual(self.app.update_contact("A", {"email": " ALICE@EXAMPLE.TEST "})["email"],
+            "alice@example.test")
+        # After changing the email, the old one can be registered again and the new one is deduped.
+        self.app.update_contact("A", {"email": "alice2@example.test"})
+        self.app.add_contact("C", "Cara", "alice@example.test", "Games")
+        with self.assertRaises(ValueError):
+            self.app.add_contact("D", "Dan", "Alice2@example.test", "Toys")
+        # Import is bound by the same existing-email dedup rule.
+        csv_path = self.root / "people.csv"
+        csv_path.write_text(
+            "contact_id,name,email,organization\nE,Eve,ALICE2@example.test,Toys\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.import_contacts(str(csv_path))
+
+    def test_update_contact_is_atomic_across_fields(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        before = self.app.path.read_bytes()
+        # A valid name together with a duplicate email: the whole call fails, name stays.
+        with self.assertRaises(ValueError):
+            self.app.update_contact("A", {"name": "Ali", "email": "b@example.test"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+        contact = ContactFlow(self.root).find()[0]
+        self.assertEqual((contact["name"], contact["email"]), ("Alice", "a@example.test"))
+        # A valid organization together with an unsupported key is also fully rejected.
+        with self.assertRaises(ValueError):
+            self.app.update_contact("A", {"organization": "Toys", "nope": "x"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_update_contact_noop_returns_contact_without_rewrite(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        result = self.app.update_contact(" A ", {"name": "  Alice  ", "email": " A@EXAMPLE.test ",
+                                                "organization": " Books "})
+        self.assertEqual(result,
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_update_contact_preserves_related_records_and_legacy_shape(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.follow_up("A", "2026-10-01", "first note")
+        self.app.follow_up("A", "2026-10-03", "second note")
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_stage("O2", "won")
+        self.app.set_reminder("A", "2026-11-05", "call back")
+        self.app.update_contact("A", {"name": "Alice Wang", "email": "ali@example.test",
+                                      "organization": "Music"})
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip", "华东"])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["first note", "second note"])
+        opportunities = {o["opportunity_id"]: o for o in reopened.find_opportunities(contact_id="A")}
+        self.assertEqual(opportunities["O1"]["stage"], "new")
+        self.assertEqual(opportunities["O2"]["stage"], "won")
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+            [{"contact_id": "A", "due_on": "2026-11-05", "note": "call back"}])
+        # Legacy document with contacts but no tags/opportunities/reminders/followups updates fine.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        legacy.update_contact("L", {"organization": "New"})
+        self.assertEqual(ContactFlow(legacy_root).find("new")[0]["contact_id"], "L")
+        self.assertEqual(ContactFlow(legacy_root).find_opportunities(contact_id="L"), [])
+
+    def test_update_organization_moves_contact_and_opportunities_in_find_and_funnel(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_stage("O2", "won")
+        before = self.app.funnel_report()
+        self.assertEqual(before["total"],
+            {"contacts": 2, "new": 1, "qualified": 0, "won": 1, "lost": 0, "opportunities": 2})
+        self.app.update_contact("A", {"organization": "music"})
+        # find organization filtering follows the new organization (casefold grouped).
+        self.assertEqual([c["contact_id"] for c in self.app.find(organization="Music")], ["A", "B"])
+        self.assertEqual(self.app.find(organization="Books"), [])
+        report = self.app.funnel_report()
+        # Unfiltered totals never move; only the organization grouping changes.
+        self.assertEqual(report["total"], before["total"])
+        self.assertEqual([row["organization"] for row in report["organizations"]], ["Music"])
+        music = report["organizations"][0]
+        self.assertEqual(music,
+            {"organization": "Music", "contacts": 2, "new": 1, "qualified": 0, "won": 1,
+             "lost": 0, "opportunities": 2})
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[1], ["Music", "2", "1", "0", "1", "0", "2"])
+        # Filtering for the new organization counts both contacts and A's opportunities.
+        filtered = self.app.funnel_report(organization="MUSIC")
+        self.assertEqual(filtered["total"], report["total"])
+        self.app.update_contact("A", {"organization": "Books"})
+        self.assertEqual(self.app.funnel_report()["total"], before["total"])
+
+    def test_cli_update_contact_object_and_array(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "Deal")
+        payload = self.root / "update.json"
+        payload.write_text(json.dumps({"contact_id": " A ", "changes": {"name": " Ali ", "email": " ALI@x.test "}}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "update-contact", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+            {"contact_id": "A", "name": "Ali", "email": "ali@x.test", "organization": "Books"})
+        # Array executes item by item; successes before a failure are kept.
+        payload.write_text(json.dumps([
+            {"contact_id": "B", "changes": {"organization": "Books"}},
+            {"contact_id": "ZZZ", "changes": {"name": "Ghost"}},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "update-contact", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        reopened = ContactFlow(self.root)
+        self.assertEqual([c["contact_id"] for c in reopened.find(organization="books")], ["A", "B"])
+        # Unrelated data is untouched by the partial failure.
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["title"], "Deal")
+        # A malformed item (empty changes) also fails with the standard JSON error envelope.
+        payload.write_text(json.dumps({"contact_id": "A", "changes": {}}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "update-contact", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
 if __name__ == "__main__":
     unittest.main()
