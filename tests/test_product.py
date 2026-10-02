@@ -2060,6 +2060,312 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def seed_win_cycles(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.set_tags("A", ["VIP", "华东"])
+        self.app.set_tags("B", ["vip"])
+        # O1: measured, 30 days across the month boundary.
+        self.app.add_opportunity("O1", "A", "Alpha")
+        self.app.set_stage("O1", "qualified", "2026-09-01")
+        self.app.set_stage("O1", "won", "2026-10-01")
+        # O2: measured, 1 day.
+        self.app.add_opportunity("O2", "B", "Beta")
+        self.app.set_stage("O2", "qualified", "2026-10-01")
+        self.app.set_stage("O2", "won", "2026-10-02")
+        # O3: the qualified entry has a null date, so the win is unmeasured.
+        self.app.add_opportunity("O3", "A", "Gamma")
+        self.app.set_stage("O3", "qualified")
+        self.app.set_stage("O3", "won", "2026-10-03")
+        # O4: null-date win is excluded entirely.
+        self.app.add_opportunity("O4", "C", "Delta")
+        self.app.set_stage("O4", "qualified", "2026-09-15")
+        self.app.set_stage("O4", "won")
+        # O5: same-day qualified/won, zero days, just outside the main range.
+        self.app.add_opportunity("O5", "A", "Epsilon")
+        self.app.set_stage("O5", "qualified", "2026-10-04")
+        self.app.set_stage("O5", "won", "2026-10-04")
+        # O7: win before the range is excluded.
+        self.app.add_opportunity("O7", "D", "Eta")
+        self.app.set_stage("O7", "qualified", "2026-09-20")
+        self.app.set_stage("O7", "won", "2026-09-25")
+        # O8: start more than two years earlier across years and a leap day.
+        self.app.add_opportunity("O8", "C", "Theta")
+        self.app.set_stage("O8", "qualified", "2024-02-29")
+        self.app.set_stage("O8", "won", "2026-10-01")
+
+    def test_win_cycle_report_counts_and_calendar_durations(self):
+        self.seed_win_cycles()
+        leap_span = (date(2026, 10, 1) - date(2024, 2, 29)).days
+        # Amounts and reminders never affect durations.
+        self.app.set_opportunity_amount("O1", "1200.50")
+        self.app.set_reminder("A", "2099-01-01", "nudge")
+        report = self.app.win_cycle_report("2026-10-01", "2026-10-03")
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"],
+                         {"won": 4, "measured": 3, "unmeasured": 1,
+                          "days": 31 + leap_span, "average": "%.2f" % ((31 + leap_span) / 3)})
+        self.assertEqual(set(report["total"]),
+                         {"won", "measured", "unmeasured", "days", "average"})
+        # Books/books fold into one casefold group; display name is the smallest
+        # original value; Music sorts after it.
+        self.assertEqual([row["organization"] for row in report["organizations"]],
+                         ["Books", "Music"])
+        books, music = report["organizations"]
+        self.assertEqual(books, {"organization": "Books", "won": 3, "measured": 2,
+                                 "unmeasured": 1, "days": 31, "average": "15.50"})
+        self.assertEqual(music, {"organization": "Music", "won": 1, "measured": 1,
+                                 "unmeasured": 0, "days": leap_span,
+                                 "average": "%d.00" % leap_span})
+        # Inclusive single-day bounds.
+        single = self.app.win_cycle_report("2026-10-02", "2026-10-02")
+        self.assertEqual(single["total"],
+                         {"won": 1, "measured": 1, "unmeasured": 0, "days": 1,
+                          "average": "1.00"})
+        self.assertEqual([row["organization"] for row in single["organizations"]], ["books"])
+        # Same-day win measures zero days; the 09-25 win stays out of range.
+        zero_day = self.app.win_cycle_report("2026-10-04", "2026-10-04")
+        self.assertEqual(zero_day["total"],
+                         {"won": 1, "measured": 1, "unmeasured": 0, "days": 0,
+                          "average": "0.00"})
+        outside = self.app.win_cycle_report("2026-09-26", "2026-09-30")
+        self.assertEqual(outside["total"]["won"], 0)
+
+    def test_win_cycle_report_csv_matches_organizations(self):
+        self.seed_win_cycles()
+        report = self.app.win_cycle_report("2026-10-01", "2026-10-03")
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0],
+                         ["organization", "won", "measured", "unmeasured", "days", "average"])
+        decoded = []
+        for row in rows[1:]:
+            decoded.append({"organization": row[0], "won": int(row[1]), "measured": int(row[2]),
+                            "unmeasured": int(row[3]), "days": int(row[4]),
+                            "average": row[5] if row[5] else None})
+        self.assertEqual(decoded, report["organizations"])
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["organizations"]) + 1)
+        # A range containing only the unmeasured win renders null average as an
+        # empty field in both the row and the totals.
+        only_unmeasured = self.app.win_cycle_report("2026-10-03", "2026-10-03")
+        self.assertIsNone(only_unmeasured["total"]["average"])
+        self.assertEqual(
+            only_unmeasured["csv"],
+            "organization,won,measured,unmeasured,days,average\nBooks,1,0,1,0,\n")
+
+    def test_win_cycle_report_csv_escapes_organization(self):
+        self.app.add_contact("A", "Alice", "a@example.test", 'Books, "店"')
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", "2026-10-01")
+        self.app.set_stage("O1", "won", "2026-10-02")
+        report = self.app.win_cycle_report("2026-10-01", "2026-10-02")
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[1][0], 'Books, "店"')
+        self.assertEqual(rows[1][1:], ["1", "1", "0", "1", "1.00"])
+
+    def test_win_cycle_report_filters_organization_tags_and_intersection(self):
+        self.seed_win_cycles()
+        by_org = self.app.win_cycle_report("2026-10-01", "2026-10-03", organization=" books ")
+        self.assertEqual(by_org["total"],
+                         {"won": 3, "measured": 2, "unmeasured": 1, "days": 31,
+                          "average": "15.50"})
+        tagged = self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=["VIP"])
+        # A owns O1 and O3; B also carries vip and owns O2.
+        self.assertEqual(tagged["total"],
+                         {"won": 3, "measured": 2, "unmeasured": 1, "days": 31,
+                          "average": "15.50"})
+        both = self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=["vip", "华东"])
+        self.assertEqual(both["total"],
+                         {"won": 2, "measured": 1, "unmeasured": 1, "days": 30,
+                          "average": "30.00"})
+        any_tag = self.app.win_cycle_report("2026-10-01", "2026-10-03",
+                                            tags=["vip", "missing"], tag_mode="any")
+        self.assertEqual(any_tag["total"]["won"], 3)
+        # Organization and tag conditions intersect: Music has no vip contacts.
+        self.assertEqual(self.app.win_cycle_report(
+            "2026-10-01", "2026-10-03", organization="Music", tags=["vip"])["total"]["won"], 0)
+        # None and empty list leave tags unrestricted.
+        self.assertEqual(self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=None),
+                         self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=[]))
+
+    def test_win_cycle_report_empty_and_legacy_data(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.win_cycle_report("2026-10-01", "2026-10-02")
+        self.assertEqual(report["total"],
+                         {"won": 0, "measured": 0, "unmeasured": 0, "days": 0, "average": None})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"],
+                         "organization,won,measured,unmeasured,days,average\n")
+        self.assertFalse(fresh_root.exists())
+        # A legacy deal already sitting at won without history is not a win event.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                               "organization": "Old"}},
+            "opportunities": {"O9": {"opportunity_id": "O9", "contact_id": "L",
+                                     "title": "Legacy", "stage": "won"}}}),
+            encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        report = legacy.win_cycle_report("2026-10-01", "2026-10-03")
+        self.assertEqual(report["total"]["won"], 0)
+        self.assertIsNone(report["total"]["average"])
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"],
+                         "organization,won,measured,unmeasured,days,average\n")
+
+    def test_win_cycle_report_counts_each_opportunity_once(self):
+        # Hand-crafted histories cannot arise through the legal transition API.
+        legacy_root = self.root / "crafted"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                               "organization": "Old"}},
+            "opportunities": {"O1": {"opportunity_id": "O1", "contact_id": "L",
+                                     "title": "Twice", "stage": "won"},
+                              "O2": {"opportunity_id": "O2", "contact_id": "L",
+                                     "title": "Null after", "stage": "won"}},
+            "stage_history": {
+                "O1": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-10-01"},
+                       {"from_stage": "won", "to_stage": "qualified", "on": "2026-10-02"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-10-03"}],
+                "O2": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-10-01"},
+                       {"from_stage": "won", "to_stage": "won", "on": None}]}}),
+            encoding="utf-8")
+        app = ContactFlow(legacy_root)
+        report = app.win_cycle_report("2026-10-01", "2026-10-03")
+        # O1 takes the last saved winning event and the qualified entry just before
+        # it (1 day); O2 keeps its dated win even though a null win follows (30).
+        self.assertEqual(report["total"],
+                         {"won": 2, "measured": 2, "unmeasured": 0, "days": 31,
+                          "average": "15.50"})
+
+    def test_win_cycle_report_average_rounds_half_up(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        # Eight measured wins totalling one day: 1/8 = 0.125 -> "0.13" (half-up,
+        # never Python float banker's rounding).
+        self.app.add_opportunity("O1", "A", "one")
+        self.app.set_stage("O1", "qualified", "2026-10-01")
+        self.app.set_stage("O1", "won", "2026-10-02")
+        for index in range(7):
+            opportunity_id = "O%d" % (index + 2)
+            self.app.add_opportunity(opportunity_id, "A", "same")
+            self.app.set_stage(opportunity_id, "qualified", "2026-10-02")
+            self.app.set_stage(opportunity_id, "won", "2026-10-02")
+        report = self.app.win_cycle_report("2026-10-01", "2026-10-03")
+        self.assertEqual(report["total"],
+                         {"won": 8, "measured": 8, "unmeasured": 0, "days": 1,
+                          "average": "0.13"})
+
+    def test_win_cycle_report_uses_current_ownership_profile_and_tags(self):
+        self.seed_win_cycles()
+        leap_span = (date(2026, 10, 1) - date(2024, 2, 29)).days
+        # Profile updates regroup the wins immediately.
+        self.app.update_contact("A", {"organization": "Music"})
+        report = self.app.win_cycle_report("2026-10-01", "2026-10-03")
+        self.assertEqual([row["organization"] for row in report["organizations"]],
+                         ["books", "Music"])
+        music = next(row for row in report["organizations"]
+                     if row["organization"] == "Music")
+        self.assertEqual(music["days"], 30 + leap_span)
+        self.assertEqual(music["unmeasured"], 1)
+        # Transfer O1 to C: it now follows C's profile and loses A's vip tag.
+        self.app.transfer_opportunities([{"opportunity_id": "O1", "source_contact_id": "A",
+                                          "target_contact_id": "C"}])
+        tagged = self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=["vip"])
+        self.assertEqual(tagged["total"],
+                         {"won": 2, "measured": 1, "unmeasured": 1, "days": 1,
+                          "average": "1.00"})
+        # History dates and stages are untouched.
+        self.assertEqual([(entry["from_stage"], entry["to_stage"], entry["on"])
+                          for entry in self.app.stage_history("O1")],
+                         [("new", "qualified", "2026-09-01"),
+                          ("qualified", "won", "2026-10-01")])
+        # Merge B into A: O2 follows A's merged tags and current organization.
+        self.app.merge_contacts("B", "A")
+        merged = self.app.win_cycle_report("2026-10-01", "2026-10-03", tags=["华东"])
+        self.assertEqual(merged["total"],
+                         {"won": 2, "measured": 1, "unmeasured": 1, "days": 1,
+                          "average": "1.00"})
+        full = self.app.win_cycle_report("2026-10-01", "2026-10-03")
+        # Reopening the root recomputes from the same current ownership.
+        self.assertEqual(ContactFlow(self.root).win_cycle_report("2026-10-01", "2026-10-03"),
+                         full)
+
+    def test_win_cycle_report_validates_arguments_without_writing(self):
+        self.seed_win_cycles()
+        before = self.app.path.read_bytes()
+        bad_dates = [None, 5, "", "   ", "2026-1-1", "20261002", "2026-13-01", "2026-02-30"]
+        for bad in bad_dates:
+            with self.assertRaises(ValueError):
+                self.app.win_cycle_report(bad, "2026-10-02")
+            with self.assertRaises(ValueError):
+                self.app.win_cycle_report("2026-10-01", bad)
+        with self.assertRaises(ValueError):
+            self.app.win_cycle_report("2026-10-03", "2026-10-02")
+        for kwargs in [{"organization": 5}, {"organization": ["x"]},
+                       {"tags": ["ok", 1]}, {"tags": "vip"},
+                       {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.win_cycle_report("2026-10-01", "2026-10-02", **kwargs)
+        with self.assertRaises(TypeError):
+            self.app.win_cycle_report()
+        with self.assertRaises(TypeError):
+            self.app.win_cycle_report("2026-10-01")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A legal leap day is accepted.
+        self.assertEqual(self.app.win_cycle_report("2024-02-29", "2024-02-29")["total"]["won"], 0)
+        # Validation also applies when there is no data at all, creating nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.win_cycle_report("2026-02-30", "2026-10-02")
+        with self.assertRaises(ValueError):
+            fresh.win_cycle_report("2026-10-02", "2026-10-01")
+        with self.assertRaises(ValueError):
+            fresh.win_cycle_report("2026-10-01", "2026-10-02", tag_mode="weird")
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_cli_win_cycle_report_success_and_failure(self):
+        self.seed_win_cycles()
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"start_on": "2026-10-01", "end_on": "2026-10-03"}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "win-cycle-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"]["won"], 4)
+        # Filters pass through; array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "organization": "books"},
+            {"start_on": "2026-10-03", "end_on": "2026-10-03", "tags": ["vip", "华东"]},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "win-cycle-report", str(payload)], text=True,
+                               capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"]["won"], 2)
+        self.assertEqual(values[1]["total"]["won"], 1)
+        self.assertEqual(values[1]["total"]["unmeasured"], 1)
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"start_on": "2026-10-02", "end_on": "2026-10-01"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "win-cycle-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def seed_inactive(self):
         # A: last on/before 2026-10-05 is the last saved entry on 2026-10-02 (idle 3);
         # B: last 2026-09-01 (idle 34); C: recent 2026-10-04 (idle 1);

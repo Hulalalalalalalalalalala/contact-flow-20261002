@@ -2,6 +2,7 @@ import csv
 import io
 import unicodedata
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from .storage import JsonStore, text, calendar_day, positive, amount_string, amount_cents, format_cents
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
@@ -895,6 +896,112 @@ class ContactFlow(JsonStore):
                              record["organization"], record["from_stage"], record["to_stage"],
                              record["on"]))
         return {"records": records, "csv": buffer.getvalue()}
+
+    def win_cycle_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
+        start_on = calendar_day(start_on, "start_on")
+        end_on = calendar_day(end_on, "end_on")
+        if start_on > end_on:
+            raise ValueError("start_on must not be later than end_on")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        def empty_counts():
+            return {"won": 0, "measured": 0, "unmeasured": 0, "days": 0}
+
+        history_store = data.get("stage_history", {})
+        totals = empty_counts()
+        # Only organizations that own at least one qualifying win get a group.
+        groups = {}
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            history = history_store.get(opportunity["opportunity_id"], [])
+            # Exactly one winning event per opportunity: the last saved record
+            # entering won with a non-null date inside the range. Imported/legacy
+            # deals already at won have no such record, and a null-date win entry
+            # on its own never qualifies.
+            won_index = None
+            for index, entry in enumerate(history):
+                if (entry["to_stage"] == "won" and entry["on"] is not None
+                        and start_on <= entry["on"] <= end_on):
+                    won_index = index
+            if won_index is None:
+                continue
+            won_on = history[won_index]["on"]
+            # The duration starts at the most recent (in save order) dated entry
+            # into qualified saved before the winning event; the start may be
+            # earlier than the query range. A null on never serves as a start.
+            qualified_on = None
+            for entry in history[:won_index]:
+                if entry["to_stage"] == "qualified" and entry["on"] is not None:
+                    qualified_on = entry["on"]
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among owning contacts.
+                group["display"] = contact["organization"]
+            counts = groups[key]["counts"]
+            counts["won"] += 1
+            totals["won"] += 1
+            if qualified_on is None:
+                counts["unmeasured"] += 1
+                totals["unmeasured"] += 1
+            else:
+                span = (date.fromisoformat(won_on) - date.fromisoformat(qualified_on)).days
+                counts["measured"] += 1
+                counts["days"] += span
+                totals["measured"] += 1
+                totals["days"] += span
+
+        def stats_row(counts):
+            row = dict(counts)
+            if counts["measured"]:
+                average = (Decimal(counts["days"]) / Decimal(counts["measured"])).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                row["average"] = format(average, "f")
+            else:
+                row["average"] = None
+            return row
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(stats_row(group["counts"]))
+            organizations.append(row)
+
+        total_row = stats_row(totals)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "won", "measured", "unmeasured", "days", "average"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["won"], row["measured"],
+                             row["unmeasured"], row["days"],
+                             row["average"] if row["average"] is not None else ""))
+
+        return {"total": total_row, "organizations": organizations, "csv": buffer.getvalue()}
 
     def timeline(self, contact_id):
         data = self._read()
