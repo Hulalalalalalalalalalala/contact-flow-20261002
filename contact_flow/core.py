@@ -1,5 +1,9 @@
+import csv
+import io
 from datetime import date
 from .storage import JsonStore, text
+
+CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 
 def normalize_tags(value):
     if not isinstance(value, list):
@@ -28,6 +32,58 @@ class ContactFlow(JsonStore):
         contacts[contact_id] = contact
         self._write(data)
         return contact
+
+    def import_contacts(self, csv_path):
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if len(header) != len(CONTACT_FIELDS) or set(header) != set(CONTACT_FIELDS) or len(set(header)) != len(header):
+            raise ValueError("CSV header must contain exactly contact_id,name,email,organization in any order")
+
+        data = self._read()
+        contacts = data.setdefault("contacts", {})
+        existing_emails = {c["email"] for c in contacts.values()}
+        seen_ids = set()
+        seen_emails = set()
+        imported = []
+        try:
+            for row in rows:
+                if not row:
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                contact_id = text(values["contact_id"], "contact_id")
+                name = text(values["name"], "name")
+                organization = text(values["organization"], "organization")
+                email = text(values["email"], "email").lower()
+                if email.count("@") != 1 or any(c.isspace() for c in email) or not all(email.split("@")):
+                    raise ValueError("invalid email")
+                if contact_id in contacts or email in existing_emails:
+                    raise ValueError("contact id or email already exists")
+                if contact_id in seen_ids or email in seen_emails:
+                    raise ValueError("duplicate contact id or email within import file")
+                seen_ids.add(contact_id)
+                seen_emails.add(email)
+                contact = {"contact_id": contact_id, "name": name, "email": email, "organization": organization}
+                contacts[contact_id] = contact
+                imported.append(contact)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if imported:
+            self._write(data)
+        return imported
 
     def follow_up(self, contact_id, on, note):
         note = text(note, "note")

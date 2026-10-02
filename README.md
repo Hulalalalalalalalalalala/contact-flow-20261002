@@ -30,6 +30,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `merge` → `ContactFlow.merge_contacts(...)`。把源联系人合入目标联系人：删除源联系人，其全部跟进记录归入目标，返回目标联系人和转移数量。参数名见 `core.py` 的公开方法签名。
 - `set-tags` → `ContactFlow.set_tags(contact_id, tags)`。整组替换联系人标签，返回规范化后的标签数组；传空数组清除标签。标签须为字符串列表，每项去除首尾空白后非空，并按 casefold 规范化、去重，返回按 Unicode 码点排序。
 - `get-tags` → `ContactFlow.get_tags(contact_id)`。返回联系人的标签数组；新联系人或旧数据默认返回空数组。
+- `import-contacts` → `ContactFlow.import_contacts(csv_path)`。一次性整体导入本地 CSV：参数 JSON 形如 `{"csv_path": "people.csv"}`，相对路径按当前工作目录解释。文件须为 UTF-8（可带 BOM），表头只能是 `contact_id,name,email,organization` 四列、名称精确匹配、顺序任意；缺失、重复或额外列一律拒绝。支持标准引号、字段内逗号与换行；零字段空行忽略，其余字段数不符、CSV 语法错误或编码非法一律拒绝。整份文件先全部校验：规范化后的标识或邮箱与已有联系人或批内其他记录重复（即使两行完全相同）时整批拒绝，不覆盖、不跳过、不部分写入。成功返回按文件记录顺序排列的联系人数组，内容与 `add` 返回一致；空文件或无表头一律拒绝，只有合法表头（或其后仅有空行）时返回空数组且不创建数据目录。源文件不存在报 `FileNotFoundError`、无权限报 `PermissionError`、`csv_path` 类型非法或为空白字符串报 `ValueError`。
 - `find` 还接受可选 `tags`（标签数组）和 `tag_mode`（`all` 或 `any`，默认 `all`）：前者要求包含全部标签，后者要求至少匹配一个。省略 `tags` 或传 `None`、空数组时不限制标签；标签条件与组织条件同时满足才返回。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
