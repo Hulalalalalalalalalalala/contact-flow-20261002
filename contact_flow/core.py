@@ -225,6 +225,72 @@ class ContactFlow(JsonStore):
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
 
+    def funnel_report(self, organization=None, tags=None, tag_mode="all"):
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        def empty_counts():
+            return {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0}
+
+        totals = empty_counts()
+        groups = {}
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among filtered contacts.
+                group["display"] = contact["organization"]
+            groups[key]["counts"]["contacts"] += 1
+            totals["contacts"] += 1
+
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            counts = groups[contact["organization"].casefold()]["counts"]
+            counts[opportunity["stage"]] += 1
+            counts["opportunities"] += 1
+            totals[opportunity["stage"]] += 1
+            totals["opportunities"] += 1
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(group["counts"])
+            organizations.append(row)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "contacts", "new", "qualified", "won", "lost", "opportunities"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["contacts"], row["new"], row["qualified"],
+                            row["won"], row["lost"], row["opportunities"]))
+
+        return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):

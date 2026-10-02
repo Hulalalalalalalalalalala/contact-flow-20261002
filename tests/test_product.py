@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -372,6 +374,162 @@ class ProductTests(unittest.TestCase):
         rejected = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(fresh_root), "import-contacts", str(payload)], text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
         self.assertFalse(fresh_root.exists())
+
+    def seed_funnel(self):
+        # Books (casefold group): A with two opportunities (new + won), D with one qualified.
+        # books: B with one lost. Music: C with no opportunities.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_stage("O2", "won")
+        self.app.add_opportunity("O3", "D", "Third")
+        self.app.set_stage("O3", "qualified")
+        self.app.add_opportunity("O4", "B", "Fourth")
+        self.app.set_stage("O4", "lost")
+
+    def test_funnel_report_counts_current_stages_and_groups_organizations(self):
+        self.seed_funnel()
+        report = self.app.funnel_report()
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(report["total"],
+            {"contacts": 4, "new": 1, "qualified": 1, "won": 1, "lost": 1, "opportunities": 4})
+        # Organizations are grouped by casefold value, sorted by that key;
+        # the display name is the code-point-smallest original value ("Books" < "books").
+        self.assertEqual([row["organization"] for row in report["organizations"]], ["Books", "Music"])
+        books = report["organizations"][0]
+        self.assertEqual(books,
+            {"organization": "Books", "contacts": 3, "new": 1, "qualified": 1, "won": 1, "lost": 1, "opportunities": 4})
+        # A contact with no opportunities is included as an organization but adds no stages.
+        self.assertEqual(report["organizations"][1],
+            {"organization": "Music", "contacts": 1, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+
+    def test_funnel_report_csv_matches_organizations(self):
+        self.seed_funnel()
+        report = self.app.funnel_report()
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["organization", "contacts", "new", "qualified", "won", "lost", "opportunities"])
+        decoded = [dict(zip(rows[0], row)) for row in rows[1:]]
+        self.assertEqual([row["organization"] for row in decoded],
+                         [row["organization"] for row in report["organizations"]])
+        for decoded_row, row in zip(decoded, report["organizations"]):
+            self.assertEqual(int(decoded_row["contacts"]), row["contacts"])
+            self.assertEqual(int(decoded_row["new"]), row["new"])
+            self.assertEqual(int(decoded_row["qualified"]), row["qualified"])
+            self.assertEqual(int(decoded_row["won"]), row["won"])
+            self.assertEqual(int(decoded_row["lost"]), row["lost"])
+            self.assertEqual(int(decoded_row["opportunities"]), row["opportunities"])
+        # LF-terminated records, final newline, only organization rows.
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["organizations"]) + 1)
+
+    def test_funnel_report_csv_escapes_and_preserves_internal_newlines(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Book, \"店\"\n二楼")
+        report = self.app.funnel_report()
+        self.assertIn('"Book, ""店""\n二楼",1,0,0,0,0,0', report["csv"])
+        # The embedded newline survives a strict CSV round-trip.
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[1][0], "Book, \"店\"\n二楼")
+
+    def test_funnel_report_filters_organization_tags_and_intersection(self):
+        self.seed_funnel()
+        by_org = self.app.funnel_report(organization="  BOOKS ")
+        self.assertEqual([row["organization"] for row in by_org["organizations"]], ["Books"])
+        self.assertEqual(by_org["total"],
+            {"contacts": 3, "new": 1, "qualified": 1, "won": 1, "lost": 1, "opportunities": 4})
+        tagged = self.app.funnel_report(tags=["VIP"])
+        # Only A matches: its won opportunity stays won and is not counted as qualified.
+        self.assertEqual(tagged["total"],
+            {"contacts": 1, "new": 1, "qualified": 0, "won": 1, "lost": 0, "opportunities": 2})
+        self.assertEqual(tagged["organizations"][0]["organization"], "Books")
+        # Organization and tag conditions intersect: no contact in Music carries the tag.
+        self.assertEqual(self.app.funnel_report(organization="Music", tags=["vip"])["total"],
+            {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(self.app.funnel_report(tags=["vip", "华东"])["total"]["contacts"], 1)
+        self.assertEqual(self.app.funnel_report(tags=["vip", "missing"], tag_mode="any")["total"]["contacts"], 1)
+
+    def test_funnel_report_empty_and_legacy_data(self):
+        # No data file at all.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.funnel_report()
+        self.assertEqual(report["total"],
+            {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"], "organization,contacts,new,qualified,won,lost,opportunities\n")
+        self.assertFalse(fresh_root.exists())
+        # Legacy data with contacts but no opportunities.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        report = self.app.funnel_report()
+        self.assertEqual(report["total"],
+            {"contacts": 1, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0})
+        self.assertEqual(report["organizations"][0]["new"], 0)
+
+    def test_funnel_report_regroups_after_merge_without_extra_opportunities(self):
+        self.seed_funnel()
+        before = self.app.funnel_report()["total"]["opportunities"]
+        self.app.merge_contacts("A", "C")  # into Music; tags travel with the contact
+        report = self.app.funnel_report()
+        self.assertEqual(report["total"]["opportunities"], before)
+        by_org = {row["organization"]: row for row in report["organizations"]}
+        self.assertEqual(by_org["Music"],
+            {"organization": "Music", "contacts": 1, "new": 1, "qualified": 0, "won": 1, "lost": 0, "opportunities": 2})
+        self.assertEqual(by_org["Books"],
+            {"organization": "Books", "contacts": 2, "new": 0, "qualified": 1, "won": 0, "lost": 1, "opportunities": 2})
+        # The merged contact keeps its tags, so the vip filter now resolves to Music.
+        tagged = self.app.funnel_report(tags=["vip"])
+        self.assertEqual(tagged["organizations"][0]["organization"], "Music")
+        self.assertEqual(tagged["total"]["opportunities"], 2)
+
+    def test_funnel_report_validates_arguments_without_writing(self):
+        self.seed_funnel()
+        before = self.app.path.read_bytes()
+        for kwargs in [{"organization": 5}, {"organization": ["x"]},
+                       {"tags": ["ok", 1]}, {"tags": "vip"},
+                       {"tag_mode": "ALL"}, {"tag_mode": "weird"}]:
+            with self.assertRaises(ValueError):
+                self.app.funnel_report(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # None and plain strings are accepted without side effects.
+        self.assertEqual(self.app.funnel_report(organization=None)["total"]["contacts"], 4)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_funnel_report_success_and_failure(self):
+        self.seed_funnel()
+        # No input file: report over all data.
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "funnel-report"],
+                            text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(report["total"]["opportunities"], 4)
+        self.assertEqual(report["total"]["contacts"], 4)
+        # Object input with filters, array input behaves like repeated calls.
+        payload = self.root / "funnel.json"
+        payload.write_text(json.dumps({"tags": ["vip"]}), encoding="utf-8")
+        filtered = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                   "funnel-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        self.assertEqual(json.loads(filtered.stdout)["total"]["contacts"], 1)
+        payload.write_text(json.dumps([{}, {"organization": "Music"}]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "funnel-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"]["contacts"], 4)
+        self.assertEqual(values[1]["organizations"][0]["organization"], "Music")
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        payload.write_text(json.dumps({"organization": 7}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "funnel-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.funnel_report()["total"]["opportunities"], 4)
 
 if __name__ == "__main__":
     unittest.main()
