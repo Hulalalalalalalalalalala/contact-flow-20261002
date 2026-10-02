@@ -1138,3 +1138,67 @@ class ContactFlow(JsonStore):
         never.sort(key=lambda row: row["contact"]["contact_id"])
         idle_rows.sort(key=lambda row: (-row["idle_days"], row["contact"]["contact_id"]))
         return never + idle_rows
+
+    def stalled_opportunities(self, as_of, stalled_days, organization=None, tags=None, tag_mode="all"):
+        as_of = calendar_day(as_of, "as_of")
+        # type(...) is int rejects bools, which are ints in Python but never a day count.
+        stalled_days = positive(stalled_days, "stalled_days")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        cutoff = date.fromisoformat(as_of)
+        history_store = data.get("stage_history", {})
+        unknown, aged = [], []
+        for opportunity in data.get("opportunities", {}).values():
+            # Only deals currently at qualified are judged; history is never
+            # rebuilt to decide what stage a deal was in as of the cutoff.
+            if opportunity["stage"] != "qualified":
+                continue
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            # The start is the last saved record (save order) entering qualified.
+            # Imported/legacy deals already qualified have none, and a null date
+            # never borrows another date; both still qualify with nulls.
+            entered_on = None
+            for entry in history_store.get(opportunity["opportunity_id"], []):
+                if entry["to_stage"] == "qualified":
+                    entered_on = entry["on"]
+            row = {"opportunity": dict(opportunity), "contact": dict(contact)}
+            if entered_on is None:
+                row["entered_on"] = None
+                row["age_days"] = None
+                unknown.append(row)
+            elif entered_on > as_of:
+                # Qualified only after the cutoff: the deal is not stalled yet.
+                continue
+            else:
+                age_days = (cutoff - date.fromisoformat(entered_on)).days
+                if age_days < stalled_days:
+                    # The threshold is inclusive: exactly stalled_days still matches.
+                    continue
+                row["entered_on"] = entered_on
+                row["age_days"] = age_days
+                aged.append(row)
+
+        unknown.sort(key=lambda row: row["opportunity"]["opportunity_id"])
+        aged.sort(key=lambda row: (-row["age_days"], row["opportunity"]["opportunity_id"]))
+        return unknown + aged
