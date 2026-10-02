@@ -6,6 +6,7 @@ import tempfile
 from datetime import date
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
 
 class JsonStore:
     def __init__(self, root):
@@ -41,6 +42,26 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def amount_cents(value):
+    # Exact cents for a validated decimal string; the fraction pads to two digits.
+    whole, _, fraction = value.partition(".")
+    return int(whole) * 100 + int((fraction + "00")[:2])
+
+def format_cents(cents):
+    return "%d.%02d" % (cents // 100, cents % 100)
+
+def amount_string(value, label):
+    # Accept only a trimmed non-negative decimal string: ASCII digits, at most one
+    # point, a nonempty integer part, and 1-2 fraction digits when a point appears.
+    # Leading zeros and zero are fine; signs, exponents, and separators are not.
+    if not isinstance(value, str):
+        raise ValueError(label + " must be a decimal string")
+    clean = value.strip()
+    if not AMOUNT_RE.fullmatch(clean):
+        raise ValueError(label + " must be a nonnegative decimal amount")
+    # Output drops extra leading zeros and pins exactly two fraction digits.
+    return format_cents(amount_cents(clean))
 
 def calendar_day(value, label):
     # Accept only a trimmed YYYY-MM-DD string naming a real calendar date

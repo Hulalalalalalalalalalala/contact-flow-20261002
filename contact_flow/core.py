@@ -2,7 +2,7 @@ import csv
 import io
 import unicodedata
 from datetime import date
-from .storage import JsonStore, text, calendar_day, positive
+from .storage import JsonStore, text, calendar_day, positive, amount_string, amount_cents, format_cents
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
@@ -419,6 +419,21 @@ class ContactFlow(JsonStore):
             self._write(data)
         return dict(opportunity)
 
+    def set_opportunity_amount(self, opportunity_id, amount):
+        opportunity_id = text(opportunity_id, "opportunity_id")
+        amount = amount_string(amount, "amount")
+        data = self._read()
+        opportunity = data.get("opportunities", {}).get(opportunity_id)
+        if opportunity is None:
+            raise ValueError("unknown opportunity")
+        # Terminal stages accept amounts too; an unset amount reads as 0.00, so
+        # setting zero on a never-priced opportunity is a no-op like any equal value.
+        current = opportunity.get("amount", "0.00")
+        if current != amount:
+            opportunity["amount"] = amount
+            self._write(data)
+        return {"opportunity_id": opportunity_id, "amount": amount}
+
     def find_opportunities(self, contact_id=None, stage=None):
         if contact_id is not None:
             contact_id = text(contact_id, "contact_id")
@@ -625,6 +640,78 @@ class ContactFlow(JsonStore):
                             row["won"], row["lost"], row["opportunities"]))
 
         return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
+
+    def opportunity_amount_report(self, organization=None, tags=None, tag_mode="all"):
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        # Sums accumulate in integer cents, so totals are exact to the cent.
+        def empty_counts():
+            return {"new": 0, "qualified": 0, "won": 0, "lost": 0}
+
+        totals = empty_counts()
+        groups = {}
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among filtered contacts.
+                group["display"] = contact["organization"]
+
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            # An opportunity without a price contributes 0.00 to its current stage.
+            cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
+            counts = groups[contact["organization"].casefold()]["counts"]
+            counts[opportunity["stage"]] += cents
+            totals[opportunity["stage"]] += cents
+
+        def money_row(counts):
+            row = {stage: format_cents(counts[stage]) for stage in STAGES}
+            row["amount"] = format_cents(sum(counts.values()))
+            return row
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(money_row(group["counts"]))
+            organizations.append(row)
+
+        totals_row = money_row(totals)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "new", "qualified", "won", "lost", "amount"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["new"], row["qualified"],
+                             row["won"], row["lost"], row["amount"]))
+
+        return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
 
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
