@@ -378,6 +378,53 @@ class ContactFlow(JsonStore):
 
         return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
 
+    def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
+        start_on = calendar_day(start_on, "start_on")
+        end_on = calendar_day(end_on, "end_on")
+        if start_on > end_on:
+            raise ValueError("start_on must not be later than end_on")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        selected = {contact_id: contact for contact_id, contact in contacts.items() if matches(contact)}
+        records = []
+        for entry in data.get("followups", []):
+            contact = selected.get(entry["contact_id"])
+            if contact is None or not (start_on <= entry["on"] <= end_on):
+                continue
+            records.append({"contact_id": contact["contact_id"], "name": contact["name"],
+                            "email": contact["email"], "organization": contact["organization"],
+                            "on": entry["on"], "note": entry["note"]})
+        # Date ascending, then contact id code point; the stable sort keeps save order
+        # for same-day entries of one contact, and duplicate entries stay as separate rows.
+        records.sort(key=lambda record: (record["on"], record["contact_id"]))
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("contact_id", "name", "email", "organization", "on", "note"))
+        for record in records:
+            writer.writerow((record["contact_id"], record["name"], record["email"],
+                             record["organization"], record["on"], record["note"]))
+        return {"records": records, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):

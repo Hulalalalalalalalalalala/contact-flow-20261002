@@ -41,6 +41,10 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
   - `organizations` 是按组织归组的统计数组，每项比 `total` 多一个 `organization` 字段，并包含有联系人但无机会的组织。组织按 `casefold` 值归组，同组显示名取筛选后组织原值中 Unicode 码点最小者，数组按归组值升序。无匹配时 `total` 全零且数组为空；旧数据没有机会时各阶段计数为零。
   - `csv` 是字符串，表头固定为 `organization,contacts,new,qualified,won,lost,opportunities`，只输出组织行，顺序与数值与 `organizations` 一致；没有组织时只有表头。字段按标准 CSV 规则转义并保留字段内换行，记录用 LF 分隔且末尾有换行。
   - 合并联系人后，其机会按目标联系人的当前组织和标签重新归组，全局机会总数不因合并增加。`organization` 非字符串且非 `None`、标签不合法、`tag_mode` 不是 `all`/`any` 时抛 `ValueError`。
+- `followup-report` → `ContactFlow.followup_report(start_on, end_on, organization=None, tags=None, tag_mode="all")`。跨联系人查询指定日期范围内的跟进记录，返回仅含 `records`、`csv` 的对象，只读不创建目录或改写数据，也不写出导出文件。`start_on`、`end_on` 规则同 `due_on`（去除首尾空白后的 `YYYY-MM-DD` 真实日期，允许合法闰日），范围包含两端，起始日晚于结束日抛 `ValueError`；`organization`、`tags`、`tag_mode` 的筛选含义、规范化及默认值与 `find` 一致，组织与标签条件取交集。没有跟进记录的联系人不产生结果，机会阶段和提醒不影响查询。
+  - `records` 是数组，每项只含 `contact_id`、`name`、`email`、`organization`、`on`、`note`；资料取联系人的当前值，日期和备注保留原内容。先按日期升序，再按联系人标识的 Unicode 码点升序，同日同一联系人按保存顺序排列，重复记录逐条保留。更新或合并联系人后，记录按当前联系人资料及标签筛选和展示。
+  - `csv` 是字符串，表头固定为 `contact_id,name,email,organization,on,note`，行顺序和内容与 `records` 一致；字段按标准 CSV 规则转义并保留字段内换行，记录用 LF 分隔且末尾有换行。无匹配时 `records` 为空数组且 `csv` 只有表头。
+  - 类型错误、空白、格式非法、无效日期或起始日晚于结束日均抛 `ValueError`；`organization` 非字符串且非 `None`、标签不合法、`tag_mode` 不是 `all`/`any` 同样抛 `ValueError`，空数据时也同样校验。旧数据缺少跟进或标签集合时按空集合处理。
 - `set-reminder` → `ContactFlow.set_reminder(contact_id, due_on, note)`。为已存在的联系人设置下一次跟进提醒。每位联系人至多保留一条提醒，再次设置整条替换；返回仅含 `contact_id`、`due_on`、`note` 的对象。`contact_id` 与 `note` 去除首尾空白后须非空，标识区分大小写，备注内部空白保留。`due_on` 只接受去除首尾空白后的 `YYYY-MM-DD` 且日期真实有效（允许过去日期与合法闰日，如 `2024-02-29`）；参数非字符串、去空白后为空或日期非法均抛 `ValueError`。未知联系人抛 `ValueError` 且不写文件。
 - `clear-reminder` → `ContactFlow.clear_reminder(contact_id)`。清除联系人的提醒：有提醒则删除并返回 `true`；本就没有提醒时返回 `false` 且不写文件。标识非法或联系人未知抛 `ValueError`。
 - `due-reminders` → `ContactFlow.due_reminders(as_of)`。须显式提供截止日期 `as_of`（规则同 `due_on`，不使用系统日期），返回 `due_on` 不晚于 `as_of` 的提醒数组（含当天及逾期项）。结果先按到期日升序，同日再按联系人标识的 Unicode 码点升序；无匹配返回空数组。只读，不创建目录或文件，也不改写数据；旧数据没有提醒时视为空集合。

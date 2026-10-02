@@ -717,6 +717,200 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(ContactFlow(self.root).due_reminders("2030-12-31"),
                          [{"contact_id": "A", "due_on": "2030-01-01", "note": "far"}])
 
+    def seed_followups(self):
+        # Books: A (vip, 华东) with three notes, two on the same day; B (vip, north) with one.
+        # Music: C with one note outside the default range; D with no followups at all.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip", "north"])
+        self.app.follow_up("A", "2026-10-02", "second")
+        self.app.follow_up("B", "2026-10-01", "bob first")
+        self.app.follow_up("A", "2026-10-01", "first")
+        self.app.follow_up("A", "2026-10-01", "first again")  # same day, kept in save order
+        self.app.follow_up("C", "2026-11-05", "cara later")
+
+    def test_followup_report_orders_and_keeps_only_record_fields(self):
+        self.seed_followups()
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in report["records"]],
+                         [("A", "2026-10-01", "first"), ("A", "2026-10-01", "first again"),
+                          ("B", "2026-10-01", "bob first"), ("A", "2026-10-02", "second")])
+        for record in report["records"]:
+            self.assertEqual(set(record), {"contact_id", "name", "email", "organization", "on", "note"})
+        self.assertEqual(report["records"][0],
+                         {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                          "organization": "Books", "on": "2026-10-01", "note": "first"})
+        # Contacts without followups (D) and out-of-range notes (C) produce nothing.
+        self.assertNotIn("D", [r["contact_id"] for r in report["records"]])
+        self.assertNotIn("C", [r["contact_id"] for r in report["records"]])
+
+    def test_followup_report_range_is_inclusive_and_same_day_allowed(self):
+        self.seed_followups()
+        one_day = self.app.followup_report(" 2026-10-02 ", "2026-10-02")
+        self.assertEqual([(r["contact_id"], r["note"]) for r in one_day["records"]],
+                         [("A", "second")])
+        self.assertEqual(self.app.followup_report("2026-10-03", "2026-10-04")["records"], [])
+        # Legal leap day accepted as a boundary.
+        self.assertEqual(self.app.followup_report("2024-02-29", "2024-02-29")["records"], [])
+
+    def test_followup_report_filters_organization_tags_and_intersection(self):
+        self.seed_followups()
+        by_org = self.app.followup_report("2026-10-01", "2026-12-31", organization=" BOOKS ")
+        self.assertEqual([r["contact_id"] for r in by_org["records"]], ["A", "A", "B", "A"])
+        tagged = self.app.followup_report("2026-10-01", "2026-12-31", tags=["VIP"])
+        self.assertEqual([r["contact_id"] for r in tagged["records"]], ["A", "A", "B", "A"])
+        both = self.app.followup_report("2026-10-01", "2026-12-31", tags=["vip", "华东"])
+        self.assertEqual([r["contact_id"] for r in both["records"]], ["A", "A", "A"])
+        any_mode = self.app.followup_report("2026-10-01", "2026-12-31",
+                                            tags=["north", "missing"], tag_mode="any")
+        self.assertEqual([r["contact_id"] for r in any_mode["records"]], ["B"])
+        # Organization and tag conditions intersect: no Music contact carries the tag.
+        crossed = self.app.followup_report("2026-10-01", "2026-12-31",
+                                           organization="Music", tags=["vip"])
+        self.assertEqual(crossed["records"], [])
+        # None and empty tags mean no tag restriction.
+        self.assertEqual(self.app.followup_report("2026-10-01", "2026-10-02", tags=None),
+                         self.app.followup_report("2026-10-01", "2026-10-02", tags=[]))
+
+    def test_followup_report_uses_current_profile_after_update_and_merge(self):
+        self.seed_followups()
+        self.app.update_contact("A", {"name": "Alice Wang", "organization": "Music"})
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        alice = [r for r in report["records"] if r["contact_id"] == "A"]
+        self.assertTrue(all(r["name"] == "Alice Wang" and r["organization"] == "Music" for r in alice))
+        # The organization filter follows the current value.
+        self.assertEqual(self.app.followup_report("2026-10-01", "2026-10-02", organization="Books")
+                         ["records"][0]["contact_id"], "B")
+        # Merging B into A moves B's note under A with A's current profile and tags.
+        self.app.merge_contacts("B", "A")
+        merged = self.app.followup_report("2026-10-01", "2026-10-02", tags=["north"])
+        # Same-day entries keep save order: "bob first" was saved before A's 10-01 notes.
+        self.assertEqual([(r["contact_id"], r["note"], r["name"]) for r in merged["records"]],
+                         [("A", "bob first", "Alice Wang"), ("A", "first", "Alice Wang"),
+                          ("A", "first again", "Alice Wang"), ("A", "second", "Alice Wang")])
+
+    def test_followup_report_csv_matches_records_and_escapes(self):
+        self.app.add_contact("A", "Alice, \"艾\"", "a@example.test", "Book\n店")
+        self.app.follow_up("A", "2026-10-01", "line one\nline two")
+        report = self.app.followup_report("2026-10-01", "2026-10-01")
+        self.assertTrue(report["csv"].startswith("contact_id,name,email,organization,on,note\n"))
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[0], ["contact_id", "name", "email", "organization", "on", "note"])
+        self.assertEqual(rows[1], ["A", "Alice, \"艾\"", "a@example.test", "Book\n店",
+                                   "2026-10-01", "line one\nline two"])
+        self.assertEqual(len(rows), len(report["records"]) + 1)
+
+    def test_followup_report_empty_result_is_header_only_csv(self):
+        self.seed_followups()
+        report = self.app.followup_report("2027-01-01", "2027-01-31")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"], "contact_id,name,email,organization,on,note\n")
+        # Legacy data without followups or tags collections reads as empty sets.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root).followup_report("2026-01-01", "2026-12-31", tags=["vip"])
+        self.assertEqual(legacy["records"], [])
+        self.assertEqual(legacy["csv"], "contact_id,name,email,organization,on,note\n")
+
+    def test_followup_report_validates_arguments_without_writing(self):
+        self.seed_followups()
+        before = self.app.path.read_bytes()
+        bad_calls = [
+            {"start_on": None, "end_on": "2026-10-02"},
+            {"start_on": 20261001, "end_on": "2026-10-02"},
+            {"start_on": "", "end_on": "2026-10-02"},
+            {"start_on": "   ", "end_on": "2026-10-02"},
+            {"start_on": "2026-1-1", "end_on": "2026-10-02"},
+            {"start_on": "20261001", "end_on": "2026-10-02"},
+            {"start_on": "2026-02-30", "end_on": "2026-10-02"},
+            {"start_on": "2026-10-01", "end_on": "2026-13-01"},
+            {"start_on": "2026-10-01", "end_on": "not-a-date"},
+            {"start_on": "2026-10-03", "end_on": "2026-10-02"},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "organization": 5},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "organization": ["Books"]},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "tags": "vip"},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "tags": ["ok", 1]},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "tags": ["  "]},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "tag_mode": "ALL"},
+            {"start_on": "2026-10-01", "end_on": "2026-10-02", "tag_mode": "weird"},
+        ]
+        for kwargs in bad_calls:
+            with self.assertRaises(ValueError):
+                self.app.followup_report(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Validation also runs against an empty store and creates neither directory nor file.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for kwargs in bad_calls:
+            with self.assertRaises(ValueError):
+                fresh.followup_report(**kwargs)
+        self.assertFalse(fresh_root.exists())
+        # A valid query on the empty store is read-only too.
+        empty = fresh.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual(empty["records"], [])
+        self.assertFalse(fresh_root.exists())
+
+    def test_followup_report_ignores_opportunities_and_reminders(self):
+        self.seed_followups()
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified")
+        self.app.set_stage("O1", "won")
+        self.app.set_reminder("A", "2026-10-05", "nudge")
+        report = self.app.followup_report("2026-10-01", "2026-10-02")
+        self.assertEqual([r["note"] for r in report["records"]],
+                         ["first", "first again", "bob first", "second"])
+        self.assertTrue(all(set(r) == {"contact_id", "name", "email", "organization", "on", "note"}
+                            for r in report["records"]))
+
+    def test_cli_followup_report_success_and_failure(self):
+        self.seed_followups()
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"start_on": "2026-10-01", "end_on": "2026-10-02"}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(set(report), {"records", "csv"})
+        self.assertEqual([r["note"] for r in report["records"]],
+                         ["first", "first again", "bob first", "second"])
+        # Array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"start_on": "2026-10-01", "end_on": "2026-10-01", "tags": ["north"]},
+            {"start_on": "2026-11-01", "end_on": "2026-11-30"},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["note"] for r in values[0]["records"]], ["bob first"])
+        self.assertEqual([r["note"] for r in values[1]["records"]], ["cara later"])
+        # Invalid argument: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"start_on": "2026-10-03", "end_on": "2026-10-02"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing required dates also fail through the same error envelope.
+        payload.write_text(json.dumps({"start_on": "2026-10-01"}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "followup-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+
     def test_update_contact_changes_fields_and_persists_like_add(self):
         self.app.add_contact("A", "Alice", "alice@example.test", "Books")
         result = self.app.update_contact(" A ", {"name": "  Alice 王 ", "email": " ALICE@Example.TEST "})
