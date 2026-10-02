@@ -2591,6 +2591,335 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(json.loads(quiet.stdout), [])
         self.assertFalse(empty.exists())
 
+    def seed_stalled(self):
+        # Cutoff used by the tests: 2026-11-04.
+        # A (Books, vip+华东): O1 qualified 2026-09-25 (age 40), O10 qualified
+        # 2026-10-05 (age 30, boundary), O6 still new, O8 qualified in the future.
+        # B (Books, vip): O2 qualified with a null date (unknown), O7 won (excluded).
+        # C (Music): O3 qualified 2026-10-20 (age 15).
+        # D (Books): O4 imported directly qualified with no history (unknown).
+        # 陈 (Books): O5 qualified on the 2024 leap day (oldest dated start).
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.add_contact("陈", "Chen", "chen@example.test", "Books")
+        self.app.set_tags("A", ["VIP", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.set_stage("O1", "qualified", on="2026-09-25")
+        self.app.add_opportunity("O10", "A", "Boundary")
+        self.app.set_stage("O10", "qualified", on="2026-10-05")
+        self.app.add_opportunity("O6", "A", "Still new")
+        self.app.add_opportunity("O8", "A", "Future entry")
+        self.app.set_stage("O8", "qualified", on="2026-11-10")
+        self.app.add_opportunity("O2", "B", "Null date")
+        self.app.set_stage("O2", "qualified")
+        self.app.add_opportunity("O7", "B", "Won deal")
+        self.app.set_stage("O7", "qualified", on="2026-10-01")
+        self.app.set_stage("O7", "won", on="2026-10-15")
+        self.app.add_opportunity("O3", "C", "Music deal")
+        self.app.set_stage("O3", "qualified", on="2026-10-20")
+        # O4 is imported directly as qualified, with no stage history back-filled.
+        csv_path = self.root / "opportunities.csv"
+        csv_path.write_text(
+            "opportunity_id,contact_id,title,stage\nO4,D,Imported deal,qualified\n",
+            encoding="utf-8")
+        self.app.import_opportunities(str(csv_path))
+        self.app.add_opportunity("O5", "陈", "Leap start")
+        self.app.set_stage("O5", "qualified", on="2024-02-29")
+        # Followups, reminders and amounts never affect inclusion.
+        self.app.follow_up("C", "2026-11-03", "fresh contact")
+        self.app.set_reminder("D", "2026-10-01", "nudge")
+        self.app.set_opportunity_amount("O1", "880.00")
+
+    def test_stalled_opportunities_content_threshold_and_ordering(self):
+        self.seed_stalled()
+        leap_age = (date(2026, 11, 4) - date(2024, 2, 29)).days
+        result = self.app.stalled_opportunities(" 2026-11-04 ", 10)
+        # Unknown starts first (O2, O4 by id), then ages descending, id ascending.
+        self.assertEqual([(r["opportunity"]["opportunity_id"], r["entered_on"], r["age_days"])
+                          for r in result],
+                         [("O2", None, None), ("O4", None, None),
+                          ("O5", "2024-02-29", leap_age),
+                          ("O1", "2026-09-25", 40), ("O10", "2026-10-05", 30),
+                          ("O3", "2026-10-20", 15)])
+        for row in result:
+            self.assertEqual(set(row), {"opportunity", "contact", "entered_on", "age_days"})
+        # The opportunity is the full current object (amount kept, no back-fill elsewhere).
+        self.assertEqual(result[2]["opportunity"],
+                         {"opportunity_id": "O5", "contact_id": "陈", "title": "Leap start",
+                          "stage": "qualified"})
+        o1 = next(r for r in result if r["opportunity"]["opportunity_id"] == "O1")
+        self.assertEqual(o1["opportunity"],
+                         {"opportunity_id": "O1", "contact_id": "A", "title": "First",
+                          "stage": "qualified", "amount": "880.00"})
+        self.assertEqual(o1["contact"],
+                         {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                          "organization": "Books"})
+        # Null-start rows carry nulls and the current objects.
+        self.assertIsNone(result[0]["entered_on"])
+        self.assertIsNone(result[0]["age_days"])
+        self.assertEqual(result[0]["opportunity"],
+                         {"opportunity_id": "O2", "contact_id": "B", "title": "Null date",
+                          "stage": "qualified"})
+        self.assertEqual(result[0]["contact"],
+                         {"contact_id": "B", "name": "Bob", "email": "b@example.test",
+                          "organization": "Books"})
+        # The threshold is inclusive: O10 is exactly 30 days old.
+        ids_30 = [r["opportunity"]["opportunity_id"]
+                  for r in self.app.stalled_opportunities("2026-11-04", 30)]
+        self.assertIn("O10", ids_30)
+        ids_31 = [r["opportunity"]["opportunity_id"]
+                  for r in self.app.stalled_opportunities("2026-11-04", 31)]
+        self.assertNotIn("O10", ids_31)
+        # O3 (15 days) drops out at 16; the unknown-start rows always stay.
+        ids_16 = [r["opportunity"]["opportunity_id"]
+                  for r in self.app.stalled_opportunities("2026-11-04", 16)]
+        self.assertNotIn("O3", ids_16)
+        self.assertIn("O2", ids_16)
+        # The future qualified entry and the non-qualified deals never appear.
+        for excluded in ("O6", "O7", "O8"):
+            self.assertNotIn(excluded, [r["opportunity"]["opportunity_id"] for r in result])
+        # A cutoff after the leap-day start but before the other dated starts
+        # keeps the unknown starts plus the one aged leap-day deal.
+        early = self.app.stalled_opportunities("2026-01-01", 1)
+        self.assertEqual([(r["opportunity"]["opportunity_id"], r["age_days"]) for r in early],
+                         [("O2", None), ("O4", None),
+                          ("O5", (date(2026, 1, 1) - date(2024, 2, 29)).days)])
+        # Same-day start is age 0, so a threshold of 1 excludes it (but nulls stay).
+        same_day = self.app.stalled_opportunities("2026-10-20", 1)
+        self.assertEqual([r["opportunity"]["opportunity_id"] for r in same_day],
+                         ["O2", "O4", "O5", "O1", "O10"])
+
+    def test_stalled_opportunities_uses_last_saved_qualified_entry(self):
+        # Legacy history shapes that the normal transition API cannot create are
+        # stored verbatim: the start is the last saved entry into qualified.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {
+                "A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                      "organization": "Books"},
+                "B": {"contact_id": "B", "name": "Bob", "email": "b@example.test",
+                      "organization": "Books"}},
+            "opportunities": {
+                "P1": {"opportunity_id": "P1", "contact_id": "A", "title": "Re-entered",
+                       "stage": "qualified"},
+                "P2": {"opportunity_id": "P2", "contact_id": "A", "title": "Last null",
+                       "stage": "qualified"},
+                "P3": {"opportunity_id": "P3", "contact_id": "B", "title": "Moved out",
+                       "stage": "won"}},
+            "stage_history": {
+                # Two qualified entries: the last dated one (2026-09-15) is the start.
+                "P1": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "lost", "to_stage": "qualified", "on": "2026-09-15"}],
+                # A dated qualified entry followed by a null-date one: unknown start.
+                "P2": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "lost", "to_stage": "qualified", "on": None}],
+                # Currently won: qualified history exists but the deal is excluded.
+                "P3": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-10-01"}]}},
+        ), encoding="utf-8")
+        result = ContactFlow(legacy_root).stalled_opportunities("2026-11-04", 10)
+        self.assertEqual([(r["opportunity"]["opportunity_id"], r["entered_on"], r["age_days"])
+                          for r in result],
+                         [("P2", None, None),
+                          ("P1", "2026-09-15", (date(2026, 11, 4) - date(2026, 9, 15)).days)])
+
+    def test_stalled_opportunities_filters_organization_tags_and_intersection(self):
+        self.seed_stalled()
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities("2026-11-04", 10, organization="books")],
+            ["O2", "O4", "O5", "O1", "O10"])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities("2026-11-04", 10, organization=" music ")],
+            ["O3"])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities("2026-11-04", 10, tags=["vip"])],
+            ["O2", "O1", "O10"])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities("2026-11-04", 10, tags=["vip", "华东"])],
+            ["O1", "O10"])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities(
+                 "2026-11-04", 10, tags=["vip", "华东"], tag_mode="any")],
+            ["O2", "O1", "O10"])
+        # Organization and tag conditions intersect.
+        self.assertEqual(
+            self.app.stalled_opportunities("2026-11-04", 10, organization="Music", tags=["vip"]),
+            [])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities(
+                 "2026-11-04", 10, organization="Music", tags=[])],
+            ["O3"])
+        self.assertEqual(
+            self.app.stalled_opportunities("2026-11-04", 10, tags=None),
+            self.app.stalled_opportunities("2026-11-04", 10, tags=[]))
+
+    def test_stalled_opportunities_empty_legacy_and_readonly(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.stalled_opportunities("2026-11-04", 10), [])
+        self.assertFalse(fresh_root.exists())
+        # A legacy document with no opportunities/history/tags collections: empty result.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        self.assertEqual(ContactFlow(legacy_root).stalled_opportunities("2026-11-04", 1), [])
+        # Successful and rejected queries never rewrite the file or create directories.
+        self.seed_stalled()
+        before = self.app.path.read_bytes()
+        self.app.stalled_opportunities("2026-11-04", 10)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.stalled_opportunities("bad", 10)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_stalled_opportunities_validates_arguments_even_when_empty(self):
+        for kwargs in [
+            {"as_of": None, "stalled_days": 10},
+            {"as_of": 5, "stalled_days": 10},
+            {"as_of": "", "stalled_days": 10},
+            {"as_of": "   ", "stalled_days": 10},
+            {"as_of": "2026-02-30", "stalled_days": 10},
+            {"as_of": "2026-13-01", "stalled_days": 10},
+            {"as_of": "20261104", "stalled_days": 10},
+            {"as_of": "2026-11-04", "stalled_days": None},
+            {"as_of": "2026-11-04", "stalled_days": 0},
+            {"as_of": "2026-11-04", "stalled_days": -3},
+            {"as_of": "2026-11-04", "stalled_days": True},
+            {"as_of": "2026-11-04", "stalled_days": False},
+            {"as_of": "2026-11-04", "stalled_days": 1.0},
+            {"as_of": "2026-11-04", "stalled_days": "10"},
+            {"as_of": "2026-11-04", "stalled_days": 10, "organization": 5},
+            {"as_of": "2026-11-04", "stalled_days": 10, "organization": ["Books"]},
+            {"as_of": "2026-11-04", "stalled_days": 10, "tags": "vip"},
+            {"as_of": "2026-11-04", "stalled_days": 10, "tags": ["ok", 1]},
+            {"as_of": "2026-11-04", "stalled_days": 10, "tags": ["  "]},
+            {"as_of": "2026-11-04", "stalled_days": 10, "tag_mode": "ALL"},
+            {"as_of": "2026-11-04", "stalled_days": 10, "tag_mode": "weird"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.stalled_opportunities(**kwargs)
+        # The same validation runs against a missing data file and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.stalled_opportunities("2026-02-30", 10)
+        with self.assertRaises(ValueError):
+            fresh.stalled_opportunities("2026-11-04", True)
+        with self.assertRaises(ValueError):
+            fresh.stalled_opportunities("2026-11-04", 10, tag_mode="weird")
+        self.assertFalse(fresh_root.exists())
+        # Missing required arguments are a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            self.app.stalled_opportunities("2026-11-04")
+        with self.assertRaises(TypeError):
+            self.app.stalled_opportunities(stalled_days=10)
+        # A legal leap day parses against an empty store.
+        self.assertEqual(fresh.stalled_opportunities("2024-02-29", 1), [])
+
+    def test_stalled_opportunities_recomputes_after_profile_transfer_and_merge(self):
+        self.seed_stalled()
+        # Reopening the root recomputes from the current file.
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in ContactFlow(self.root).stalled_opportunities("2026-11-04", 10)],
+            ["O2", "O4", "O5", "O1", "O10", "O3"])
+        # Profile update: B moves to Music and its null-start deal is found there.
+        self.app.update_contact("B", {"organization": "Music"})
+        music = self.app.stalled_opportunities("2026-11-04", 10, organization="music")
+        self.assertEqual([r["opportunity"]["opportunity_id"] for r in music], ["O2", "O3"])
+        self.assertEqual(music[0]["contact"]["organization"], "Music")
+        # Tag changes take effect immediately.
+        self.app.set_tags("D", ["vip"])
+        self.assertEqual(
+            [r["opportunity"]["opportunity_id"]
+             for r in self.app.stalled_opportunities("2026-11-04", 10, tags=["vip"])],
+            ["O2", "O4", "O1", "O10"])
+        # Transfer O3 (Music) to A: it now belongs to Books and the vip group.
+        self.app.transfer_opportunities(
+            [{"opportunity_id": "O3", "source_contact_id": "C", "target_contact_id": "A"}])
+        transferred = self.app.stalled_opportunities("2026-11-04", 10, tags=["vip"])
+        rows = {r["opportunity"]["opportunity_id"]: r for r in transferred}
+        self.assertIn("O3", rows)
+        self.assertEqual(rows["O3"]["contact"]["contact_id"], "A")
+        # Moving O1 out of qualified excludes it; its history is untouched.
+        self.app.set_stage("O1", "won", on="2026-11-01")
+        after_win = self.app.stalled_opportunities("2026-11-04", 10)
+        self.assertNotIn("O1", [r["opportunity"]["opportunity_id"] for r in after_win])
+        self.assertEqual(ContactFlow(self.root).stage_history("O1")[-1]["to_stage"], "won")
+        # Merge B into A: B's null-start O2 follows the current owner and tags.
+        self.app.merge_contacts("B", "A")
+        merged = ContactFlow(self.root).stalled_opportunities("2026-11-04", 10, tags=["华东"])
+        merged_rows = {r["opportunity"]["opportunity_id"]: r for r in merged}
+        self.assertIn("O2", merged_rows)
+        self.assertEqual(merged_rows["O2"]["contact"]["contact_id"], "A")
+        self.assertNotIn("B", {r["contact"]["contact_id"] for r in
+                               ContactFlow(self.root).stalled_opportunities("2026-11-04", 10)})
+
+    def test_cli_stalled_opportunities_success_and_failure(self):
+        self.seed_stalled()
+        payload = self.root / "stalled.json"
+        payload.write_text(json.dumps({"as_of": " 2026-11-04 ", "stalled_days": 10}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "stalled-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([r["opportunity"]["opportunity_id"] for r in json.loads(ok.stdout)],
+                         ["O2", "O4", "O5", "O1", "O10", "O3"])
+        # Outer array runs the query once per object.
+        payload.write_text(json.dumps([
+            {"as_of": "2026-11-04", "stalled_days": 10, "tags": ["vip"]},
+            {"as_of": "2026-11-04", "stalled_days": 100, "organization": "Music"},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "stalled-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["opportunity"]["opportunity_id"] for r in values[0]],
+                         ["O2", "O1", "O10"])
+        self.assertEqual(values[1], [])
+        # Invalid threshold: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"as_of": "2026-11-04", "stalled_days": True}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "stalled-opportunities", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing required argument is also exit 2 via the standard error envelope.
+        payload.write_text(json.dumps({"as_of": "2026-11-04"}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "stalled-opportunities", str(payload)],
+                                 text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # A query over a nonexistent root returns [] and creates nothing.
+        empty = self.root / "empty"
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "stalled-opportunities", str(payload)], text=True,
+                               capture_output=True)
+        self.assertEqual(quiet.returncode, 2)  # missing stalled_days
+        payload.write_text(json.dumps({"as_of": "2026-11-04", "stalled_days": 10}), encoding="utf-8")
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "stalled-opportunities", str(payload)], text=True,
+                               capture_output=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty.exists())
+
     def seed_complete(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "Books")
