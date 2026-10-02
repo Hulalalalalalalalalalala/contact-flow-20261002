@@ -373,5 +373,148 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertFalse(fresh_root.exists())
 
+    def test_add_opportunity_validates_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        result = self.app.add_opportunity(" O-1 ", " A ", "  春季 采购  ")
+        self.assertEqual(result, {"opportunity_id": "O-1", "contact_id": "A", "title": "春季 采购", "stage": "new"})
+        # One contact may hold many opportunities; ids are case-sensitive and independent of contact ids.
+        self.app.add_opportunity("o-1", "A", "Another")
+        self.app.add_opportunity("A", "A", "Shares contact id")
+        reopened = ContactFlow(self.root)
+        self.assertEqual([o["opportunity_id"] for o in reopened.find_opportunities()], ["A", "O-1", "o-1"])
+
+    def test_add_opportunity_rejects_without_writing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O-1", "A", "First")
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"opportunity_id": "", "contact_id": "A", "title": "x"},
+            {"opportunity_id": "  ", "contact_id": "A", "title": "x"},
+            {"opportunity_id": None, "contact_id": "A", "title": "x"},
+            {"opportunity_id": 5, "contact_id": "A", "title": "x"},
+            {"opportunity_id": "O-2", "contact_id": " ", "title": "x"},
+            {"opportunity_id": "O-2", "contact_id": None, "title": "x"},
+            {"opportunity_id": "O-2", "contact_id": "ZZZ", "title": "x"},
+            {"opportunity_id": "O-2", "contact_id": "A", "title": ""},
+            {"opportunity_id": "O-2", "contact_id": "A", "title": "   "},
+            {"opportunity_id": "O-2", "contact_id": "A", "title": None},
+            {"opportunity_id": "O-1", "contact_id": "A", "title": "First"},
+            {"opportunity_id": "O-1", "contact_id": "A", "title": "Different"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.add_opportunity(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([o["opportunity_id"] for o in self.app.find_opportunities()], ["O-1"])
+
+    def test_add_opportunity_without_contact_creates_nothing(self):
+        with self.assertRaises(ValueError):
+            self.app.add_opportunity("O-1", "A", "x")
+        self.assertFalse(self.app.path.exists())
+
+    def test_set_stage_transitions_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O-1", "A", "Deal")
+        self.assertEqual(self.app.set_stage(" O-1 ", " qualified ")["stage"], "qualified")
+        self.assertEqual(self.app.set_stage("O-1", "won"),
+                         {"opportunity_id": "O-1", "contact_id": "A", "title": "Deal", "stage": "won"})
+        self.assertEqual(ContactFlow(self.root).find_opportunities(stage="won")[0]["opportunity_id"], "O-1")
+        # new -> lost and qualified -> lost are also allowed.
+        self.app.add_opportunity("O-2", "A", "Lost early")
+        self.assertEqual(self.app.set_stage("O-2", "lost")["stage"], "lost")
+        self.app.add_opportunity("O-3", "A", "Lost late")
+        self.app.set_stage("O-3", "qualified")
+        self.assertEqual(self.app.set_stage("O-3", "lost")["stage"], "lost")
+
+    def test_set_stage_rejects_without_writing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O-1", "A", "Deal")
+        self.app.add_opportunity("O-2", "A", "Won")
+        self.app.set_stage("O-2", "qualified")
+        self.app.set_stage("O-2", "won")
+        before = self.app.path.read_bytes()
+        for args in [("O-1", "won"), ("O-1", "Won"), ("O-1", "NEW"), ("O-1", ""), ("O-1", "  "),
+                     ("O-1", None), ("O-1", 5), ("O-2", "new"), ("O-2", "qualified"), ("O-2", "lost"),
+                     ("O-2", "qualified"), ("ZZZ", "new"), ("", "new"), (None, "new")]:
+            with self.assertRaises(ValueError):
+                self.app.set_stage(*args)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Re-setting the current stage succeeds without touching the file.
+        self.assertEqual(self.app.set_stage("O-1", "new")["stage"], "new")
+        self.assertEqual(self.app.set_stage("O-2", "won")["stage"], "won")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_set_stage_without_data_creates_nothing(self):
+        with self.assertRaises(ValueError):
+            self.app.set_stage("O-1", "qualified")
+        self.assertFalse(self.app.path.exists())
+
+    def test_find_opportunities_filters_sorts_and_defaults_empty(self):
+        self.assertEqual(self.app.find_opportunities(), [])
+        self.assertFalse(self.app.path.exists())
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O-2", "B", "Two")
+        self.app.add_opportunity("O-10", "A", "Ten")
+        self.app.add_opportunity("O-1", "A", "One")
+        self.app.set_stage("O-1", "qualified")
+        self.assertEqual([o["opportunity_id"] for o in self.app.find_opportunities()], ["O-1", "O-10", "O-2"])
+        self.assertEqual([o["opportunity_id"] for o in self.app.find_opportunities(contact_id=" A ")], ["O-1", "O-10"])
+        self.assertEqual([o["opportunity_id"] for o in self.app.find_opportunities(stage="new")], ["O-10", "O-2"])
+        self.assertEqual([o["opportunity_id"] for o in self.app.find_opportunities(contact_id="A", stage="qualified")], ["O-1"])
+        self.assertEqual(self.app.find_opportunities(contact_id="A", stage="won"), [])
+        self.assertEqual(self.app.find_opportunities(contact_id=None, stage=None), self.app.find_opportunities())
+        before = self.app.path.read_bytes()
+        for kwargs in [{"contact_id": "ZZZ"}, {"contact_id": ""}, {"contact_id": "  "}, {"contact_id": 5},
+                       {"stage": "unknown"}, {"stage": "NEW"}, {"stage": ""}, {"stage": None, "contact_id": "ZZZ"}]:
+            with self.assertRaises(ValueError):
+                self.app.find_opportunities(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_merge_moves_opportunities_unchanged(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O-1", "B", "Open")
+        self.app.add_opportunity("O-2", "B", "Closed")
+        self.app.set_stage("O-2", "lost")
+        self.app.follow_up("B", "2026-10-01", "Note")
+        result = self.app.merge_contacts("B", "A")
+        self.assertEqual(set(result), {"contact", "moved_followups"})
+        self.assertEqual(result["moved_followups"], 1)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.find_opportunities(),
+                         [{"opportunity_id": "O-1", "contact_id": "A", "title": "Open", "stage": "new"},
+                          {"opportunity_id": "O-2", "contact_id": "A", "title": "Closed", "stage": "lost"}])
+        with self.assertRaises(ValueError):
+            reopened.find_opportunities(contact_id="B")
+
+    def test_cli_opportunity_commands(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        payload = self.root / "opp.json"
+        payload.write_text(json.dumps({"opportunity_id": "O-1", "contact_id": "A", "title": "Deal"}), encoding="utf-8")
+        added = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "add-opportunity", str(payload)], text=True, capture_output=True)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(json.loads(added.stdout), {"opportunity_id": "O-1", "contact_id": "A", "title": "Deal", "stage": "new"})
+        payload.write_text(json.dumps([{"opportunity_id": "O-1", "stage": "qualified"}, {"opportunity_id": "O-1", "stage": "won"}]), encoding="utf-8")
+        staged = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "set-stage", str(payload)], text=True, capture_output=True)
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        self.assertEqual([o["stage"] for o in json.loads(staged.stdout)], ["qualified", "won"])
+        payload.write_text(json.dumps({"stage": "won"}), encoding="utf-8")
+        found = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "find-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual([o["opportunity_id"] for o in json.loads(found.stdout)], ["O-1"])
+        # Array input stops at the first failure but keeps earlier successes.
+        payload.write_text(json.dumps([{"opportunity_id": "O-2", "contact_id": "A", "title": "Two"},
+                                       {"opportunity_id": "O-2", "contact_id": "A", "title": "Dup"}]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "add-opportunity", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        self.assertEqual([o["opportunity_id"] for o in ContactFlow(self.root).find_opportunities()], ["O-1", "O-2"])
+        payload.write_text(json.dumps({"opportunity_id": "O-1", "stage": "new"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "set-stage", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+
 if __name__ == "__main__":
     unittest.main()

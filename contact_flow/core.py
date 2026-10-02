@@ -5,6 +5,15 @@ from .storage import JsonStore, text
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 
+STAGES = ("new", "qualified", "won", "lost")
+STAGE_TRANSITIONS = {"new": {"qualified", "lost"}, "qualified": {"won", "lost"}}
+
+def normalize_stage(value):
+    stage = text(value, "stage")
+    if stage not in STAGES:
+        raise ValueError("stage must be one of new, qualified, won, lost")
+    return stage
+
 def normalize_tags(value):
     if not isinstance(value, list):
         raise ValueError("tags must be a list")
@@ -119,6 +128,53 @@ class ContactFlow(JsonStore):
             raise ValueError("unknown contact")
         return list(data.get("tags", {}).get(contact_id, []))
 
+    def add_opportunity(self, opportunity_id, contact_id, title):
+        opportunity_id = text(opportunity_id, "opportunity_id")
+        contact_id, title = text(contact_id, "contact_id"), text(title, "title")
+        data = self._read()
+        if contact_id not in data.get("contacts", {}):
+            raise ValueError("unknown contact")
+        opportunities = data.setdefault("opportunities", {})
+        if opportunity_id in opportunities:
+            raise ValueError("opportunity id already exists")
+        opportunity = {"opportunity_id": opportunity_id, "contact_id": contact_id, "title": title, "stage": "new"}
+        opportunities[opportunity_id] = opportunity
+        self._write(data)
+        return opportunity
+
+    def set_stage(self, opportunity_id, stage):
+        opportunity_id, stage = text(opportunity_id, "opportunity_id"), normalize_stage(stage)
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        if opportunity_id not in opportunities:
+            raise ValueError("unknown opportunity")
+        opportunity = opportunities[opportunity_id]
+        if stage == opportunity["stage"]:
+            return opportunity
+        if stage not in STAGE_TRANSITIONS.get(opportunity["stage"], set()):
+            raise ValueError("invalid stage transition")
+        opportunity["stage"] = stage
+        self._write(data)
+        return opportunity
+
+    def find_opportunities(self, contact_id=None, stage=None):
+        if contact_id is not None:
+            contact_id = text(contact_id, "contact_id")
+        if stage is not None:
+            stage = normalize_stage(stage)
+        data = self._read()
+        if contact_id is not None and contact_id not in data.get("contacts", {}):
+            raise ValueError("unknown contact")
+
+        def matches(opportunity):
+            if contact_id is not None and opportunity["contact_id"] != contact_id:
+                return False
+            if stage is not None and opportunity["stage"] != stage:
+                return False
+            return True
+
+        return sorted((o for o in data.get("opportunities", {}).values() if matches(o)), key=lambda o: o["opportunity_id"])
+
     def merge_contacts(self, source_id, target_id):
         source_id, target_id = text(source_id, "source_id"), text(target_id, "target_id")
         if source_id == target_id:
@@ -132,6 +188,9 @@ class ContactFlow(JsonStore):
             if entry["contact_id"] == source_id:
                 entry["contact_id"] = target_id
                 moved += 1
+        for opportunity in data.get("opportunities", {}).values():
+            if opportunity["contact_id"] == source_id:
+                opportunity["contact_id"] = target_id
         tag_store = data.setdefault("tags", {})
         merged_tags = sorted(set(tag_store.get(target_id, [])) | set(tag_store.pop(source_id, [])))
         if merged_tags:
