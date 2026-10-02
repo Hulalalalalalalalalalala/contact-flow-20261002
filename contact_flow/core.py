@@ -435,6 +435,76 @@ class ContactFlow(JsonStore):
             self._write(data)
         return dict(opportunity)
 
+    def set_stages(self, updates):
+        # The whole batch validates against the pre-call stages and histories, so
+        # one rejected update never leaves a deal on a half-applied stage.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        allowed_keys = {"opportunity_id", "stage", "on"}
+        entries = []
+        seen = set()
+        for item in updates:
+            if (not isinstance(item, dict) or "opportunity_id" not in item or "stage" not in item
+                    or not set(item) <= allowed_keys):
+                raise ValueError(
+                    "each update must be an object with opportunity_id, stage and optional on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            stage = text(item["stage"], "stage")
+            if stage not in STAGES:
+                raise ValueError("invalid stage")
+            # An omitted or None date is stored as null; a provided date must be a
+            # trimmed real YYYY-MM-DD string (past, future and leap days allowed).
+            on = item.get("on")
+            on = None if on is None else calendar_day(on, "on")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even an
+            # identical item) rejects the whole batch.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in updates")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, stage, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        planned = []
+        for opportunity_id, stage, on in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            # Every transition is judged against the stage before the call; ids are
+            # unique within the batch, so updates never chain off each other.
+            current = opportunity["stage"]
+            if stage != current and stage not in STAGE_TRANSITIONS.get(current, ()):
+                raise ValueError("invalid stage transition")
+            # The date is checked even on a same-stage no-op: it must not precede
+            # the latest non-null date already recorded for this deal. Null records
+            # never move that lower bound, and equal days are allowed.
+            history = data.get("stage_history", {}).get(opportunity_id, [])
+            if on is not None:
+                dated = [entry["on"] for entry in history if entry["on"] is not None]
+                if dated and on < dated[-1]:
+                    raise ValueError("on must not be earlier than the latest recorded stage date")
+            updated = dict(opportunity)
+            updated["stage"] = stage
+            planned.append((opportunity, updated, current, stage, on))
+        # Results are the complete opportunities (amount kept, never back-filled)
+        # in input order; an all-no-op batch reports them without rewriting the file.
+        results = [updated for _, updated, _, _, _ in planned]
+        if all(stage == current for _, _, current, stage, _ in planned):
+            return results
+        # Every genuine change pairs its stage edit with one history append; the
+        # whole batch commits in a single write.
+        history_store = data.setdefault("stage_history", {})
+        for opportunity, _, current, stage, on in planned:
+            if stage == current:
+                continue
+            opportunity["stage"] = stage
+            history_store.setdefault(opportunity["opportunity_id"], []).append(
+                {"from_stage": current, "to_stage": stage, "on": on})
+        self._write(data)
+        return results
+
     def stage_history(self, opportunity_id):
         opportunity_id = text(opportunity_id, "opportunity_id")
         data = self._read()
