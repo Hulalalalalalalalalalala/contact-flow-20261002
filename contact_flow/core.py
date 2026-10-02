@@ -2,7 +2,7 @@ import csv
 import io
 import unicodedata
 from datetime import date
-from .storage import JsonStore, text, calendar_day
+from .storage import JsonStore, text, calendar_day, positive
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
@@ -568,3 +568,54 @@ class ContactFlow(JsonStore):
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
         return sorted((r for r in data.get("followups", []) if r["contact_id"] == contact_id), key=lambda r: r["on"])
+
+    def inactive_contacts(self, as_of, inactive_days, organization=None, tags=None, tag_mode="all"):
+        as_of = calendar_day(as_of, "as_of")
+        inactive_days = positive(inactive_days, "inactive_days")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+        cutoff = date.fromisoformat(as_of)
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        never, idle = [], []
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            # Latest on/on-or-before date wins; records saved the same day keep
+            # the last one in save order, so iterate in storage order with >=.
+            last = None
+            for entry in data.get("followups", []):
+                if entry["contact_id"] == contact["contact_id"] and entry["on"] <= as_of and (
+                        last is None or entry["on"] >= last["on"]):
+                    last = entry
+            if last is None:
+                # Never followed up, or only future records relative to as_of.
+                never.append(contact)
+            else:
+                days = (cutoff - date.fromisoformat(last["on"])).days
+                if days >= inactive_days:
+                    idle.append((days, contact, last))
+        never.sort(key=lambda contact: contact["contact_id"])
+        idle.sort(key=lambda item: (-item[0], item[1]["contact_id"]))
+        results = [{"contact": contact, "last_followup": None, "idle_days": None}
+                   for contact in never]
+        for days, contact, last in idle:
+            results.append({"contact": contact, "last_followup": last, "idle_days": days})
+        return results
