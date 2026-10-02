@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+from datetime import date
 from pathlib import Path
 import subprocess
 import sys
@@ -1385,6 +1386,231 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         json.loads(failed.stderr)
         self.assertEqual(self.app.path.read_bytes(), before)
+
+    def seed_inactive(self):
+        # A: last on/before 2026-10-05 is the last saved entry on 2026-10-02 (idle 3);
+        # B: last 2026-09-01 (idle 34); C: recent 2026-10-04 (idle 1);
+        # D: only a future record; E: never followed up; 陈: leap-day 2024-02-29.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.add_contact("E", "Eve", "e@example.test", "Books")
+        self.app.add_contact("陈", "Chen", "chen@example.test", "Books")
+        self.app.set_tags("A", ["VIP", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.follow_up("A", "2026-09-01", "old")
+        self.app.follow_up("A", "2026-10-02", "earlier save")
+        self.app.follow_up("A", "2026-10-02", "later save")
+        self.app.follow_up("A", "2099-01-01", "future")
+        self.app.follow_up("B", "2026-09-01", "b note")
+        self.app.follow_up("C", "2026-10-04", "recent")
+        self.app.follow_up("D", "2099-01-01", "future only")
+        self.app.follow_up("陈", "2024-02-29", "leap")
+        # Opportunities and reminders never affect inclusion.
+        self.app.add_opportunity("O1", "E", "Deal")
+        self.app.set_reminder("E", "2026-10-01", "nudge")
+
+    def test_inactive_contacts_content_threshold_and_ordering(self):
+        self.seed_inactive()
+        result = self.app.inactive_contacts("2026-10-05", 3)
+        # No qualifying records first (D, E by id), then idle descending, id ascending.
+        self.assertEqual([(r["contact"]["contact_id"], r["idle_days"]) for r in result],
+                         [("D", None), ("E", None), ("陈", (date(2026, 10, 5) - date(2024, 2, 29)).days),
+                          ("B", 34), ("A", 3)])
+        for row in result:
+            self.assertEqual(set(row), {"contact", "last_followup", "idle_days"})
+        # Null rows carry the current contact and no record.
+        self.assertEqual(result[0]["contact"],
+                         {"contact_id": "D", "name": "Dan", "email": "d@example.test", "organization": "Books"})
+        self.assertIsNone(result[0]["last_followup"])
+        self.assertIsNone(result[0]["idle_days"])
+        # Latest same-day entry is the last one in save order; future records are ignored.
+        a_row = next(r for r in result if r["contact"]["contact_id"] == "A")
+        self.assertEqual(a_row["last_followup"],
+                         {"contact_id": "A", "on": "2026-10-02", "note": "later save"})
+        b_row = next(r for r in result if r["contact"]["contact_id"] == "B")
+        self.assertEqual(b_row["last_followup"],
+                         {"contact_id": "B", "on": "2026-09-01", "note": "b note"})
+        # The threshold is inclusive: exactly 3 days still matches; 4 excludes A.
+        self.assertIn("A", [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 3)])
+        self.assertNotIn("A", [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 4)])
+        # At an earlier cutoff the never/only-future rows still lead; C (idle 0) is excluded.
+        earlier = [r["contact"]["contact_id"]
+                   for r in ContactFlow(self.root).inactive_contacts("2026-10-04", 1)]
+        self.assertEqual(earlier[0:2], ["D", "E"])
+        self.assertNotIn("C", earlier)
+
+    def test_inactive_contacts_filters_organization_tags_and_intersection(self):
+        self.seed_inactive()
+        self.assertEqual(
+            [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 3, organization="books")],
+            ["D", "E", "陈", "B", "A"])
+        self.assertEqual(
+            [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 3, organization=" music ")],
+            [])
+        self.assertEqual(
+            [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 1, tags=["vip"])],
+            ["B", "A"])
+        self.assertEqual(
+            [r["contact"]["contact_id"] for r in self.app.inactive_contacts("2026-10-05", 1, tags=["vip", "华东"])],
+            ["A"])
+        self.assertEqual(
+            [r["contact"]["contact_id"]
+             for r in self.app.inactive_contacts("2026-10-05", 1, tags=["vip", "missing"], tag_mode="any")],
+            ["B", "A"])
+        # Organization and tag conditions intersect.
+        self.assertEqual(
+            self.app.inactive_contacts("2026-10-05", 1, organization="Music", tags=["vip"]), [])
+        self.assertEqual(
+            [r["contact"]["contact_id"]
+             for r in self.app.inactive_contacts("2026-10-05", 1, organization="Music", tags=[])],
+            ["C"])
+
+    def test_inactive_contacts_empty_legacy_and_readonly(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.inactive_contacts("2026-10-05", 3), [])
+        self.assertFalse(fresh_root.exists())
+        # Legacy document without followups or tags: everyone counts as never followed up.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"},
+                          "M": {"contact_id": "M", "name": "Mai", "email": "m@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        result = ContactFlow(legacy_root).inactive_contacts("2026-10-05", 1)
+        self.assertEqual([(r["contact"]["contact_id"], r["last_followup"], r["idle_days"]) for r in result],
+                         [("L", None, None), ("M", None, None)])
+        # Successful queries never rewrite the file.
+        self.seed_inactive()
+        before = self.app.path.read_bytes()
+        self.app.inactive_contacts("2026-10-05", 1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_inactive_contacts_validates_arguments_even_when_empty(self):
+        for kwargs in [
+            {"as_of": None, "inactive_days": 1},
+            {"as_of": 5, "inactive_days": 1},
+            {"as_of": "", "inactive_days": 1},
+            {"as_of": "   ", "inactive_days": 1},
+            {"as_of": "2026-02-30", "inactive_days": 1},
+            {"as_of": "2026-13-01", "inactive_days": 1},
+            {"as_of": "20261005", "inactive_days": 1},
+            {"as_of": "2026-10-05", "inactive_days": None},
+            {"as_of": "2026-10-05", "inactive_days": 0},
+            {"as_of": "2026-10-05", "inactive_days": -3},
+            {"as_of": "2026-10-05", "inactive_days": True},
+            {"as_of": "2026-10-05", "inactive_days": False},
+            {"as_of": "2026-10-05", "inactive_days": 1.0},
+            {"as_of": "2026-10-05", "inactive_days": "3"},
+            {"as_of": "2026-10-05", "inactive_days": 1, "organization": 5},
+            {"as_of": "2026-10-05", "inactive_days": 1, "organization": ["Books"]},
+            {"as_of": "2026-10-05", "inactive_days": 1, "tags": "vip"},
+            {"as_of": "2026-10-05", "inactive_days": 1, "tags": ["ok", 1]},
+            {"as_of": "2026-10-05", "inactive_days": 1, "tags": ["  "]},
+            {"as_of": "2026-10-05", "inactive_days": 1, "tag_mode": "ALL"},
+            {"as_of": "2026-10-05", "inactive_days": 1, "tag_mode": "weird"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.inactive_contacts(**kwargs)
+        # The same validation runs against a missing data file and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.inactive_contacts("2026-02-30", 1)
+        with self.assertRaises(ValueError):
+            fresh.inactive_contacts("2026-10-05", True)
+        with self.assertRaises(ValueError):
+            fresh.inactive_contacts("2026-10-05", 1, tag_mode="weird")
+        self.assertFalse(fresh_root.exists())
+        # Missing required arguments are a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            self.app.inactive_contacts("2026-10-05")
+        with self.assertRaises(TypeError):
+            self.app.inactive_contacts(inactive_days=3)
+        # A legal leap day parses.
+        self.assertEqual(fresh.inactive_contacts("2024-02-29", 1), [])
+
+    def test_inactive_contacts_recomputes_after_update_import_and_merge(self):
+        self.seed_inactive()
+        # Profile update: organization filtering and the returned contact follow current data.
+        self.app.update_contact("B", {"organization": "Music"})
+        music = self.app.inactive_contacts("2026-10-05", 3, organization="music")
+        self.assertEqual([r["contact"]["contact_id"] for r in music], ["B"])
+        self.assertEqual(music[0]["contact"]["organization"], "Music")
+        self.assertEqual(
+            [r["contact"]["contact_id"]
+             for r in self.app.inactive_contacts("2026-10-05", 3, organization="books")],
+            ["D", "E", "陈", "A"])
+        # Imported followups count on the next query; reopening reads the current file fresh.
+        csv_path = self.root / "followups.csv"
+        csv_path.write_text(
+            "contact_id,on,note\nE,2026-10-04,imported recent\n", encoding="utf-8")
+        self.app.import_followups(str(csv_path))
+        reopened = ContactFlow(self.root)
+        rows = {r["contact"]["contact_id"]: r for r in reopened.inactive_contacts("2026-10-05", 1)}
+        # E now has a record with idle 1 (threshold inclusive), so it leaves the null group.
+        self.assertEqual(rows["E"]["idle_days"], 1)
+        self.assertEqual(rows["E"]["last_followup"]["note"], "imported recent")
+        self.assertNotIn("E", [r["contact"]["contact_id"]
+                               for r in reopened.inactive_contacts("2026-10-05", 2)])
+        # Merge: B's followups move under A and B no longer appears; tags union.
+        self.app.merge_contacts("B", "A")
+        merged = ContactFlow(self.root).inactive_contacts("2026-10-05", 1, tags=["vip"])
+        self.assertEqual([r["contact"]["contact_id"] for r in merged], ["A"])
+        a = merged[0]
+        self.assertEqual(a["last_followup"]["on"], "2026-10-02")
+        self.assertNotIn("B", [r["contact"]["contact_id"]
+                               for r in ContactFlow(self.root).inactive_contacts("2026-10-05", 1)])
+
+    def test_cli_inactive_contacts_success_and_failure(self):
+        self.seed_inactive()
+        payload = self.root / "inactive.json"
+        payload.write_text(json.dumps({"as_of": " 2026-10-05 ", "inactive_days": 3}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([r["contact"]["contact_id"] for r in json.loads(ok.stdout)],
+                         ["D", "E", "陈", "B", "A"])
+        # Array input behaves like repeated calls.
+        payload.write_text(json.dumps([
+            {"as_of": "2026-10-05", "inactive_days": 3, "tags": ["vip"]},
+            {"as_of": "2026-10-05", "inactive_days": 100, "organization": "Music"},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["contact"]["contact_id"] for r in values[0]], ["B", "A"])
+        self.assertEqual(values[1], [])
+        # Invalid day count: exit 2, empty stdout, JSON error on stderr, no data change.
+        before = self.app.path.read_bytes()
+        payload.write_text(json.dumps({"as_of": "2026-10-05", "inactive_days": True}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing required argument is also exit 2 via the standard error envelope.
+        payload.write_text(json.dumps({"as_of": "2026-10-05"}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # A query over a nonexistent root returns [] and creates nothing.
+        empty = self.root / "empty"
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(quiet.returncode, 2)  # missing inactive_days
+        payload.write_text(json.dumps({"as_of": "2026-10-05", "inactive_days": 3}), encoding="utf-8")
+        quiet = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(empty),
+                                "inactive-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty.exists())
 
 if __name__ == "__main__":
     unittest.main()

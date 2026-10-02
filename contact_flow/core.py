@@ -2,7 +2,7 @@ import csv
 import io
 import unicodedata
 from datetime import date
-from .storage import JsonStore, text, calendar_day
+from .storage import JsonStore, text, calendar_day, positive
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
@@ -568,3 +568,57 @@ class ContactFlow(JsonStore):
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
         return sorted((r for r in data.get("followups", []) if r["contact_id"] == contact_id), key=lambda r: r["on"])
+
+    def inactive_contacts(self, as_of, inactive_days, organization=None, tags=None, tag_mode="all"):
+        as_of = calendar_day(as_of, "as_of")
+        # type(...) is int rejects bools, which are ints in Python but never a day count.
+        inactive_days = positive(inactive_days, "inactive_days")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        cutoff = date.fromisoformat(as_of)
+        # Only records on/before as_of count; scanning in save order and replacing
+        # on an equal or later day leaves the last saved same-day entry as the latest.
+        latest = {}
+        for entry in data.get("followups", []):
+            if entry["on"] <= as_of:
+                current = latest.get(entry["contact_id"])
+                if current is None or entry["on"] >= current[0]:
+                    latest[entry["contact_id"]] = (entry["on"], dict(entry))
+
+        never, idle_rows = [], []
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            current = latest.get(contact["contact_id"])
+            if current is None:
+                # Never followed up, or only future records: no record qualifies by as_of.
+                never.append({"contact": dict(contact), "last_followup": None, "idle_days": None})
+            else:
+                on, entry = current
+                idle_days = (cutoff - date.fromisoformat(on)).days
+                if idle_days >= inactive_days:
+                    idle_rows.append({"contact": dict(contact), "last_followup": entry,
+                                      "idle_days": idle_days})
+
+        never.sort(key=lambda row: row["contact"]["contact_id"])
+        idle_rows.sort(key=lambda row: (-row["idle_days"], row["contact"]["contact_id"]))
+        return never + idle_rows
