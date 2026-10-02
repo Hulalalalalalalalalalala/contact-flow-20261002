@@ -435,6 +435,82 @@ class ContactFlow(JsonStore):
             self._write(data)
         return dict(opportunity)
 
+    def set_stages(self, updates):
+        # The whole batch validates against each deal's pre-call stage before any
+        # stage or history changes, so a rejected item never leaves half the batch
+        # applied; stage changes and history appends commit in a single write.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        allowed_keys = {"opportunity_id", "stage", "on"}
+        entries = []
+        seen = set()
+        for item in updates:
+            if (not isinstance(item, dict)
+                    or not {"opportunity_id", "stage"} <= set(item)
+                    or not set(item) <= allowed_keys):
+                raise ValueError(
+                    "each update must be an object with opportunity_id, stage and an optional on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            stage = text(item["stage"], "stage")
+            if stage not in STAGES:
+                raise ValueError("invalid stage")
+            # An omitted or None date is stored as null; a provided date must be a
+            # trimmed real YYYY-MM-DD string (past, future and leap days allowed).
+            on = item.get("on")
+            on = None if on is None else calendar_day(on, "on")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even an
+            # identical item) rejects the whole batch.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in updates")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, stage, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        history_store = data.get("stage_history", {})
+        planned = []
+        changed = False
+        for opportunity_id, stage, on in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            current = opportunity["stage"]
+            if stage != current and stage not in STAGE_TRANSITIONS.get(current, ()):
+                raise ValueError("invalid stage transition")
+            # Every provided date is validated, even on a same-stage no-op: it must
+            # not precede the latest non-null date already recorded for this deal.
+            # Null records never move that lower bound. Each deal appears once, so
+            # the pre-call history is the only history its date is checked against.
+            if on is not None:
+                dated = [entry["on"] for entry in history_store.get(opportunity_id, [])
+                         if entry["on"] is not None]
+                if dated and on < dated[-1]:
+                    raise ValueError("on must not be earlier than the latest recorded stage date")
+            if stage != current:
+                changed = True
+            planned.append((opportunity_id, opportunity, current, stage, on))
+        # Results are the complete opportunities in input order, unchanged on a no-op batch.
+        results = []
+        if not changed:
+            # Every item repeated its current stage: report the originals
+            # without rewriting the file.
+            for _, opportunity, _, _, _ in planned:
+                results.append(dict(opportunity))
+            return results
+        for opportunity_id, opportunity, current, stage, on in planned:
+            if stage != current:
+                opportunity["stage"] = stage
+                # The history lives outside the opportunity object itself;
+                # deals without a history collection start from an empty one.
+                history_store.setdefault(opportunity_id, []).append(
+                    {"from_stage": current, "to_stage": stage, "on": on})
+            results.append(dict(opportunity))
+        data.setdefault("stage_history", history_store)
+        self._write(data)
+        return results
+
     def stage_history(self, opportunity_id):
         opportunity_id = text(opportunity_id, "opportunity_id")
         data = self._read()
