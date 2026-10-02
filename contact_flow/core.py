@@ -6,6 +6,7 @@ from .storage import JsonStore, text, calendar_day, positive
 
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
+OPPORTUNITY_FIELDS = ("opportunity_id", "contact_id", "title", "stage")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
@@ -221,6 +222,64 @@ class ContactFlow(JsonStore):
                 imported.append(dict(entry))
             self._write(data)
         return imported
+
+    def import_opportunities(self, csv_path):
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if (len(header) != len(OPPORTUNITY_FIELDS) or set(header) != set(OPPORTUNITY_FIELDS)
+                or len(set(header)) != len(header)):
+            raise ValueError(
+                "CSV header must contain exactly opportunity_id,contact_id,title,stage in any order")
+
+        records = []
+        try:
+            for row in rows:
+                if not row:
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                opportunity_id = text(values["opportunity_id"], "opportunity_id")
+                contact_id = text(values["contact_id"], "contact_id")
+                title = text(values["title"], "title")
+                stage = text(values["stage"], "stage")
+                # Historical stages import verbatim; transition rules apply only to set_stage.
+                if stage not in STAGES:
+                    raise ValueError("invalid stage")
+                records.append({"opportunity_id": opportunity_id, "contact_id": contact_id,
+                                "title": title, "stage": stage})
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        data = self._read()
+        contacts = data.get("contacts", {})
+        opportunities = data.get("opportunities", {})
+        # The whole batch validates before anything is stored, so one bad row rejects all.
+        seen_ids = set()
+        for entry in records:
+            if entry["contact_id"] not in contacts:
+                raise ValueError("unknown contact")
+            if entry["opportunity_id"] in opportunities or entry["opportunity_id"] in seen_ids:
+                raise ValueError("opportunity id already exists")
+            seen_ids.add(entry["opportunity_id"])
+        if records:
+            store = data.setdefault("opportunities", {})
+            for entry in records:
+                store[entry["opportunity_id"]] = dict(entry)
+            self._write(data)
+        return records
 
     def follow_up(self, contact_id, on, note):
         note = text(note, "note")
