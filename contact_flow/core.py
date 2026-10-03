@@ -758,6 +758,77 @@ class ContactFlow(JsonStore):
         # deals without any recorded change read as an empty history.
         return [dict(entry) for entry in data.get("stage_history", {}).get(opportunity_id, [])]
 
+    def correct_stage_dates(self, corrections):
+        # Back-fill or fix the business dates of already saved stage-history
+        # records. The whole batch validates and commits together; a rejected
+        # batch never touches the file.
+        if not isinstance(corrections, list):
+            raise ValueError("corrections must be a list")
+        if not corrections:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        correction_keys = {"opportunity_id", "index", "on"}
+        entries = []
+        seen = set()
+        for item in corrections:
+            if not isinstance(item, dict) or set(item) != correction_keys:
+                raise ValueError(
+                    "each correction must be an object with exactly opportunity_id, index and on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            # type(...) is int rejects bools, which are ints in Python but never an index.
+            index = item["index"]
+            if type(index) is not int or index < 0:
+                raise ValueError("index must be a nonnegative integer")
+            # Dates reuse the real-calendar rule (trimmed YYYY-MM-DD, past,
+            # future and leap days allowed, null rejected, no system clock).
+            on = calendar_day(item["on"], "on")
+            # Normalized ids are case-sensitive; the same position of one deal
+            # may appear only once, even when both items are identical.
+            if (opportunity_id, index) in seen:
+                raise ValueError("duplicate correction for the same opportunity and index")
+            seen.add((opportunity_id, index))
+            entries.append((opportunity_id, index, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        history_store = data.get("stage_history", {})
+        involved = {}
+        for opportunity_id, index, _ in entries:
+            if opportunity_id not in opportunities:
+                raise ValueError("unknown opportunity")
+            # Deals without a history collection (including old data) read as empty.
+            history = history_store.get(opportunity_id, [])
+            if index >= len(history):
+                raise ValueError("index out of range for stage history")
+            involved[opportunity_id] = history
+        # Apply on copies so final monotonicity is judged on the post-correction
+        # history while storage stays untouched until everything validates.
+        corrected = {opportunity_id: [dict(entry) for entry in history]
+                     for opportunity_id, history in involved.items()}
+        for opportunity_id, index, on in entries:
+            corrected[opportunity_id][index]["on"] = on
+        for history in corrected.values():
+            # Non-null dates in save order must not go backwards; same day is
+            # allowed and untouched null records never participate.
+            previous = None
+            for entry in history:
+                if entry["on"] is not None:
+                    if previous is not None and entry["on"] < previous:
+                        raise ValueError("stage dates must not go backwards")
+                    previous = entry["on"]
+        # Results are the corrected records in input order, shaped like stage-history.
+        results = [dict(corrected[opportunity_id][index])
+                   for opportunity_id, index, _ in entries]
+        if all(corrected[opportunity_id] == involved[opportunity_id]
+               for opportunity_id in involved):
+            # Every normalized date already matched the stored one: report the
+            # records without rewriting the file.
+            return results
+        store = data.setdefault("stage_history", {})
+        for opportunity_id, history in corrected.items():
+            store[opportunity_id] = history
+        self._write(data)
+        return results
+
     def set_opportunity_amount(self, opportunity_id, amount):
         opportunity_id = text(opportunity_id, "opportunity_id")
         amount = amount_string(amount, "amount")
