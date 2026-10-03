@@ -1962,6 +1962,285 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(by_id["B"]["organization"], "Music")
         self.assertEqual(by_id["C"]["organization"], "Games")
 
+    def test_rename_contacts_returns_full_contacts_in_input_order(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        result = self.app.rename_contacts([
+            {"old_id": " A ", "new_id": " A-2 "},
+            {"old_id": "B", "new_id": "B"},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A-2", "name": "Alice", "email": "a@example.test", "organization": "Books"},
+            {"contact_id": "B", "name": "Bob", "email": "b@example.test", "organization": "Music"},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual([c["contact_id"] for c in reopened.find()], ["A-2", "B"])
+        self.assertEqual(reopened.find()[0], result[0])
+
+    def test_rename_contacts_swaps_and_cycles_ids(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        swapped = self.app.rename_contacts([
+            {"old_id": "A", "new_id": "B"},
+            {"old_id": "B", "new_id": "A"},
+        ])
+        self.assertEqual([c["contact_id"] for c in swapped], ["B", "A"])
+        by_id = {c["contact_id"]: c for c in ContactFlow(self.root).find()}
+        self.assertEqual(by_id["A"]["name"], "Bob")
+        self.assertEqual(by_id["B"]["name"], "Alice")
+        self.assertEqual(by_id["C"]["name"], "Cara")
+        # Cycle A->B, B->C, C->A against the post-swap identities; the input
+        # order of the items does not change the final state.
+        self.app.rename_contacts([
+            {"old_id": "C", "new_id": "A"},
+            {"old_id": "A", "new_id": "B"},
+            {"old_id": "B", "new_id": "C"},
+        ])
+        by_id = {c["contact_id"]: c for c in ContactFlow(self.root).find()}
+        self.assertEqual(by_id["A"]["name"], "Cara")
+        self.assertEqual(by_id["B"]["name"], "Bob")
+        self.assertEqual(by_id["C"]["name"], "Alice")
+
+    def test_rename_contacts_ids_are_case_sensitive(self):
+        self.app.add_contact("a", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.rename_contacts([{"old_id": "A", "new_id": "B"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        result = self.app.rename_contacts([{"old_id": " a ", "new_id": "A"}])
+        self.assertEqual(result[0]["contact_id"], "A")
+        self.assertEqual(ContactFlow(self.root).find()[0]["contact_id"], "A")
+
+    def test_rename_contacts_moves_related_records_and_preserves_reports(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.follow_up("A", "2026-10-01", "first")
+        self.app.follow_up("A", "2026-10-01", "first")  # duplicate kept verbatim
+        self.app.follow_up("B", "2026-10-02", "other")
+        self.app.add_opportunity("O1", "A", "Deal one")
+        self.app.add_opportunity("O2", "A", "Deal two")
+        self.app.set_stage("O2", "qualified", on="2026-09-01")
+        self.app.set_stage("O2", "won", on="2026-09-15")
+        self.app.set_opportunity_amount("O2", "100.5")
+        self.app.set_reminder("A", "2026-11-05", "call back", repeat_monthly=True)
+        before_funnel = self.app.funnel_report()
+        before_amounts = self.app.opportunity_amount_report()
+        self.app.rename_contacts([{"old_id": "A", "new_id": "A-9"}])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A-9"), ["vip", "华东"])
+        with self.assertRaises(ValueError):
+            reopened.get_tags("A")
+        # Followup dates, notes, duplicates and save order are preserved.
+        timeline = reopened.timeline("A-9")
+        self.assertEqual([(r["on"], r["note"]) for r in timeline],
+                         [("2026-10-01", "first"), ("2026-10-01", "first")])
+        opportunities = {o["opportunity_id"]: o
+                         for o in reopened.find_opportunities(contact_id="A-9")}
+        self.assertEqual(opportunities["O1"],
+            {"opportunity_id": "O1", "contact_id": "A-9", "title": "Deal one", "stage": "new"})
+        # An unset amount is not back-filled by the rename.
+        self.assertNotIn("amount", opportunities["O1"])
+        self.assertEqual(opportunities["O2"]["stage"], "won")
+        self.assertEqual(opportunities["O2"]["amount"], "100.50")
+        self.assertEqual(reopened.stage_history("O2"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-15"},
+        ])
+        # Reminder due date, note and repetition fields survive the rename.
+        self.assertEqual(reopened.due_reminders("2099-01-01"), [
+            {"contact_id": "A-9", "due_on": "2026-11-05", "note": "call back",
+             "repeat_monthly": True, "anchor_day": 5}])
+        # Reports keep their filters, ordering, CSV format and totals.
+        self.assertEqual(reopened.funnel_report(), before_funnel)
+        self.assertEqual(reopened.opportunity_amount_report(), before_amounts)
+        report = reopened.followup_report("2026-01-01", "2026-12-31")
+        self.assertEqual([r["contact_id"] for r in report["records"]], ["A-9", "A-9", "B"])
+        self.assertEqual(report["records"][0]["name"], "Alice")
+
+    def test_rename_contacts_frees_old_ids_for_registration(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.follow_up("A", "2026-10-01", "note")
+        self.app.rename_contacts([{"old_id": "A", "new_id": "A-2"}])
+        # The old id is no longer reused, so it reads as an unknown contact...
+        with self.assertRaises(ValueError):
+            self.app.timeline("A")
+        with self.assertRaises(ValueError):
+            self.app.follow_up("A", "2026-10-02", "ghost")
+        # ...and can be registered again.
+        self.app.add_contact("A", "Annie", "annie@example.test", "Games")
+        self.assertEqual(self.app.get_tags("A"), [])
+        self.assertEqual(self.app.timeline("A"), [])
+        self.assertEqual([r["contact_id"] for r in self.app.timeline("A-2")], ["A-2"])
+
+    def test_rename_contacts_requires_list_and_empty_list_writes_nothing(self):
+        for bad in [None, {}, "A", 5, True, {"old_id": "A", "new_id": "B"}]:
+            with self.assertRaises(ValueError):
+                self.app.rename_contacts(bad)
+        with self.assertRaises(TypeError):
+            self.app.rename_contacts()
+        # An empty batch on a fresh root creates neither directory nor file.
+        fresh = ContactFlow(self.root / "fresh")
+        self.assertEqual(fresh.rename_contacts([]), [])
+        self.assertFalse((self.root / "fresh").exists())
+        self.assertEqual(self.app.rename_contacts([]), [])
+        self.assertFalse(self.app.path.exists())
+
+    def test_rename_contacts_validates_items_without_partial_changes(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            [None], [["old_id", "new_id"]], ["rename"], [5], [True],
+            [{}],
+            [{"old_id": "A"}],
+            [{"new_id": "C"}],
+            [{"old_id": "A", "new_id": "C", "extra": 1}],
+            [{"old_id": "", "new_id": "C"}],
+            [{"old_id": "   ", "new_id": "C"}],
+            [{"old_id": None, "new_id": "C"}],
+            [{"old_id": 5, "new_id": "C"}],
+            [{"old_id": "A", "new_id": ""}],
+            [{"old_id": "A", "new_id": "   "}],
+            [{"old_id": "A", "new_id": None}],
+            [{"old_id": "A", "new_id": 5}],
+            [{"old_id": "ZZZ", "new_id": "C"}],
+            # Normalized old ids repeat within the batch, even after trimming.
+            [{"old_id": "A", "new_id": "C"}, {"old_id": " A ", "new_id": "D"}],
+            # Normalized new ids repeat within the batch.
+            [{"old_id": "A", "new_id": "C"}, {"old_id": "B", "new_id": " C "}],
+            # The new id is taken by a contact outside the batch.
+            [{"old_id": "A", "new_id": "B"}],
+            [{"old_id": "A", "new_id": " B "}],
+            # A later unknown contact rejects the whole batch atomically.
+            [{"old_id": "A", "new_id": "C"}, {"old_id": "ZZZ", "new_id": "D"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.rename_contacts(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Unknown contact against a missing data file creates neither directory nor file.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.rename_contacts([{"old_id": "ZZZ", "new_id": "C"}])
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_rename_contacts_identity_batch_returns_without_rewrite(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        before = self.app.path.read_bytes()
+        result = self.app.rename_contacts([
+            {"old_id": " A ", "new_id": "A"},
+            {"old_id": "B", "new_id": " B "},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"},
+            {"contact_id": "B", "name": "Bob", "email": "b@example.test", "organization": "Music"},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_rename_contacts_preserves_unrelated_data_and_legacy_shape(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("B", ["vip"])
+        self.app.follow_up("B", "2026-10-02", "b note")
+        self.app.add_opportunity("O1", "B", "B deal")
+        self.app.set_reminder("B", "2026-11-01", "b reminder")
+        self.app.rename_contacts([{"old_id": "A", "new_id": "A-2"}])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("B"), ["vip"])
+        self.assertEqual(reopened.timeline("B")[0]["note"], "b note")
+        self.assertEqual(reopened.find_opportunities(contact_id="B")[0]["contact_id"], "B")
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+            [{"contact_id": "B", "due_on": "2026-11-01", "note": "b reminder"}])
+        # Legacy document with contacts but no optional collections renames fine.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        result = legacy.rename_contacts([{"old_id": "L", "new_id": "L-2"}])
+        self.assertEqual(result, [{"contact_id": "L-2", "name": "Lee",
+                                   "email": "l@example.test", "organization": "Old"}])
+        self.assertEqual(ContactFlow(legacy_root).find()[0]["contact_id"], "L-2")
+
+    def test_rename_contacts_keeps_other_entry_points_unchanged(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        # update_contact still refuses to change contact_id.
+        with self.assertRaises(ValueError):
+            self.app.update_contact("A", {"contact_id": "B"})
+        with self.assertRaises(ValueError):
+            self.app.update_contacts([{"contact_id": "A", "changes": {"contact_id": "B"}}])
+        # Registration dedup applies to the new id after a rename.
+        self.app.rename_contacts([{"old_id": "A", "new_id": "A-2"}])
+        with self.assertRaises(ValueError):
+            self.app.add_contact("A-2", "Other", "other@example.test", "Toys")
+        with self.assertRaises(ValueError):
+            self.app.add_contact("B", "Other", "A@EXAMPLE.test", "Toys")
+
+    def test_cli_rename_contacts_object_empty_array_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        payload = self.root / "renames.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "rename-contacts", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"renames": [{"old_id": " A ", "new_id": " A-2 "},
+                              {"old_id": "B", "new_id": "A"}]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A-2", "name": "Alice", "email": "a@example.test", "organization": "Books"},
+            {"contact_id": "A", "name": "Bob", "email": "b@example.test", "organization": "Music"},
+        ])
+        self.assertEqual(ContactFlow(self.root).get_tags("A-2"), ["vip"])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"renames": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"renames": [{"old_id": "A-2", "new_id": "A"}]})  # A is now Bob's id
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # renames must be a list.
+        not_list = cli({"renames": {"old_id": "A-2", "new_id": "C"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+
+    def test_cli_rename_contacts_outer_array_keeps_earlier_batches(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        payload = self.root / "batches.json"
+        # An outer array runs whole batches independently; a later failed batch keeps
+        # the earlier successful batch (unlike the atomicity inside one renames list).
+        payload.write_text(json.dumps([
+            {"renames": [{"old_id": "A", "new_id": "A-2"}]},
+            {"renames": [{"old_id": "ZZZ", "new_id": "C"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "rename-contacts", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        by_id = {c["contact_id"]: c for c in ContactFlow(self.root).find()}
+        self.assertEqual(sorted(by_id), ["A-2", "B"])
+        self.assertEqual(by_id["A-2"]["name"], "Alice")
+
     def seed_followups(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "books")
