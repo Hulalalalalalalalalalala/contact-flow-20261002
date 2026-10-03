@@ -4815,5 +4815,227 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(by_id["O3"]["stage"], "qualified")
         self.assertEqual(by_id["O4"]["stage"], "lost")
 
+    def seed_forecast(self):
+        # Books group: A with a 0.01 new deal and B with a 999.00 won deal.
+        # Music: C with a 0.01 qualified deal and D with a lost deal.
+        # Toys: E with no opportunities (zero-amount organization stays).
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Music")
+        self.app.add_contact("E", "Erin", "e@example.test", "Toys")
+        self.app.set_tags("A", ["vip"])
+        self.app.add_opportunity("O1", "A", "Cent new")
+        self.app.set_opportunity_amount("O1", "0.01")
+        self.app.add_opportunity("O2", "C", "Cent qualified")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_opportunity_amount("O2", "0.01")
+        self.app.add_opportunity("O3", "B", "Won money")
+        self.app.set_stage("O3", "qualified")
+        self.app.set_stage("O3", "won")
+        self.app.set_opportunity_amount("O3", "999.00")
+        self.app.add_opportunity("O4", "D", "Lost money")
+        self.app.set_stage("O4", "lost")
+        self.app.set_opportunity_amount("O4", "999.00")
+
+    def test_forecast_report_weights_open_stages_and_keeps_zero_organizations(self):
+        self.seed_forecast()
+        report = self.app.forecast_report({"new": "50", "qualified": "50"})
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        self.assertEqual(set(report["total"]), {"new", "qualified", "amount"})
+        # Two 0.005 stage sums round independently everywhere: each group 0.01,
+        # and the total also rounds its own unrounded 0.005 sums to 0.01 each;
+        # amount comes from the unrounded sum, not from the rounded children.
+        self.assertEqual(report["total"], {"new": "0.01", "qualified": "0.01", "amount": "0.01"})
+        by_org = {row["organization"]: row for row in report["organizations"]}
+        self.assertEqual([row["organization"] for row in report["organizations"]],
+                         ["Books", "Music", "Toys"])
+        self.assertEqual(by_org["Books"],
+                         {"organization": "Books", "new": "0.01", "qualified": "0.00", "amount": "0.01"})
+        self.assertEqual(by_org["Music"],
+                         {"organization": "Music", "new": "0.00", "qualified": "0.01", "amount": "0.01"})
+        # The contact without opportunities keeps a zero row.
+        self.assertEqual(by_org["Toys"],
+                         {"organization": "Toys", "new": "0.00", "qualified": "0.00", "amount": "0.00"})
+
+    def test_forecast_report_exact_weights_endpoints_and_unset_amounts(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        # Unpriced deal: contributes 0.00.
+        self.app.add_opportunity("O0", "A", "No price")
+        # 100.00 at 33.5% -> 33.50 exactly; one decimal place and padding are accepted.
+        self.app.add_opportunity("O1", "A", "Priced")
+        self.app.set_opportunity_amount("O1", "100.00")
+        self.app.add_opportunity("O2", "B", "Qualified deal")
+        self.app.set_stage("O2", "qualified")
+        self.app.set_opportunity_amount("O2", "0.03")
+        report = self.app.forecast_report({"new": "33.5", "qualified": "50"})
+        # 0.03 * 50 / 100 = 0.015 -> half up rounds to 0.02.
+        self.assertEqual(report["total"], {"new": "33.50", "qualified": "0.02", "amount": "33.52"})
+        # Endpoint probabilities 0 and 100.
+        none = self.app.forecast_report({"new": "0", "qualified": "0"})
+        self.assertEqual(none["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        full = self.app.forecast_report({"new": "100.00", "qualified": "100"})
+        self.assertEqual(full["total"], {"new": "100.00", "qualified": "0.03", "amount": "100.03"})
+
+    def test_forecast_report_reopened_deal_counts_at_current_stage(self):
+        self.seed_forecast()
+        # Reopen B's won deal: it now contributes at qualified, and the same
+        # opportunity is never counted twice.
+        self.app.reopen_opportunities([{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"}])
+        report = self.app.forecast_report({"new": "50", "qualified": "10"})
+        # Books new: 0.005 -> 0.01; Books qualified: 99.90; total qualified 99.90 + 0.001.
+        self.assertEqual(report["total"]["new"], "0.01")
+        self.assertEqual(report["total"]["qualified"], "99.90")
+        self.assertEqual(report["total"]["amount"], "99.91")
+        by_org = {row["organization"]: row for row in report["organizations"]}
+        # The 0.01 qualified deal in Music at 10% is 0.001 and shows as 0.00
+        # there while the unrounded total keeps it.
+        self.assertEqual(by_org["Music"]["qualified"], "0.00")
+
+    def test_forecast_report_csv_matches_groups_and_escapes(self):
+        self.seed_forecast()
+        report = self.app.forecast_report({"new": "50", "qualified": "50"})
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        self.assertEqual(rows[0], ["organization", "new", "qualified", "amount"])
+        decoded = [dict(zip(rows[0], row)) for row in rows[1:]]
+        self.assertEqual([row["organization"] for row in decoded],
+                         [row["organization"] for row in report["organizations"]])
+        for decoded_row, row in zip(decoded, report["organizations"]):
+            self.assertEqual(decoded_row["new"], row["new"])
+            self.assertEqual(decoded_row["qualified"], row["qualified"])
+            self.assertEqual(decoded_row["amount"], row["amount"])
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["organizations"]) + 1)
+        # Standard CSV escaping for commas, quotes and internal newlines.
+        self.app.add_contact("X", "Xena", "x@example.test", "Shop, \"店\"\n二楼")
+        report = self.app.forecast_report({"new": "50", "qualified": "50"})
+        rows = list(csv.reader(io.StringIO(report["csv"]), strict=True))
+        org_names = [row[0] for row in rows[1:]]
+        self.assertIn("Shop, \"店\"\n二楼", org_names)
+
+    def test_forecast_report_filters_organization_and_tags(self):
+        self.seed_forecast()
+        by_org = self.app.forecast_report({"new": "50", "qualified": "50"}, organization="  MUSIC ")
+        self.assertEqual([row["organization"] for row in by_org["organizations"]], ["Music"])
+        self.assertEqual(by_org["total"], {"new": "0.00", "qualified": "0.01", "amount": "0.01"})
+        tagged = self.app.forecast_report({"new": "100", "qualified": "100"}, tags=["VIP"])
+        self.assertEqual([row["organization"] for row in tagged["organizations"]], ["Books"])
+        self.assertEqual(tagged["total"], {"new": "0.01", "qualified": "0.00", "amount": "0.01"})
+        # Organization and tag conditions intersect to nothing.
+        none = self.app.forecast_report({"new": "50", "qualified": "50"},
+                                        organization="Music", tags=["vip"])
+        self.assertEqual(none["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(none["organizations"], [])
+        self.assertEqual(none["csv"], "organization,new,qualified,amount\n")
+        any_mode = self.app.forecast_report({"new": "100", "qualified": "100"},
+                                            tags=["vip", "missing"], tag_mode="any")
+        self.assertEqual(any_mode["total"]["new"], "0.01")
+
+    def test_forecast_report_empty_and_legacy_data_without_writing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.forecast_report({"new": "0", "qualified": "100"})
+        self.assertEqual(report["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"], "organization,new,qualified,amount\n")
+        self.assertFalse(fresh_root.exists())
+        # Legacy contact without opportunities or tags.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        report = self.app.forecast_report({"new": "50", "qualified": "50"})
+        self.assertEqual(report["organizations"][0],
+                         {"organization": "Books", "new": "0.00", "qualified": "0.00", "amount": "0.00"})
+
+    def test_forecast_report_validates_probabilities_and_filters(self):
+        self.seed_forecast()
+        before = self.app.path.read_bytes()
+        # Missing required argument is a TypeError.
+        with self.assertRaises(TypeError):
+            self.app.forecast_report()
+        bad = [None, [], "x", 5,
+               {"new": "50"}, {"qualified": "50"},
+               {"new": "50", "qualified": "50", "won": "10"},
+               {"new": "50", "qualified": 50},
+               {"new": 50, "qualified": "50"},
+               {"new": "abc", "qualified": "50"},
+               {"new": "  ", "qualified": "50"},
+               {"new": "1.234", "qualified": "50"},
+               {"new": "-1", "qualified": "50"},
+               {"new": "100.01", "qualified": "50"},
+               {"new": "101", "qualified": "50"},
+               {"new": "50", "qualified": None}]
+        for value in bad:
+            with self.assertRaises(ValueError):
+                self.app.forecast_report(value)
+        for kwargs in [{"probabilities": {"new": "50", "qualified": "50"}, "organization": 5},
+                       {"probabilities": {"new": "50", "qualified": "50"}, "tags": "vip"},
+                       {"probabilities": {"new": "50", "qualified": "50"}, "tags": ["vip", 1]},
+                       {"probabilities": {"new": "50", "qualified": "50"}, "tag_mode": "ALL"}]:
+            with self.assertRaises(ValueError):
+                self.app.forecast_report(**kwargs)
+        # Probabilities validate even on an empty store, and nothing is written.
+        fresh_root = self.root / "gone"
+        with self.assertRaises(ValueError):
+            ContactFlow(fresh_root).forecast_report({"new": "101", "qualified": "0"})
+        self.assertFalse(fresh_root.exists())
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_forecast_report_recomputes_after_data_changes(self):
+        self.seed_forecast()
+        probs = {"new": "50", "qualified": "50"}
+        self.assertEqual(self.app.forecast_report(probs)["total"]["new"], "0.01")
+        # Changing the amount changes the forecast.
+        self.app.set_opportunity_amount("O1", "1.00")
+        self.assertEqual(self.app.forecast_report(probs)["total"]["new"], "0.50")
+        # Moving the stage drops it from new.
+        self.app.set_stage("O1", "qualified")
+        report = self.app.forecast_report(probs)
+        self.assertEqual(report["total"]["new"], "0.00")
+        self.assertEqual(report["total"]["qualified"], "0.51")
+        # Ownership transfer regroups the money.
+        self.app.transfer_opportunities([{"opportunity_id": "O1", "source_contact_id": "A",
+                                          "target_contact_id": "E"}])
+        report = self.app.forecast_report(probs)
+        toys = {row["organization"]: row for row in report["organizations"]}["Toys"]
+        self.assertEqual(toys["qualified"], "0.50")
+
+    def test_cli_forecast_report_success_and_failure(self):
+        self.seed_forecast()
+        payload = self.root / "forecast.json"
+        payload.write_text(json.dumps({"probabilities": {"new": "50", "qualified": "50"}}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "forecast-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["total"],
+                         {"new": "0.01", "qualified": "0.01", "amount": "0.01"})
+        # Outer array invokes the method once per object.
+        payload.write_text(json.dumps([
+            {"probabilities": {"new": "0", "qualified": "0"}},
+            {"probabilities": {"new": "100", "qualified": "100"}, "organization": "Music"},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow",
+                                "--root", str(self.root), "forecast-report", str(payload)],
+                               text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(values[1]["organizations"][0]["organization"], "Music")
+        # Invalid probability: exit 2 with a JSON error envelope.
+        payload.write_text(json.dumps({"probabilities": {"new": "101", "qualified": "50"}}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "forecast-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # Missing the required parameter is a TypeError, also reported as exit 2.
+        payload.write_text(json.dumps({"organization": "Music"}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "forecast-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+
 if __name__ == "__main__":
     unittest.main()

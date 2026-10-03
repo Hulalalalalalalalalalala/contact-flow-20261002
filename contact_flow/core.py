@@ -1521,6 +1521,101 @@ class ContactFlow(JsonStore):
 
         return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
 
+    def forecast_report(self, probabilities, organization=None, tags=None, tag_mode="all"):
+        # probabilities is required and must contain exactly new and qualified;
+        # the values reuse the decimal amount syntax and name a percentage from 0
+        # to 100 inclusive. It is used only for this query and is never stored.
+        if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
+            raise ValueError("probabilities must be an object containing exactly new and qualified")
+        rates = {}
+        for stage in ("new", "qualified"):
+            value = amount_string(probabilities[stage], stage + " probability")
+            if not (Decimal("0") <= Decimal(value) <= Decimal("100")):
+                raise ValueError(stage + " probability must be between 0 and 100")
+            rates[stage] = Decimal(value)
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        # Groups exist for every matching contact, including ones without open
+        # opportunities; grouping, display name and sort order mirror funnel-report.
+        groups = {}
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"],
+                               "sums": {"new": Decimal("0"), "qualified": Decimal("0")}}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among filtered contacts.
+                group["display"] = contact["organization"]
+
+        totals = {"new": Decimal("0"), "qualified": Decimal("0")}
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            # Only deals currently open at one of the weighted stages count, once
+            # each; won and lost never do. A reopened deal is judged by its
+            # current stage alone.
+            stage = opportunity["stage"]
+            if stage not in rates:
+                continue
+            # A deal without a price contributes 0.00; the weight is exact
+            # decimal money times the percentage divided by 100.
+            amount = Decimal(opportunity["amount"]) if "amount" in opportunity else Decimal("0")
+            weighted = amount * rates[stage] / Decimal("100")
+            groups[contact["organization"].casefold()]["sums"][stage] += weighted
+            totals[stage] += weighted
+
+        cent = Decimal("0.01")
+
+        def money_row(sums):
+            # Each stage, the organization and the total round their own
+            # unrounded sums to the cent (half up); a row is never rebuilt from
+            # already rounded stage figures.
+            row = {stage: format(sums[stage].quantize(cent, rounding=ROUND_HALF_UP), "f")
+                   for stage in ("new", "qualified")}
+            row["amount"] = format((sums["new"] + sums["qualified"]).quantize(
+                cent, rounding=ROUND_HALF_UP), "f")
+            return row
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(money_row(group["sums"]))
+            organizations.append(row)
+
+        totals_row = money_row(totals)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "new", "qualified", "amount"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["new"], row["qualified"], row["amount"]))
+
+        return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
+
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
         end_on = calendar_day(end_on, "end_on")
