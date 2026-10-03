@@ -143,6 +143,58 @@ def _tag_expression_predicate(expression):
         raise ValueError("unexpected content after complete tag expression")
     return predicate
 
+def _validate_contact_filter(organization, tags, tag_mode):
+    # Validation and normalization shared by the three organization reports.
+    # Organization is a trimmed string matched casefoldedly (omitted or None
+    # means unrestricted); tags follow set-tags normalization (None or an empty
+    # list means unrestricted) and tag_mode only accepts all/any. Returns the
+    # casefolded organization key (or None) and the sorted wanted tags.
+    if organization is not None and not isinstance(organization, str):
+        raise ValueError("organization must be a string")
+    wanted = [] if tags is None else normalize_tags(tags)
+    if tag_mode not in ("all", "any"):
+        raise ValueError("tag_mode must be 'all' or 'any'")
+    org_key = organization.strip().casefold() if organization is not None else None
+    return org_key, wanted
+
+def _contact_filter(tag_store, org_key, wanted, tag_mode):
+    # Contact predicate shared by the three reports: the organization and tag
+    # conditions intersect. A contact without a stored tag set (or old data
+    # without the tags collection) evaluates against the empty set.
+    def matches(contact):
+        if org_key is not None and contact["organization"].casefold() != org_key:
+            return False
+        if wanted:
+            have = set(tag_store.get(contact["contact_id"], []))
+            if tag_mode == "all" and not set(wanted) <= have:
+                return False
+            if tag_mode == "any" and not (set(wanted) & have):
+                return False
+        return True
+    return matches
+
+def _grouped_organizations(contacts, matches, empty_counts):
+    # One pass over the filtered contacts: group by the current organization's
+    # casefold value, take the code-point-smallest original organization value
+    # among the group's filtered contacts as the display name, and start every
+    # group from fresh counts. An organization whose contacts own no
+    # opportunities still gets a group. The filtered contacts are also returned
+    # in iteration order for contact-only counting.
+    groups = {}
+    selected = []
+    for contact in contacts:
+        if not matches(contact):
+            continue
+        selected.append(contact)
+        key = contact["organization"].casefold()
+        group = groups.get(key)
+        if group is None:
+            groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+        elif contact["organization"] < group["display"]:
+            # Display name is the code-point-smallest original value among filtered contacts.
+            group["display"] = contact["organization"]
+    return groups, selected
+
 # Distinguishes an omitted next_reminder (auto-renew a monthly reminder) from
 # an explicit None (terminate repetition and clear the reminder).
 _UNSET = object()
@@ -1524,44 +1576,19 @@ class ContactFlow(JsonStore):
         return pairs
 
     def funnel_report(self, organization=None, tags=None, tag_mode="all"):
-        if organization is not None and not isinstance(organization, str):
-            raise ValueError("organization must be a string")
-        wanted = [] if tags is None else normalize_tags(tags)
-        if tag_mode not in ("all", "any"):
-            raise ValueError("tag_mode must be 'all' or 'any'")
+        org_key, wanted = _validate_contact_filter(organization, tags, tag_mode)
         data = self._read()
         contacts = data.get("contacts", {})
-        tag_store = data.get("tags", {})
-        org_key = organization.strip().casefold() if organization is not None else None
-
-        def matches(contact):
-            if org_key is not None and contact["organization"].casefold() != org_key:
-                return False
-            if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
-                if tag_mode == "all" and not set(wanted) <= have:
-                    return False
-                if tag_mode == "any" and not (set(wanted) & have):
-                    return False
-            return True
+        matches = _contact_filter(data.get("tags", {}), org_key, wanted, tag_mode)
 
         def empty_counts():
             return {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-            groups[key]["counts"]["contacts"] += 1
-            totals["contacts"] += 1
+        groups, selected = _grouped_organizations(contacts.values(), matches, empty_counts)
+        totals["contacts"] = len(selected)
+        for contact in selected:
+            groups[contact["organization"].casefold()]["counts"]["contacts"] += 1
 
         for opportunity in data.get("opportunities", {}).values():
             contact = contacts.get(opportunity["contact_id"])
@@ -1590,44 +1617,17 @@ class ContactFlow(JsonStore):
         return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
 
     def opportunity_amount_report(self, organization=None, tags=None, tag_mode="all"):
-        if organization is not None and not isinstance(organization, str):
-            raise ValueError("organization must be a string")
-        wanted = [] if tags is None else normalize_tags(tags)
-        if tag_mode not in ("all", "any"):
-            raise ValueError("tag_mode must be 'all' or 'any'")
+        org_key, wanted = _validate_contact_filter(organization, tags, tag_mode)
         data = self._read()
         contacts = data.get("contacts", {})
-        tag_store = data.get("tags", {})
-        org_key = organization.strip().casefold() if organization is not None else None
-
-        def matches(contact):
-            if org_key is not None and contact["organization"].casefold() != org_key:
-                return False
-            if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
-                if tag_mode == "all" and not set(wanted) <= have:
-                    return False
-                if tag_mode == "any" and not (set(wanted) & have):
-                    return False
-            return True
+        matches = _contact_filter(data.get("tags", {}), org_key, wanted, tag_mode)
 
         # Sums accumulate in integer cents, so totals are exact to the cent.
         def empty_counts():
             return {"new": 0, "qualified": 0, "won": 0, "lost": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-
+        groups, _ = _grouped_organizations(contacts.values(), matches, empty_counts)
         for opportunity in data.get("opportunities", {}).values():
             contact = contacts.get(opportunity["contact_id"])
             if contact is None or not matches(contact):
@@ -1666,26 +1666,10 @@ class ContactFlow(JsonStore):
             raise ValueError("probabilities must be an object containing exactly new and qualified")
         rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
                  for stage in ("new", "qualified")}
-        if organization is not None and not isinstance(organization, str):
-            raise ValueError("organization must be a string")
-        wanted = [] if tags is None else normalize_tags(tags)
-        if tag_mode not in ("all", "any"):
-            raise ValueError("tag_mode must be 'all' or 'any'")
+        org_key, wanted = _validate_contact_filter(organization, tags, tag_mode)
         data = self._read()
         contacts = data.get("contacts", {})
-        tag_store = data.get("tags", {})
-        org_key = organization.strip().casefold() if organization is not None else None
-
-        def matches(contact):
-            if org_key is not None and contact["organization"].casefold() != org_key:
-                return False
-            if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
-                if tag_mode == "all" and not set(wanted) <= have:
-                    return False
-                if tag_mode == "any" and not (set(wanted) & have):
-                    return False
-            return True
+        matches = _contact_filter(data.get("tags", {}), org_key, wanted, tag_mode)
 
         # Weighted sums stay unrounded: amount cents times probability
         # hundredths, where weighted cents = raw / 10000. Each stage, group and
@@ -1695,18 +1679,7 @@ class ContactFlow(JsonStore):
             return {"new": 0, "qualified": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-
+        groups, _ = _grouped_organizations(contacts.values(), matches, empty_counts)
         for opportunity in data.get("opportunities", {}).values():
             stage = opportunity["stage"]
             # Only open opportunities count; won and lost never enter the forecast.
