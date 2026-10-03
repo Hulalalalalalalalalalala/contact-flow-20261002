@@ -440,6 +440,100 @@ class ContactFlow(JsonStore):
         self._write(data)
         return entry
 
+    def correct_followups(self, corrections):
+        # Fix the date and/or note of already saved followup records. The whole
+        # batch validates against the pre-call timelines before any record
+        # changes, so a rejected item never leaves half the batch applied;
+        # every correction commits in a single write.
+        if not isinstance(corrections, list):
+            raise ValueError("corrections must be a list")
+        if not corrections:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        correction_keys = {"contact_id", "index", "expected_on", "expected_note", "changes"}
+        entries = []
+        seen = set()
+        for item in corrections:
+            if not isinstance(item, dict) or set(item) != correction_keys:
+                raise ValueError(
+                    "each correction must be an object with exactly contact_id, index, "
+                    "expected_on, expected_note and changes")
+            contact_id = text(item["contact_id"], "contact_id")
+            # type(...) is int rejects bools, which are ints in Python but never an index.
+            index = item["index"]
+            if type(index) is not int or index < 0:
+                raise ValueError("index must be a nonnegative integer")
+            # The expected values are checked verbatim against the stored record
+            # after the read; they are only required to be strings here and are
+            # never normalized before the comparison.
+            expected_on = item["expected_on"]
+            if not isinstance(expected_on, str):
+                raise ValueError("expected_on must be a string")
+            expected_note = item["expected_note"]
+            if not isinstance(expected_note, str):
+                raise ValueError("expected_note must be a string")
+            changes = item["changes"]
+            if not isinstance(changes, dict) or not changes:
+                raise ValueError("changes must be a nonempty object")
+            normalized = {}
+            for key, value in changes.items():
+                if key not in ("on", "note"):
+                    raise ValueError("changes contains an unsupported field: " + str(key))
+                if key == "on":
+                    # Dates reuse the real-calendar rule (trimmed YYYY-MM-DD,
+                    # past, future and leap days allowed, no system clock).
+                    normalized["on"] = calendar_day(value, "on")
+                else:
+                    normalized["note"] = text(value, "note")
+            # Normalized ids are case-sensitive; the same position of one
+            # contact may appear only once, even when both items are identical.
+            if (contact_id, index) in seen:
+                raise ValueError("duplicate correction for the same contact and index")
+            seen.add((contact_id, index))
+            entries.append((contact_id, index, expected_on, expected_note, normalized))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        followups = data.get("followups", [])
+        # Each contact's timeline sorts its records by date ascending, same day
+        # in save order; indexes address that pre-call timeline, so an earlier
+        # item's date change never moves the record a later item points at.
+        timelines = {}
+        for contact_id, index, expected_on, expected_note, _ in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            timeline = timelines.get(contact_id)
+            if timeline is None:
+                # Old data without a followups collection reads as empty.
+                timeline = sorted((entry for entry in followups if entry["contact_id"] == contact_id),
+                                  key=lambda entry: entry["on"])
+                timelines[contact_id] = timeline
+            if index >= len(timeline):
+                raise ValueError("index out of range for followups")
+            record = timeline[index]
+            if record["on"] != expected_on or record["note"] != expected_note:
+                raise ValueError("expected values do not match the stored followup")
+        # Everything validated; results are the complete corrected records in
+        # input order, shaped like the stored followup records.
+        results = []
+        changed = False
+        for contact_id, index, _, _, normalized in entries:
+            record = timelines[contact_id][index]
+            updated = dict(record)
+            updated.update(normalized)
+            results.append(updated)
+            if updated != record:
+                changed = True
+        if not changed:
+            # Every normalized change already matched the stored values: report
+            # the records without rewriting the file.
+            return results
+        # The timeline entries are the stored records themselves, so updating
+        # them keeps the original save order and any duplicate rows intact.
+        for (contact_id, index, _, _, normalized) in entries:
+            timelines[contact_id][index].update(normalized)
+        self._write(data)
+        return results
+
     def set_reminder(self, contact_id, due_on, note, repeat_monthly=False):
         contact_id = text(contact_id, "contact_id")
         note = text(note, "note")
