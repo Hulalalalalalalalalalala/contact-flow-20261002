@@ -10,6 +10,7 @@ from .storage import JsonStore, text, calendar_day, positive, amount_string, amo
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
 OPPORTUNITY_FIELDS = ("opportunity_id", "contact_id", "title", "stage")
+CONTACT_TAG_FIELDS = ("contact_id", "tag")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
@@ -526,6 +527,90 @@ class ContactFlow(JsonStore):
                 imported.append(dict(opportunity))
             self._write(data)
         return imported
+
+    def import_contact_tags(self, csv_path):
+        # Append tags to already registered contacts without replacing their
+        # existing tags: the import is the deduplicated union. The whole file
+        # parses and validates (including that every contact exists) before any
+        # write, so a rejected row never changes a single tag.
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if (len(header) != len(CONTACT_TAG_FIELDS) or set(header) != set(CONTACT_TAG_FIELDS)
+                or len(set(header)) != len(header)):
+            raise ValueError("CSV header must contain exactly contact_id,tag in any order")
+
+        records = []
+        try:
+            for row in rows:
+                if not row:
+                    # Only zero-field blank lines are ignored; a row of two
+                    # empty fields is a malformed record, not a blank line.
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                contact_id = values["contact_id"].strip()
+                if not contact_id:
+                    raise ValueError("contact_id must be a nonempty string")
+                # Tags reuse set-tags normalization: trim, casefold, keep inner
+                # whitespace; an empty tag can never clear stored tags.
+                tag = values["tag"].strip().casefold()
+                if not tag:
+                    raise ValueError("tags must be nonempty strings")
+                records.append((contact_id, tag))
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        data = self._read()
+        contacts = data.get("contacts", {})
+        # The whole batch validates first, so one unknown contact rejects it all.
+        for contact_id, _ in records:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+        if not records:
+            # A legal header followed only by blank lines imports nothing and
+            # never touches storage.
+            return []
+        # Results follow the file order in which each normalized id first
+        # appears; repeated rows (identical records included) only feed the
+        # deduplicated union.
+        order = []
+        additions = {}
+        for contact_id, tag in records:
+            if contact_id not in additions:
+                additions[contact_id] = set()
+                order.append(contact_id)
+            additions[contact_id].add(tag)
+        store = data.setdefault("tags", {})
+        # Build every post-import union before writing, so a file whose tags
+        # all already exist reports the same result without rewriting.
+        final_tags = {}
+        changed = False
+        for contact_id in order:
+            current = set(store.get(contact_id, []))
+            merged = current | additions[contact_id]
+            if merged != current:
+                changed = True
+            final_tags[contact_id] = sorted(merged)
+        results = [{"contact_id": contact_id, "tags": final_tags[contact_id]}
+                   for contact_id in order]
+        if changed:
+            for contact_id in order:
+                store[contact_id] = final_tags[contact_id]
+            self._write(data)
+        return results
 
     def follow_up(self, contact_id, on, note):
         note = text(note, "note")
