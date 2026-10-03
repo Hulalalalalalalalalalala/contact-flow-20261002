@@ -1266,6 +1266,109 @@ class ContactFlow(JsonStore):
 
         return {"total": total_row, "organizations": organizations, "csv": buffer.getvalue()}
 
+    def conversion_report(self, start_on, end_on, as_of, organization=None, tags=None, tag_mode="all"):
+        start_on = calendar_day(start_on, "start_on")
+        end_on = calendar_day(end_on, "end_on")
+        as_of = calendar_day(as_of, "as_of")
+        if start_on > end_on:
+            raise ValueError("start_on must not be later than end_on")
+        if as_of < end_on:
+            raise ValueError("as_of must not be earlier than end_on")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        def empty_counts():
+            return {"entered": 0, "won": 0, "lost": 0, "open": 0}
+
+        history_store = data.get("stage_history", {})
+        totals = empty_counts()
+        # Only organizations owning at least one entered opportunity get a group.
+        groups = {}
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            history = history_store.get(opportunity["opportunity_id"], [])
+            # Exactly one entry per opportunity: the last saved record entering
+            # qualified with a non-null date inside the inclusive range. Imported
+            # or legacy deals without such a record never enter the cohort.
+            entered_index = None
+            for index, entry in enumerate(history):
+                if (entry["to_stage"] == "qualified" and entry["on"] is not None
+                        and start_on <= entry["on"] <= end_on):
+                    entered_index = index
+            if entered_index is None:
+                continue
+            entered_on = history[entered_index]["on"]
+            # The outcome is the last saved dated record from the entry record
+            # onward whose date falls between the entry date and the observation
+            # day (both inclusive); the entry record itself always qualifies, so
+            # the outcome is never missing. The current stage is never consulted.
+            outcome = None
+            for entry in history[entered_index:]:
+                if entry["on"] is not None and entered_on <= entry["on"] <= as_of:
+                    outcome = entry["to_stage"]
+            result = outcome if outcome in ("won", "lost") else "open"
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among
+                # the organizations owning entered opportunities.
+                group["display"] = contact["organization"]
+            counts = groups[key]["counts"]
+            counts["entered"] += 1
+            counts[result] += 1
+            totals["entered"] += 1
+            totals[result] += 1
+
+        def stats_row(counts):
+            row = dict(counts)
+            if counts["entered"]:
+                rate = (Decimal(counts["won"]) * 100 / Decimal(counts["entered"])).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                row["win_rate"] = format(rate, "f")
+            else:
+                row["win_rate"] = None
+            return row
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(stats_row(group["counts"]))
+            organizations.append(row)
+
+        total_row = stats_row(totals)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "entered", "won", "lost", "open", "win_rate"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["entered"], row["won"], row["lost"],
+                             row["open"], row["win_rate"] if row["win_rate"] is not None else ""))
+
+        return {"total": total_row, "organizations": organizations, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):
