@@ -418,6 +418,105 @@ class ContactFlow(JsonStore):
             self._write(data)
         return imported
 
+    def preview_contact_import(self, csv_path):
+        # Read-only dry run of import_contacts: same path, encoding, header,
+        # quoting and field normalization rules, but nothing is registered,
+        # written or created. The report lists every row-level problem so the
+        # whole file can be reviewed before importing for real.
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if len(header) != len(CONTACT_FIELDS) or set(header) != set(CONTACT_FIELDS) or len(set(header)) != len(header):
+            raise ValueError("CSV header must contain exactly contact_id,name,email,organization in any order")
+
+        # Row numbers count the non-empty logical records after the header
+        # from 1; quoted newlines stay inside one record and zero-field blank
+        # lines never get a number.
+        parsed = []
+        try:
+            for row in rows:
+                if not row:
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                parsed.append((len(parsed) + 1, dict(zip(header, row))))
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        # Old data without a contacts collection reads as an empty store.
+        data = self._read()
+        contacts = data.get("contacts", {})
+        existing_ids = set(contacts)
+        existing_emails = {c["email"] for c in contacts.values()}
+
+        # Each field normalizes independently, so a row with one bad field
+        # still contributes its legal id and email to the conflict checks.
+        entries = []
+        for row_number, values in parsed:
+            clean = {}
+            invalid = set()
+            for field in CONTACT_FIELDS:
+                value = values[field].strip()
+                if field == "email":
+                    value = value.lower()
+                    if (not value or value.count("@") != 1 or any(c.isspace() for c in value)
+                            or not all(value.split("@"))):
+                        invalid.add(field)
+                        continue
+                elif not value:
+                    invalid.add(field)
+                    continue
+                clean[field] = value
+            entries.append((row_number, clean, invalid))
+
+        id_rows = {}
+        email_rows = {}
+        for row_number, clean, _ in entries:
+            if "contact_id" in clean:
+                id_rows.setdefault(clean["contact_id"], []).append(row_number)
+            if "email" in clean:
+                email_rows.setdefault(clean["email"], []).append(row_number)
+
+        # A legal id or email occupied by an existing contact reports
+        # "existing"; one repeated within the file reports "duplicate" on
+        # every involved row, not just the later ones. Both can apply to the
+        # same field of the same row and are kept as two entries.
+        errors = []
+        for row_number, clean, invalid in entries:
+            for field in invalid:
+                errors.append({"row": row_number, "field": field, "code": "invalid"})
+            contact_id = clean.get("contact_id")
+            if contact_id is not None:
+                if contact_id in existing_ids:
+                    errors.append({"row": row_number, "field": "contact_id", "code": "existing"})
+                if len(id_rows[contact_id]) > 1:
+                    errors.append({"row": row_number, "field": "contact_id", "code": "duplicate"})
+            email = clean.get("email")
+            if email is not None:
+                if email in existing_emails:
+                    errors.append({"row": row_number, "field": "email", "code": "existing"})
+                if len(email_rows[email]) > 1:
+                    errors.append({"row": row_number, "field": "email", "code": "duplicate"})
+        errors.sort(key=lambda error: (error["row"], error["field"], error["code"]))
+
+        failed_rows = {error["row"] for error in errors}
+        records = [{"row": row_number,
+                    "contact": {"contact_id": clean["contact_id"], "name": clean["name"],
+                                "email": clean["email"], "organization": clean["organization"]}}
+                   for row_number, clean, _ in entries if row_number not in failed_rows]
+        return {"can_import": not errors, "records": records, "errors": errors}
+
     def import_followups(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():
             raise ValueError("csv_path must be a nonempty string")

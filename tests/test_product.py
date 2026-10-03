@@ -725,6 +725,226 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertFalse(fresh_root.exists())
 
+    def test_preview_clean_file_reports_rows_without_importing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        csv_path = self.write_csv("people.csv",
+            "email,contact_id,name,organization\r\n"
+            "bob@example.test,B,\"Bob, Jr.\",Music\r\n"
+            "ALICE@example.test, A ,\"陈\n小明\",\" 春山书店 \"\r\n")
+        result = fresh.preview_contact_import(str(csv_path))
+        self.assertEqual(result, {
+            "can_import": True,
+            "records": [
+                {"row": 1, "contact": {"contact_id": "B", "name": "Bob, Jr.", "email": "bob@example.test", "organization": "Music"}},
+                {"row": 2, "contact": {"contact_id": "A", "name": "陈\n小明", "email": "alice@example.test", "organization": "春山书店"}},
+            ],
+            "errors": [],
+        })
+        # The preview registered nothing and never created the data directory.
+        self.assertFalse(fresh_root.exists())
+        # A later real import still validates independently and succeeds.
+        imported = fresh.import_contacts(str(csv_path))
+        self.assertEqual([c["contact_id"] for c in imported], ["B", "A"])
+
+    def test_preview_reports_every_problem_and_keeps_clean_rows(self):
+        self.app.add_contact("X", "Existing", "x@example.test", "Books")
+        self.app.add_contact("Y", "Other", "y@example.test", "Games")
+        before = self.app.path.read_bytes()
+        csv_path = self.write_csv("mixed.csv",
+            "contact_id,name,email,organization\n"
+            "A,Alice,a@example.test,Org\n"          # row 1: clean
+            "X,BadId,new@example.test,Org\n"        # row 2: existing + duplicated id
+            ",NoId,no-id@example.test,Org\n"        # row 3: invalid id
+            "B, ,b@example.test,Org\n"              # row 4: invalid name
+            "C,Cara,not-an-email,Org\n"             # row 5: invalid email
+            "D,Dee,Y@example.test,Org\n"            # row 6: existing email
+            "E,Eve,dup@example.test,Org\n"          # row 7: duplicated email
+            "F,Fay,DUP@example.test,Org\n"          # row 8: duplicated email
+            "E,Eve2,e2@example.test,Org\n"          # row 9: duplicated id (rows 7+9)
+            "X,Xagain,x@example.test,Org\n")        # row 10: duplicated + existing id, existing email
+        result = self.app.preview_contact_import(str(csv_path))
+        self.assertFalse(result["can_import"])
+        self.assertEqual(result["records"], [
+            {"row": 1, "contact": {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Org"}},
+        ])
+        self.assertEqual(result["errors"], [
+            {"row": 2, "field": "contact_id", "code": "duplicate"},
+            {"row": 2, "field": "contact_id", "code": "existing"},
+            {"row": 3, "field": "contact_id", "code": "invalid"},
+            {"row": 4, "field": "name", "code": "invalid"},
+            {"row": 5, "field": "email", "code": "invalid"},
+            {"row": 6, "field": "email", "code": "existing"},
+            {"row": 7, "field": "contact_id", "code": "duplicate"},
+            {"row": 7, "field": "email", "code": "duplicate"},
+            {"row": 8, "field": "email", "code": "duplicate"},
+            {"row": 9, "field": "contact_id", "code": "duplicate"},
+            {"row": 10, "field": "contact_id", "code": "duplicate"},
+            {"row": 10, "field": "contact_id", "code": "existing"},
+            {"row": 10, "field": "email", "code": "existing"},
+        ])
+        # Nothing was imported or rewritten, and a repeated preview recomputes.
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.preview_contact_import(str(csv_path)), result)
+        self.assertEqual([c["contact_id"] for c in ContactFlow(self.root).find()], ["X", "Y"])
+
+    def test_preview_checks_legal_id_and_email_even_when_row_has_invalid_fields(self):
+        self.app.add_contact("X", "Existing", "x@example.test", "Books")
+        csv_path = self.write_csv("partial.csv",
+            "contact_id,name,email,organization\n"
+            "X, ,x@example.test, \n")
+        result = self.app.preview_contact_import(str(csv_path))
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["errors"], [
+            {"row": 1, "field": "contact_id", "code": "existing"},
+            {"row": 1, "field": "email", "code": "existing"},
+            {"row": 1, "field": "name", "code": "invalid"},
+            {"row": 1, "field": "organization", "code": "invalid"},
+        ])
+
+    def test_preview_flags_all_rows_of_a_batch_duplicate_and_both_conflict_kinds(self):
+        self.app.add_contact("A", "Existing", "a@example.test", "Books")
+        csv_path = self.write_csv("dup.csv",
+            "contact_id,name,email,organization\n"
+            "A,One,a@example.test,Org\n"
+            "B,Two,b@example.test,Org\n"
+            "A,Three,a@example.test,Org\n"
+            "B,Four,b2@example.test,Org\n")
+        result = self.app.preview_contact_import(str(csv_path))
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["errors"], [
+            {"row": 1, "field": "contact_id", "code": "duplicate"},
+            {"row": 1, "field": "contact_id", "code": "existing"},
+            {"row": 1, "field": "email", "code": "duplicate"},
+            {"row": 1, "field": "email", "code": "existing"},
+            {"row": 2, "field": "contact_id", "code": "duplicate"},
+            {"row": 3, "field": "contact_id", "code": "duplicate"},
+            {"row": 3, "field": "contact_id", "code": "existing"},
+            {"row": 3, "field": "email", "code": "duplicate"},
+            {"row": 3, "field": "email", "code": "existing"},
+            {"row": 4, "field": "contact_id", "code": "duplicate"},
+        ])
+
+    def test_preview_row_numbering_skips_blank_lines_and_quoted_newlines(self):
+        csv_path = self.write_csv("rows.csv",
+            "contact_id,name,email,organization\n"
+            "\n"
+            "A,\"Al\nice\",a@example.test,Org\n"
+            "\r\n"
+            ",Bad,b@example.test,Org\n"
+            "\n")
+        result = self.app.preview_contact_import(str(csv_path))
+        self.assertEqual([r["row"] for r in result["records"]], [1])
+        self.assertEqual(result["records"][0]["contact"]["name"], "Al\nice")
+        self.assertEqual(result["errors"], [{"row": 2, "field": "contact_id", "code": "invalid"}])
+
+    def test_preview_header_only_is_importable_and_creates_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for content in ["contact_id,name,email,organization\n", "contact_id,name,email,organization\n\n\r\n\n"]:
+            csv_path = self.write_csv("header-%d.csv" % len(content), content)
+            self.assertEqual(fresh.preview_contact_import(str(csv_path)),
+                             {"can_import": True, "records": [], "errors": []})
+            self.assertFalse(fresh_root.exists())
+
+    def test_preview_treats_missing_contacts_collection_as_empty_store(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.app.path.write_text(json.dumps({"followups": []}), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        csv_path = self.write_csv("people.csv",
+            "contact_id,name,email,organization\nA,Alice,a@example.test,Org\n")
+        result = self.app.preview_contact_import(str(csv_path))
+        self.assertTrue(result["can_import"])
+        self.assertEqual(len(result["records"]), 1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_preview_rejects_file_level_problems_without_partial_report(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        bad_files = [
+            "", "\n",                                            # empty file
+            "contact_id,name,email\n",                           # bad header
+            "contact_id,name,email,email\n",                     # duplicated header
+            "contact_id,name,email,organization\nA,Alice,a@example.test\n",   # short record
+            "contact_id,name,email,organization\nA,Alice,a@example.test,Org,x\n",  # long record
+            'contact_id,name,email,organization\nA,"Alice,a@example.test,Org\n',   # unterminated quote
+        ]
+        for i, content in enumerate(bad_files):
+            csv_path = self.write_csv("bad-%d.csv" % i, content)
+            with self.assertRaises(ValueError):
+                fresh.preview_contact_import(str(csv_path))
+        csv_path = self.write_csv("latin.csv", b"contact_id,name,email,organization\nA,\xff,a@example.test,Org\n")
+        with self.assertRaises(ValueError):
+            fresh.preview_contact_import(str(csv_path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_preview_validates_csv_path_and_missing_argument(self):
+        for bad in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.preview_contact_import(bad)
+        with self.assertRaises(FileNotFoundError):
+            self.app.preview_contact_import(str(self.root / "missing.csv"))
+        with self.assertRaises(TypeError):
+            self.app.preview_contact_import()
+        self.assertFalse(self.app.path.exists())
+
+    def test_preview_unreadable_file_raises_permission_error(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        csv_path = self.write_csv("locked.csv", "contact_id,name,email,organization\nA,Alice,a@example.test,Books\n")
+        csv_path.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                self.app.preview_contact_import(str(csv_path))
+        finally:
+            csv_path.chmod(0o644)
+        self.assertFalse(self.app.path.exists())
+
+    def test_preview_recomputes_against_current_data(self):
+        csv_path = self.write_csv("people.csv",
+            "contact_id,name,email,organization\nA,Alice,a@example.test,Org\n")
+        first = self.app.preview_contact_import(str(csv_path))
+        self.assertTrue(first["can_import"])
+        self.app.add_contact("A", "Alice", "a@example.test", "Org")
+        second = self.app.preview_contact_import(str(csv_path))
+        self.assertFalse(second["can_import"])
+        self.assertEqual(second["records"], [])
+        self.assertEqual(second["errors"], [
+            {"row": 1, "field": "contact_id", "code": "existing"},
+            {"row": 1, "field": "email", "code": "existing"},
+        ])
+
+    def test_cli_preview_contact_import_success_and_failure(self):
+        csv_path = self.write_csv("people.csv",
+            "contact_id,name,email,organization\n"
+            "A,Alice,a@example.test,Books\n"
+            ",Bad,b@example.test,Music\n")
+        payload = self.root / "preview.json"
+        payload.write_text(json.dumps({"csv_path": str(csv_path)}), encoding="utf-8")
+        # Row-level problems are still a successful report: JSON on stdout, exit 0.
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "preview-contact-import", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertFalse(report["can_import"])
+        self.assertEqual([r["row"] for r in report["records"]], [1])
+        self.assertEqual(report["errors"], [{"row": 2, "field": "contact_id", "code": "invalid"}])
+        self.assertFalse(self.app.path.exists())
+        # File-level problems use the standard error JSON and exit 2.
+        bad_csv = self.write_csv("bad.csv", "contact_id,name,email\nA,Alice,a@example.test\n")
+        payload.write_text(json.dumps({"csv_path": str(bad_csv)}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "preview-contact-import", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        # An outer JSON array calls each item independently and reports them all.
+        payload.write_text(json.dumps([{"csv_path": str(csv_path)}, {"csv_path": str(csv_path)}]), encoding="utf-8")
+        mixed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "preview-contact-import", str(payload)], text=True, capture_output=True)
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        reports = json.loads(mixed.stdout)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0], reports[1])
+        self.assertFalse(self.app.path.exists())
+
     def test_import_followups_returns_file_order_and_persists(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "Music")
