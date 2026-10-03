@@ -118,6 +118,75 @@ class ProductTests(unittest.TestCase):
         # contact return structure is unchanged
         self.assertEqual(self.app.find(tags=["vip"])[0], {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
 
+    def test_find_tag_expression_logic_and_intersection(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip", "华南", "暂停"])
+        self.app.set_tags("C", ["vip"])
+        ids = lambda rows: [c["contact_id"] for c in rows]
+        self.assertEqual(ids(self.app.find(tag_expression='"vip" && ("华东" || "华南") && !"暂停"')), ["A"])
+        # Precedence: ! binds tightest, then &&, then ||.
+        self.assertEqual(ids(self.app.find(tag_expression='"华东" || "华南" && !"暂停"')), ["A"])
+        self.assertEqual(ids(self.app.find(tag_expression=' ! ! ( ( "vip" ) ) ')), ["A", "B", "C"])
+        # Unknown tags count as absent, so their negation holds; a pure
+        # exclusion expression also selects contacts without any tags.
+        self.assertEqual(ids(self.app.find(tag_expression='"missing"')), [])
+        self.assertEqual(ids(self.app.find(tag_expression='!"missing"')), ["A", "B", "C", "D"])
+        self.assertEqual(ids(self.app.find(tag_expression='!"vip"')), ["D"])
+        # The expression intersects with organization and tags/tag_mode.
+        self.assertEqual(ids(self.app.find(organization="books", tag_expression='"vip"')), ["A", "B"])
+        self.assertEqual(ids(self.app.find(tags=["vip"], tag_expression='"华东" || "华南"')), ["A", "B"])
+        self.assertEqual(ids(self.app.find(tags=["华南"], tag_expression='!"暂停"')), [])
+        # Decoded tags follow set-tags trim/casefold; escapes and quoted
+        # operator characters are tag content.
+        self.assertEqual(ids(self.app.find(tag_expression='" VIP "')), ["A", "B", "C"])
+        self.assertEqual(ids(self.app.find(tag_expression='"\\u4e1c\\u533a" || "华东"')), ["A"])
+        self.assertEqual(ids(self.app.find(tag_expression='!"a&&b"')), ["A", "B", "C", "D"])
+        # Omitted or None keeps the previous behavior exactly.
+        self.assertEqual(self.app.find(tag_expression=None), self.app.find())
+        self.assertEqual(ids(self.app.find(tag_expression='"vip" || !"vip"')), ["A", "B", "C", "D"])
+
+    def test_find_tag_expression_validation(self):
+        for expression in [123, 1.5, [], {}, True, "", "   ", '""', '"  "', '"a', '"a\\x"',
+                           "vip", "'vip'", '"a" "b"', '"a" & "b"', '"a" | "b"', '"a" &&',
+                           '&& "a"', "()", '("a"', '"a")', '"a" @ "b"', "!", '"a" && || "b"',
+                           '"a" ("b")', '"a" ||']:
+            with self.assertRaises(ValueError, msg=repr(expression)):
+                self.app.find(tag_expression=expression)
+        # The whole expression validates even on an empty store, with no
+        # organization match, or when an earlier condition already decides.
+        self.assertFalse(self.app.path.exists())
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for kwargs in [{"organization": "nobody"}, {"tags": ["missing"]}, {}]:
+            with self.assertRaises(ValueError):
+                self.app.find(tag_expression='"a" || &&', **kwargs)
+        # Queries stay read-only: no directory, no rewrite, no extra files.
+        empty_root = self.root / "fresh"
+        with self.assertRaises(ValueError):
+            ContactFlow(empty_root).find(tag_expression='"a" &&')
+        self.assertFalse(empty_root.exists())
+        self.assertEqual(ContactFlow(empty_root).find(tag_expression='"a"'), [])
+        self.assertFalse(empty_root.exists())
+
+    def test_cli_find_tag_expression(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"tag_expression": '"vip" && !"暂停"'}), encoding="utf-8")
+        found = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual([c["contact_id"] for c in json.loads(found.stdout)], ["A"])
+        payload.write_text(json.dumps({"tag_expression": '"vip" && ('}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
     def test_duplicate_candidates_pairs_and_ordering(self):
         self.app.add_contact("A", "陈小明", "a@example.test", "Books")
         self.app.add_contact("B", "陈晓明", "b@example.test", "Books")

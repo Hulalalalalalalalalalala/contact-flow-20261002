@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import unicodedata
 from calendar import monthrange
 from datetime import date
@@ -25,6 +26,109 @@ def normalize_tags(value):
             raise ValueError("tags must be nonempty strings")
         tags.add(tag)
     return sorted(tags)
+
+def _tokenize_tag_expression(source):
+    # Tags are JSON double-quoted strings (escapes included); &&, ||, ! and
+    # parentheses are the only other tokens. Unicode whitespace outside the
+    # strings is ignored; anything else is rejected.
+    tokens = []
+    index = 0
+    decoder = json.JSONDecoder()
+    while index < len(source):
+        char = source[index]
+        if char.isspace():
+            index += 1
+        elif char == '"':
+            try:
+                value, end = decoder.raw_decode(source, index)
+            except json.JSONDecodeError as error:
+                raise ValueError("invalid JSON string in tag_expression") from error
+            # Decoded tags follow set-tags normalization: trim, then casefold.
+            tag = value.strip().casefold()
+            if not tag:
+                raise ValueError("tags in tag_expression must be nonempty strings")
+            tokens.append(("tag", tag))
+            index = end
+        elif char == "!":
+            tokens.append(("not", None))
+            index += 1
+        elif char == "&" and source[index:index + 2] == "&&":
+            tokens.append(("and", None))
+            index += 2
+        elif char == "|" and source[index:index + 2] == "||":
+            tokens.append(("or", None))
+            index += 2
+        elif char == "(":
+            tokens.append(("lparen", None))
+            index += 1
+        elif char == ")":
+            tokens.append(("rparen", None))
+            index += 1
+        else:
+            raise ValueError("unexpected character in tag_expression")
+    return tokens
+
+def _parse_tag_expression(tokens):
+    # Grammar, loosest first: or -> and (|| and)*; and -> unary (&& unary)*;
+    # unary -> ! unary | primary; primary -> tag | ( or ). The whole token
+    # stream must be consumed, so trailing or unbalanced content rejects.
+    def parse_or(position):
+        node, position = parse_and(position)
+        while position < len(tokens) and tokens[position][0] == "or":
+            right, position = parse_and(position + 1)
+            node = ("or", node, right)
+        return node, position
+
+    def parse_and(position):
+        node, position = parse_unary(position)
+        while position < len(tokens) and tokens[position][0] == "and":
+            right, position = parse_unary(position + 1)
+            node = ("and", node, right)
+        return node, position
+
+    def parse_unary(position):
+        if position < len(tokens) and tokens[position][0] == "not":
+            node, position = parse_unary(position + 1)
+            return ("not", node), position
+        return parse_primary(position)
+
+    def parse_primary(position):
+        if position >= len(tokens):
+            raise ValueError("missing operand in tag_expression")
+        kind, value = tokens[position]
+        if kind == "tag":
+            return ("tag", value), position + 1
+        if kind == "lparen":
+            node, position = parse_or(position + 1)
+            if position >= len(tokens) or tokens[position][0] != "rparen":
+                raise ValueError("unbalanced parentheses in tag_expression")
+            return node, position + 1
+        raise ValueError("missing operand in tag_expression")
+
+    node, position = parse_or(0)
+    if position != len(tokens):
+        raise ValueError("unexpected trailing content in tag_expression")
+    return node
+
+def _compile_tag_expression(source):
+    # The whole expression validates up front, before any contact is read, so
+    # a late syntax error is never masked by an empty store or an early match.
+    if not isinstance(source, str):
+        raise ValueError("tag_expression must be a string")
+    if not source.strip():
+        raise ValueError("tag_expression must be a nonblank string")
+    return _parse_tag_expression(_tokenize_tag_expression(source))
+
+def _evaluate_tag_expression(node, have):
+    kind = node[0]
+    if kind == "tag":
+        return node[1] in have
+    if kind == "not":
+        return not _evaluate_tag_expression(node[1], have)
+    if kind == "and":
+        return _evaluate_tag_expression(node[1], have) and _evaluate_tag_expression(node[2], have)
+    return _evaluate_tag_expression(node[1], have) or _evaluate_tag_expression(node[2], have)
+
 
 # Distinguishes an omitted next_reminder (auto-renew a monthly reminder) from
 # an explicit None (terminate repetition and clear the reminder).
@@ -907,10 +1011,14 @@ class ContactFlow(JsonStore):
                  "moved_followups": moved.get(source_id, 0)}
                 for source_id, _ in entries]
 
-    def find(self, organization=None, tags=None, tag_mode="all"):
+    def find(self, organization=None, tags=None, tag_mode="all", tag_expression=None):
         wanted = [] if tags is None else normalize_tags(tags)
         if tag_mode not in ("all", "any"):
             raise ValueError("tag_mode must be 'all' or 'any'")
+        # The expression compiles (and so fully validates) before any contact
+        # is read, so a syntax error deep in the string rejects even when the
+        # store is empty or an earlier condition would already decide.
+        expression = None if tag_expression is None else _compile_tag_expression(tag_expression)
         data = self._read()
         contacts = data.get("contacts", {}).values()
         tag_store = data.get("tags", {})
@@ -918,12 +1026,14 @@ class ContactFlow(JsonStore):
         def matches(contact):
             if organization is not None and contact["organization"].casefold() != organization.strip().casefold():
                 return False
+            have = set(tag_store.get(contact["contact_id"], []))
             if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
                 if tag_mode == "all" and not set(wanted) <= have:
                     return False
                 if tag_mode == "any" and not (set(wanted) & have):
                     return False
+            if expression is not None and not _evaluate_tag_expression(expression, have):
+                return False
             return True
 
         return sorted((c for c in contacts if matches(c)), key=lambda c: c["contact_id"])
