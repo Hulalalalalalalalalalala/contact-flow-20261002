@@ -838,6 +838,72 @@ class ContactFlow(JsonStore):
         self._write(data)
         return results
 
+    def reopen_opportunities(self, reopens):
+        # The whole batch validates against each deal's pre-call stage before any
+        # stage or history changes, so a rejected item never leaves half the batch
+        # applied; stage changes and history appends commit in a single write.
+        if not isinstance(reopens, list):
+            raise ValueError("reopens must be a list")
+        if not reopens:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in reopens:
+            if not isinstance(item, dict) or set(item) != {"opportunity_id", "expected_stage", "on"}:
+                raise ValueError(
+                    "each reopen must be an object with exactly opportunity_id, expected_stage and on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            # The expected stage trims but never changes case; only the two
+            # terminal stages can be reopened.
+            expected_stage = text(item["expected_stage"], "expected_stage")
+            if expected_stage not in ("won", "lost"):
+                raise ValueError("expected_stage must be won or lost")
+            # The date is required here: a trimmed real YYYY-MM-DD string (past,
+            # future and leap days allowed, no system clock).
+            on = calendar_day(item["on"], "on")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even an
+            # identical item) rejects the whole batch.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in reopens")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, expected_stage, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        history_store = data.get("stage_history", {})
+        planned = []
+        for opportunity_id, expected_stage, on in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            # Only a currently closed deal reopens: the expected stage must equal
+            # the current one, so a deal not re-closed since its last reopen
+            # (or never closed at all) rejects the batch.
+            if opportunity["stage"] != expected_stage:
+                raise ValueError("expected_stage does not match the current stage")
+            # The reopen date must not precede the latest non-null date already
+            # recorded for this deal; same day is allowed and null records never
+            # move that lower bound.
+            dated = [entry["on"] for entry in history_store.get(opportunity_id, [])
+                     if entry["on"] is not None]
+            if dated and on < dated[-1]:
+                raise ValueError("on must not be earlier than the latest recorded stage date")
+            planned.append((opportunity_id, opportunity, expected_stage, on))
+        # Results are the complete opportunities in input order; amount stays
+        # exactly as stored and never appears on deals that never had one.
+        results = []
+        for opportunity_id, opportunity, closed_stage, on in planned:
+            opportunity["stage"] = "qualified"
+            # The history lives outside the opportunity object itself; deals
+            # without a history collection start recording from the closed
+            # stage, and no earlier history is back-filled.
+            history_store.setdefault(opportunity_id, []).append(
+                {"from_stage": closed_stage, "to_stage": "qualified", "on": on})
+            results.append(dict(opportunity))
+        data.setdefault("stage_history", history_store)
+        self._write(data)
+        return results
+
     def stage_history(self, opportunity_id):
         opportunity_id = text(opportunity_id, "opportunity_id")
         data = self._read()
