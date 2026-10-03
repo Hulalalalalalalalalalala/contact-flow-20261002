@@ -5518,5 +5518,481 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(by_id["O3"]["stage"], "qualified")
         self.assertEqual(by_id["O4"]["stage"], "lost")
 
+    def seed_corrections(self):
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        self.app.add_contact("B", "Bob", "bob@example.test", "books")
+        self.app.set_tags("A", ["vip"])
+        # Registered out of order across dates and contacts; same-day entries
+        # keep save order, including an identical duplicate kept verbatim.
+        self.app.follow_up("A", "2026-10-03", "a day three")             # f1
+        self.app.follow_up("B", "2026-10-01", "b first")                 # f2
+        self.app.follow_up("A", "2026-10-01", "a one")                   # f3
+        self.app.follow_up("A", "2026-10-02", "a day two later save")    # f4
+        self.app.follow_up("A", "2026-10-02", "a day two earlier save")  # f5
+        self.app.follow_up("A", "2026-10-02", "a day two earlier save")  # f6 duplicate of f5
+
+    def test_correct_followups_precall_positions_duplicates_and_return_shape(self):
+        self.seed_corrections()
+        # Pre-call timeline A is f3(10-01), f4(10-02 later), f5(10-02 earlier),
+        # f6(10-02 earlier duplicate), f1(10-03); every index below addresses it.
+        result = self.app.correct_followups([
+            {"contact_id": " A ", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a one", "changes": {"on": " 2026-10-02 "}},
+            {"contact_id": "A", "index": 3, "expected_on": "2026-10-02",
+             "expected_note": "a day two earlier save",
+             "changes": {"note": "fixed dup second"}},
+            {"contact_id": "A", "index": 1, "expected_on": "2026-10-02",
+             "expected_note": "a day two later save",
+             "changes": {"on": "2026-09-30", "note": "moved to september"}},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "b first", "changes": {"note": " b corrected "}},
+        ])
+        # Results are the complete records in input order; a date-only change
+        # keeps the note and a note-only change keeps the date; ids trim.
+        self.assertEqual(result, [
+            {"contact_id": "A", "on": "2026-10-02", "note": "a one"},
+            {"contact_id": "A", "on": "2026-10-02", "note": "fixed dup second"},
+            {"contact_id": "A", "on": "2026-09-30", "note": "moved to september"},
+            {"contact_id": "B", "on": "2026-10-01", "note": "b corrected"},
+        ])
+        for record in result:
+            self.assertEqual(set(record), {"contact_id", "on", "note"})
+        reopened = ContactFlow(self.root)
+        # Post-call ordering: date ascending, save order on ties. f3 moved onto
+        # 10-02 slots by its own save position; the identical-content f5 is
+        # untouched while pre-call index 3 (f6) carries the new note.
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")], [
+            ("2026-09-30", "moved to september"),
+            ("2026-10-02", "a one"),
+            ("2026-10-02", "a day two earlier save"),
+            ("2026-10-02", "fixed dup second"),
+            ("2026-10-03", "a day three"),
+        ])
+        self.assertEqual(reopened.timeline("B"),
+                         [{"contact_id": "B", "on": "2026-10-01", "note": "b corrected"}])
+        # The stored list keeps save order; records are mutated in place, so the
+        # duplicate count is preserved (f5 alone keeps the shared note).
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))["followups"]
+        self.assertEqual(stored, [
+            {"contact_id": "A", "on": "2026-10-03", "note": "a day three"},
+            {"contact_id": "B", "on": "2026-10-01", "note": "b corrected"},
+            {"contact_id": "A", "on": "2026-10-02", "note": "a one"},
+            {"contact_id": "A", "on": "2026-09-30", "note": "moved to september"},
+            {"contact_id": "A", "on": "2026-10-02", "note": "a day two earlier save"},
+            {"contact_id": "A", "on": "2026-10-02", "note": "fixed dup second"},
+        ])
+        self.assertEqual(sum(1 for r in stored if r["note"] == "a day two earlier save"), 1)
+
+    def test_correct_followups_positions_ignore_same_batch_reordering(self):
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        self.app.add_contact("B", "Bob", "bob@example.test", "Music")
+        self.app.follow_up("A", "2026-10-02", "two")
+        self.app.follow_up("A", "2026-10-01", "one")
+        self.app.follow_up("A", "2026-10-03", "three")
+        self.app.follow_up("B", "2026-10-05", "b two")
+        self.app.follow_up("B", "2026-10-04", "b one")
+        self.app.follow_up("B", "2026-10-06", "b three")
+        # Input order is deliberately scrambled; indices name the pre-call
+        # timelines: A [one, two, three], B [b one, b two, b three].
+        result = self.app.correct_followups([
+            {"contact_id": "A", "index": 2, "expected_on": "2026-10-03",
+             "expected_note": "three", "changes": {"note": "three fixed"}},
+            {"contact_id": "B", "index": 1, "expected_on": "2026-10-05",
+             "expected_note": "b two", "changes": {"on": "2026-10-03"}},
+            {"contact_id": "A", "index": 1, "expected_on": "2026-10-02",
+             "expected_note": "two", "changes": {"on": "2026-10-04"}},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-04",
+             "expected_note": "b one", "changes": {"on": "2026-10-07"}},
+        ])
+        self.assertEqual([(r["on"], r["note"]) for r in result], [
+            ("2026-10-03", "three fixed"),
+            ("2026-10-03", "b two"),
+            ("2026-10-04", "two"),
+            ("2026-10-07", "b one"),
+        ])
+        # b two moving before b one and two moving after three never shift the
+        # records the other items address: positions were fixed before mutation.
+        self.assertEqual([(r["on"], r["note"]) for r in ContactFlow(self.root).timeline("A")],
+                         [("2026-10-01", "one"), ("2026-10-03", "three fixed"),
+                          ("2026-10-04", "two")])
+        self.assertEqual([(r["on"], r["note"]) for r in ContactFlow(self.root).timeline("B")],
+                         [("2026-10-03", "b two"), ("2026-10-06", "b three"),
+                          ("2026-10-07", "b one")])
+
+    def test_correct_followups_date_and_note_normalization(self):
+        self.seed_corrections()
+        # Legal leap day, distant past and future are accepted; outer whitespace
+        # trims while the real-date round trip is the only date normalization.
+        result = self.app.correct_followups([
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a one", "changes": {"on": "  2024-02-29  "}},
+            {"contact_id": "A", "index": 1, "expected_on": "2026-10-02",
+             "expected_note": "a day two later save", "changes": {"on": "2000-01-01"}},
+            {"contact_id": "A", "index": 2, "expected_on": "2026-10-02",
+             "expected_note": "a day two earlier save", "changes": {"on": "2099-12-31"}},
+        ])
+        self.assertEqual([r["on"] for r in result],
+                         ["2024-02-29", "2000-01-01", "2099-12-31"])
+        # Notes trim only the ends; internal spaces, tabs and newlines survive.
+        noted = self.app.correct_followups([
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "b first",
+             "changes": {"note": "  line 1\n  line 2\t "}}])[0]
+        self.assertEqual(noted, {"contact_id": "B", "on": "2026-10-01",
+                                 "note": "line 1\n  line 2"})
+
+    def test_correct_followups_requires_list_and_missing_argument_is_type_error(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        for bad in [None, {}, {"corrections": []}, "x", 5, True,
+                    ({"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                      "expected_note": "a one", "changes": {"note": "x"}},)]:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups(bad)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.correct_followups()
+
+    def test_correct_followups_empty_and_noop_write_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.correct_followups([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.correct_followups([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Normalized values equal to the stored ones are a no-op: the current
+        # record comes back even though the input carried surrounding spaces.
+        result = self.app.correct_followups([
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a one",
+             "changes": {"on": " 2026-10-01 ", "note": " a one "}},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "b first", "changes": {"note": "b first"}},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "on": "2026-10-01", "note": "a one"},
+            {"contact_id": "B", "on": "2026-10-01", "note": "b first"},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_followups_validates_item_shape_and_fields_without_partial_changes(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        good_expected = {"expected_on": "2026-10-01", "expected_note": "a one"}
+        bad_batches = [
+            [None], [5], ["x"], [[]], [{}],
+            [{"contact_id": "A", "index": 0, **good_expected}],
+            [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+              "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_note": "a one",
+              "changes": {"note": "x"}}],
+            [{"index": 0, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, **good_expected,
+              "changes": {"note": "x"}, "extra": 1}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": None}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": []}],
+            [{"contact_id": "A", "index": 0, **good_expected,
+              "changes": {"stage": "x"}}],
+            [{"contact_id": "", "index": 0, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "   ", "index": 0, **good_expected,
+              "changes": {"note": "x"}}],
+            [{"contact_id": 5, "index": 0, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": -1, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 1.0, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": "0", **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": True, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": False, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": None, **good_expected, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_on": None,
+              "expected_note": "a one", "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_on": 5,
+              "expected_note": "a one", "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": None, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": 4, "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": None}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": 5}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "2026-1-1"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "20261001"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "2026-13-01"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "2023-02-29"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "not-a-date"}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"on": "   "}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"note": None}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"note": 5}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"note": ""}}],
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"note": "   "}}],
+            # A valid first item followed by an invalid second item rolls both back.
+            [{"contact_id": "A", "index": 0, **good_expected, "changes": {"note": "never saved"}},
+             {"contact_id": "A", "index": 1, **good_expected, "changes": {"on": "bad"}}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_followups_rejects_unknown_out_of_range_expected_and_duplicate(self):
+        self.seed_corrections()
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")  # no followups
+        before = self.app.path.read_bytes()
+        # Unknown contacts, including a case-sensitive miss, reject the batch.
+        for contact_id in ["Z", "a"]:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups([
+                    {"contact_id": contact_id, "index": 0, "expected_on": "2026-10-01",
+                     "expected_note": "a one", "changes": {"note": "x"}}])
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # A nonempty batch against an empty store rejects and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.correct_followups([
+                {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "a one", "changes": {"note": "x"}}])
+        self.assertFalse(fresh_root.exists())
+        # Out of range: past the end and a contact whose timeline is empty.
+        for contact_id, index in [("A", 5), ("C", 0)]:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups([
+                    {"contact_id": contact_id, "index": index,
+                     "expected_on": "2026-10-01", "expected_note": "a one",
+                     "changes": {"note": "x"}}])
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Expected values pin the record verbatim: strings only, compared
+        # exactly with no trimming or other normalization.
+        mismatches = [
+            {"expected_on": "2026-10-02", "expected_note": "a one"},
+            {"expected_on": "2026-10-01", "expected_note": "a two"},
+            {"expected_on": " 2026-10-01 ", "expected_note": "a one"},
+            {"expected_on": "2026-10-01", "expected_note": " a one"},
+            {"expected_on": "2026-10-01", "expected_note": "a one\n"},
+        ]
+        for expected in mismatches:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups([
+                    {"contact_id": "A", "index": 0, **expected,
+                     "changes": {"note": "x"}}])
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # The same timeline position of one normalized contact appears once;
+        # trimming and an identical item still count as a repeat.
+        for batch in [
+                [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                  "expected_note": "a one", "changes": {"note": "x"}},
+                 {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                  "expected_note": "a one", "changes": {"on": "2026-10-05"}}],
+                [{"contact_id": " A ", "index": 0, "expected_on": "2026-10-01",
+                  "expected_note": "a one", "changes": {"note": "x"}},
+                 {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                  "expected_note": "a one", "changes": {"note": "y"}}]]:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Different positions with identical content (f5 and f6) are not a repeat.
+        ok = self.app.correct_followups([
+            {"contact_id": "A", "index": 2, "expected_on": "2026-10-02",
+             "expected_note": "a day two earlier save", "changes": {"note": "first copy"}},
+            {"contact_id": "A", "index": 3, "expected_on": "2026-10-02",
+             "expected_note": "a day two earlier save", "changes": {"note": "second copy"}},
+        ])
+        self.assertEqual([r["note"] for r in ok], ["first copy", "second copy"])
+
+    def test_correct_followups_is_atomic_when_a_later_item_fails(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        batches = [
+            [{"contact_id": "A", "index": 3, "expected_on": "2026-10-02",
+              "expected_note": "a day two earlier save",
+              "changes": {"note": "never saved"}},
+             {"contact_id": "A", "index": 9, "expected_on": "2026-10-03",
+              "expected_note": "a day three", "changes": {"note": "x"}}],
+            [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": "a one", "changes": {"note": "never saved"}},
+             {"contact_id": "Z", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": "x", "changes": {"note": "y"}}],
+            [{"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": "b first", "changes": {"note": "never saved"}},
+             {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+              "expected_note": "b first", "changes": {"on": "2026-02-30"}}],
+        ]
+        for batch in batches:
+            with self.assertRaises(ValueError):
+                self.app.correct_followups(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Nothing from the rejected first items landed in any timeline.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([r["note"] for r in reopened.timeline("A")],
+                         ["a one", "a day two later save", "a day two earlier save",
+                          "a day two earlier save", "a day three"])
+        self.assertEqual(reopened.timeline("B")[0]["note"], "b first")
+
+    def test_correct_followups_on_legacy_data_without_followups(self):
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"A": {"contact_id": "A", "name": "Alice",
+                                "email": "alice@example.test", "organization": "Books"}}}),
+            encoding="utf-8")
+        raw = (legacy_root / "data.json").read_bytes()
+        legacy = ContactFlow(legacy_root)
+        # An empty batch stays quiet and does not add a followups collection.
+        self.assertEqual(legacy.correct_followups([]), [])
+        self.assertEqual((legacy_root / "data.json").read_bytes(), raw)
+        # Old data without the followups collection reads as an empty timeline.
+        with self.assertRaises(ValueError):
+            legacy.correct_followups([
+                {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "a one", "changes": {"note": "x"}}])
+        self.assertEqual((legacy_root / "data.json").read_bytes(), raw)
+
+    def test_correct_followups_recomputes_queries_and_preserves_other_data(self):
+        self.seed_corrections()
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")  # never followed up
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", "2026-09-01")
+        self.app.set_opportunity_amount("O1", "8.00")
+        self.app.set_reminder("A", "2026-12-01", "ring")
+        result = self.app.correct_followups([
+            {"contact_id": "A", "index": 4, "expected_on": "2026-10-03",
+             "expected_note": "a day three", "changes": {"on": " 2026-10-10 "}},
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a one", "changes": {"note": "first updated"}},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "b first",
+             "changes": {"on": "2026-10-09", "note": "b moved"}},
+        ])
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in result], [
+            ("A", "2026-10-10", "a day three"),
+            ("A", "2026-10-01", "first updated"),
+            ("B", "2026-10-09", "b moved"),
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")], [
+            ("2026-10-01", "first updated"),
+            ("2026-10-02", "a day two later save"),
+            ("2026-10-02", "a day two earlier save"),
+            ("2026-10-02", "a day two earlier save"),
+            ("2026-10-10", "a day three"),
+        ])
+        # The followup report orders by date then contact id, ties keeping save
+        # order; B's corrected 10-09 entry lands between A's 10-02 and 10-10.
+        report = reopened.followup_report("2026-10-01", "2026-10-31")
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in report["records"]], [
+            ("A", "2026-10-01", "first updated"),
+            ("A", "2026-10-02", "a day two later save"),
+            ("A", "2026-10-02", "a day two earlier save"),
+            ("A", "2026-10-02", "a day two earlier save"),
+            ("B", "2026-10-09", "b moved"),
+            ("A", "2026-10-10", "a day three"),
+        ])
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["contact_id", "name", "email", "organization", "on", "note"])
+        self.assertEqual([dict(zip(rows[0], row)) for row in rows[1:]], report["records"])
+        # Inactive contacts use the corrected latest record and recompute the gap:
+        # never-followed C first, then B idle 11 days and A idle 10.
+        inactive = reopened.inactive_contacts("2026-10-20", 5)
+        self.assertEqual([row["contact"]["contact_id"] for row in inactive], ["C", "B", "A"])
+        self.assertEqual((inactive[0]["last_followup"], inactive[0]["idle_days"]), (None, None))
+        self.assertEqual((inactive[1]["last_followup"]["on"], inactive[1]["last_followup"]["note"],
+                          inactive[1]["idle_days"]), ("2026-10-09", "b moved", 11))
+        self.assertEqual((inactive[2]["last_followup"]["on"], inactive[2]["last_followup"]["note"],
+                          inactive[2]["idle_days"]), ("2026-10-10", "a day three", 10))
+        # Tags, opportunities, stage history, amounts and reminders stay intact.
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.stage_history("O1"),
+                         [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"}])
+        self.assertEqual(reopened.find_opportunities()[0]["amount"], "8.00")
+        self.assertEqual(reopened.due_reminders("2026-12-01"),
+                         [{"contact_id": "A", "due_on": "2026-12-01", "note": "ring"}])
+        # Duplicate count and same-day save order survive the correction.
+        same_day = [r["note"] for r in reopened.timeline("A") if r["on"] == "2026-10-02"]
+        self.assertEqual(same_day, ["a day two later save", "a day two earlier save",
+                                    "a day two earlier save"])
+
+    def test_cli_correct_followups_object_array_and_failure(self):
+        self.seed_corrections()
+        payload = self.root / "corrections.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "correct-followups", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"corrections": [
+            {"contact_id": " A ", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a one", "changes": {"on": " 2026-10-02 "}},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "b first", "changes": {"note": " b corrected "}},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "on": "2026-10-02", "note": "a one"},
+            {"contact_id": "B", "on": "2026-10-01", "note": "b corrected"},
+        ])
+        self.assertEqual(ContactFlow(self.root).timeline("B")[0]["note"], "b corrected")
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"corrections": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"corrections": [
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-09",
+             "expected_note": "a one", "changes": {"note": "never"}},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError in the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # corrections must be a list.
+        not_list = cli({"corrections": {"contact_id": "A", "index": 0}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"corrections": [
+            {"contact_id": "ZZZ", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "x", "changes": {"note": "y"}}]}, root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_correct_followups_outer_array_keeps_earlier_batches(self):
+        self.seed_corrections()
+        payload = self.root / "batches.json"
+        # Each outer row is an independent call: the second row only matches
+        # because its expected note is the state after the first row succeeded,
+        # and a third failed row must not erase either committed row.
+        payload.write_text(json.dumps([
+            {"corrections": [
+                {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "a one", "changes": {"note": "renamed"}}]},
+            {"corrections": [
+                {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "renamed", "changes": {"note": "final"}}]},
+            {"corrections": [
+                {"contact_id": "ZZZ", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "x", "changes": {"note": "y"}}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "correct-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        # "final" proves row two ran against row one's committed state; the
+        # failed row three left both earlier batches intact.
+        self.assertEqual(ContactFlow(self.root).timeline("A")[0],
+                         {"contact_id": "A", "on": "2026-10-01", "note": "final"})
+
 if __name__ == "__main__":
     unittest.main()
