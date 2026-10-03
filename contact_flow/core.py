@@ -418,6 +418,96 @@ class ContactFlow(JsonStore):
             self._write(data)
         return imported
 
+    def preview_contact_import(self, csv_path):
+        # Read-only dry run of import_contacts: same path, encoding, header,
+        # quoting and field normalization rules, but row problems are collected
+        # instead of aborting and nothing is registered, written or created.
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if len(header) != len(CONTACT_FIELDS) or set(header) != set(CONTACT_FIELDS) or len(set(header)) != len(header):
+            raise ValueError("CSV header must contain exactly contact_id,name,email,organization in any order")
+
+        data = self._read()
+        # Old data without a contacts collection checks against an empty store.
+        contacts = data.get("contacts", {})
+        existing_emails = {c["email"] for c in contacts.values()}
+
+        # Logical records after the header number from 1; quoted newlines stay
+        # inside one record and zero-field blank lines take no number.
+        parsed = []
+        errors = []
+        try:
+            number = 0
+            for row in rows:
+                if not row:
+                    continue
+                number += 1
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                normalized = {}
+                invalid = set()
+                for field in CONTACT_FIELDS:
+                    try:
+                        clean = text(values[field], field)
+                        if field == "email":
+                            clean = clean.lower()
+                            if (clean.count("@") != 1 or any(c.isspace() for c in clean)
+                                    or not all(clean.split("@"))):
+                                raise ValueError("invalid email")
+                        normalized[field] = clean
+                    except ValueError:
+                        invalid.add(field)
+                for field in sorted(invalid):
+                    errors.append({"row": number, "field": field, "code": "invalid"})
+                parsed.append((number, normalized, invalid))
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        # A valid id or email is checked against the store and the batch even
+        # when the row's other fields are invalid; every row sharing a
+        # duplicated value reports, not just the later ones.
+        id_rows = {}
+        email_rows = {}
+        for number, normalized, invalid in parsed:
+            if "contact_id" not in invalid:
+                id_rows.setdefault(normalized["contact_id"], []).append(number)
+            if "email" not in invalid:
+                email_rows.setdefault(normalized["email"], []).append(number)
+        for number, normalized, invalid in parsed:
+            if "contact_id" not in invalid:
+                contact_id = normalized["contact_id"]
+                if contact_id in contacts:
+                    errors.append({"row": number, "field": "contact_id", "code": "existing"})
+                if len(id_rows[contact_id]) > 1:
+                    errors.append({"row": number, "field": "contact_id", "code": "duplicate"})
+            if "email" not in invalid:
+                email = normalized["email"]
+                if email in existing_emails:
+                    errors.append({"row": number, "field": "email", "code": "existing"})
+                if len(email_rows[email]) > 1:
+                    errors.append({"row": number, "field": "email", "code": "duplicate"})
+        errors.sort(key=lambda error: (error["row"], error["field"], error["code"]))
+
+        failed = {error["row"] for error in errors}
+        records = [{"row": number,
+                    "contact": {"contact_id": normalized["contact_id"], "name": normalized["name"],
+                                "email": normalized["email"], "organization": normalized["organization"]}}
+                   for number, normalized, invalid in parsed if number not in failed]
+        return {"can_import": not errors, "records": records, "errors": errors}
+
     def import_followups(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():
             raise ValueError("csv_path must be a nonempty string")
