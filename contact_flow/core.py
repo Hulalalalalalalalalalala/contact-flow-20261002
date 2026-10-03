@@ -24,18 +24,19 @@ def forecast_probability(value, label):
         raise ValueError(label + " must be between 0 and 100")
     return hundredths
 
+def normalize_tag(value):
+    # One tag follows the set-tags rule: trim, casefold, keep inner whitespace.
+    if not isinstance(value, str):
+        raise ValueError("each tag must be a string")
+    tag = value.strip().casefold()
+    if not tag:
+        raise ValueError("tags must be nonempty strings")
+    return tag
+
 def normalize_tags(value):
     if not isinstance(value, list):
         raise ValueError("tags must be a list")
-    tags = set()
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError("each tag must be a string")
-        tag = item.strip().casefold()
-        if not tag:
-            raise ValueError("tags must be nonempty strings")
-        tags.add(tag)
-    return sorted(tags)
+    return sorted({normalize_tag(item) for item in value})
 
 def _scan_json_string(expression, start):
     # A tag is one JSON double-quoted string; operators and parentheses inside
@@ -796,6 +797,63 @@ class ContactFlow(JsonStore):
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
         return list(data.get("tags", {}).get(contact_id, []))
+
+    def rename_tags(self, renames):
+        # Rename tags across every contact in one batch. The whole batch
+        # validates against the pre-call tag sets before any tag changes, so a
+        # rejected batch never touches storage; every rename commits in a
+        # single write.
+        if not isinstance(renames, list):
+            raise ValueError("renames must be a list")
+        if not renames:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in renames:
+            if not isinstance(item, dict) or set(item) != {"old_tag", "new_tag"}:
+                raise ValueError("each rename must be an object with exactly old_tag and new_tag")
+            old_tag = normalize_tag(item["old_tag"])
+            new_tag = normalize_tag(item["new_tag"])
+            # Normalized source names are casefolded; a repeated source (even an
+            # identical item) rejects the whole batch. Targets repeat freely, so
+            # several sources may merge into one name.
+            if old_tag in seen:
+                raise ValueError("duplicate old tag in renames")
+            seen.add(old_tag)
+            entries.append((old_tag, new_tag))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        # Every source tag must be used by at least one existing contact before
+        # the call; a missing tags collection (old data) reads as the empty set.
+        in_use = {tag for contact_id, tags in tag_store.items()
+                  if contact_id in contacts for tag in tags}
+        for old_tag, _ in entries:
+            if old_tag not in in_use:
+                raise ValueError("unknown tag")
+        mapping = dict(entries)
+        # Renames apply simultaneously against the pre-call sets: each original
+        # tag is replaced at most once and targets are never re-renamed, so
+        # identity renames, swaps and cycles land on the same final state
+        # regardless of input order.
+        changed = []
+        for contact_id in sorted(tag_store):
+            if contact_id not in contacts:
+                continue
+            tags = tag_store[contact_id]
+            renamed = sorted({mapping.get(tag, tag) for tag in tags})
+            if set(renamed) != set(tags):
+                changed.append((contact_id, renamed))
+        if not changed:
+            # No contact's set actually changes: report [] without rewriting.
+            return []
+        for contact_id, renamed in changed:
+            tag_store[contact_id] = renamed
+        self._write(data)
+        # Only contacts whose set changed are reported, ids and tags both in
+        # ascending code point order.
+        return [{"contact_id": contact_id, "tags": tags} for contact_id, tags in changed]
 
     def add_opportunity(self, opportunity_id, contact_id, title):
         opportunity_id = text(opportunity_id, "opportunity_id")

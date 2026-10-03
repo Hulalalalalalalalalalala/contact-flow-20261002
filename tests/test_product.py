@@ -2478,6 +2478,250 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(sorted(by_id), ["A-2", "B"])
         self.assertEqual(by_id["A-2"]["name"], "Alice")
 
+    def test_rename_tags_returns_changed_contacts_sorted_and_normalized(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("b", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        self.app.set_tags("A", [" VIP ", "华东"])
+        self.app.set_tags("b", ["vip", "north"])
+        self.app.set_tags("C", ["other"])
+        # Names trim and casefold like set-tags; inner whitespace is kept.
+        result = self.app.rename_tags([{"old_tag": " VIP ", "new_tag": " Lead  Tag "}])
+        # Only contacts whose set changed are reported, ids ascending by code
+        # point ("C" < "b" is irrelevant here: C is untouched), tags sorted.
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["lead  tag", "华东"]},
+            {"contact_id": "b", "tags": ["lead  tag", "north"]},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["lead  tag", "华东"])
+        self.assertEqual(reopened.get_tags("b"), ["lead  tag", "north"])
+        self.assertEqual(reopened.get_tags("C"), ["other"])
+
+    def test_rename_tags_applies_simultaneously_chain_merge_swap_cycle(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        self.app.set_tags("A", ["a"])
+        self.app.set_tags("B", ["a", "b"])
+        self.app.set_tags("C", ["c"])
+        # a->b and b->c resolve against the pre-call sets: A gets b, B gets b
+        # and c (the new b is not renamed again), C keeps c and drops out of
+        # the result because its set is unchanged.
+        result = self.app.rename_tags([{"old_tag": "a", "new_tag": "b"},
+                                       {"old_tag": "b", "new_tag": "c"}])
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["b"]},
+            {"contact_id": "B", "tags": ["b", "c"]},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["b"])
+        self.assertEqual(reopened.get_tags("B"), ["b", "c"])
+        self.assertEqual(reopened.get_tags("C"), ["c"])
+        # Several sources may merge into one existing or new target name.
+        merged = self.app.rename_tags([{"old_tag": "b", "new_tag": "c"},
+                                       {"old_tag": "c", "new_tag": "c"}])
+        self.assertEqual(merged, [
+            {"contact_id": "A", "tags": ["c"]},
+            {"contact_id": "B", "tags": ["c"]},
+        ])
+        self.assertEqual(ContactFlow(self.root).get_tags("C"), ["c"])
+        # Swap and cycle among three tags.
+        self.app.set_tags("A", ["x"])
+        self.app.set_tags("B", ["y"])
+        self.app.set_tags("C", ["z"])
+        self.app.rename_tags([{"old_tag": "x", "new_tag": "y"},
+                              {"old_tag": "y", "new_tag": "z"},
+                              {"old_tag": "z", "new_tag": "x"}])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["y"])
+        self.assertEqual(reopened.get_tags("B"), ["z"])
+        self.assertEqual(reopened.get_tags("C"), ["x"])
+
+    def test_rename_tags_requires_list_and_empty_list_writes_nothing(self):
+        for bad in [None, {}, "vip", 5, True, {"old_tag": "a", "new_tag": "b"}]:
+            with self.assertRaises(ValueError):
+                self.app.rename_tags(bad)
+        with self.assertRaises(TypeError):
+            self.app.rename_tags()
+        # An empty batch on a fresh root creates neither directory nor file.
+        fresh = ContactFlow(self.root / "fresh")
+        self.assertEqual(fresh.rename_tags([]), [])
+        self.assertFalse((self.root / "fresh").exists())
+        self.assertEqual(self.app.rename_tags([]), [])
+        self.assertFalse(self.app.path.exists())
+
+    def test_rename_tags_validates_items_without_partial_changes(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            [None], [["old_tag", "new_tag"]], ["rename"], [5], [True],
+            [{}],
+            [{"old_tag": "vip"}],
+            [{"new_tag": "lead"}],
+            [{"old_tag": "vip", "new_tag": "lead", "extra": 1}],
+            [{"old_tag": "", "new_tag": "lead"}],
+            [{"old_tag": "   ", "new_tag": "lead"}],
+            [{"old_tag": None, "new_tag": "lead"}],
+            [{"old_tag": 5, "new_tag": "lead"}],
+            [{"old_tag": ["vip"], "new_tag": "lead"}],
+            [{"old_tag": "vip", "new_tag": ""}],
+            [{"old_tag": "vip", "new_tag": "   "}],
+            [{"old_tag": "vip", "new_tag": None}],
+            [{"old_tag": "vip", "new_tag": 5}],
+            # The source tag is not used by any existing contact.
+            [{"old_tag": "ghost", "new_tag": "lead"}],
+            [{"old_tag": "vip", "new_tag": "lead"}, {"old_tag": "ghost", "new_tag": "x"}],
+            # Normalized source names repeat within the batch, even identical items.
+            [{"old_tag": "vip", "new_tag": "lead"}, {"old_tag": " VIP ", "new_tag": "other"}],
+            [{"old_tag": "vip", "new_tag": "lead"}, {"old_tag": "vip", "new_tag": "lead"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.rename_tags(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Unknown source tag against a missing data file creates nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.rename_tags([{"old_tag": "vip", "new_tag": "lead"}])
+        self.assertFalse((self.root / "fresh").exists())
+
+    def test_rename_tags_noop_batch_returns_empty_without_rewrite(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        before = self.app.path.read_bytes()
+        # Identity rename: every final set equals its pre-call set.
+        self.assertEqual(self.app.rename_tags([{"old_tag": " VIP ", "new_tag": "vip"}]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Renaming to a name the contact already has can still be a no-op for
+        # some contacts; only genuinely changed sets are reported and written.
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("B", ["lead"])
+        before = self.app.path.read_bytes()
+        result = self.app.rename_tags([{"old_tag": "vip", "new_tag": "lead"}])
+        self.assertEqual(result, [{"contact_id": "A", "tags": ["lead", "华东"]}])
+        self.assertNotEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).get_tags("B"), ["lead"])
+
+    def test_rename_tags_legacy_data_without_tags_collection(self):
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        legacy_root.joinpath("data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        before = legacy.path.read_bytes()
+        # A missing tags collection reads as the empty set, so every source is unknown.
+        with self.assertRaises(ValueError):
+            legacy.rename_tags([{"old_tag": "vip", "new_tag": "lead"}])
+        self.assertEqual(legacy.path.read_bytes(), before)
+        self.assertEqual(legacy.rename_tags([]), [])
+        self.assertEqual(legacy.path.read_bytes(), before)
+
+    def test_rename_tags_preserves_everything_else_and_recomputes_queries(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.follow_up("A", "2026-10-01", "first")
+        self.app.add_opportunity("O1", "A", "Deal one")
+        self.app.set_stage("O1", "qualified", on="2026-09-01")
+        self.app.set_stage("O1", "won", on="2026-09-15")
+        self.app.set_opportunity_amount("O1", "100.5")
+        self.app.set_reminder("A", "2026-11-05", "call back", repeat_monthly=True)
+        before_funnel = self.app.funnel_report()
+        before_amounts = self.app.opportunity_amount_report()
+        result = self.app.rename_tags([{"old_tag": "vip", "new_tag": "lead"}])
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["lead", "华东"]},
+            {"contact_id": "B", "tags": ["lead"]},
+        ])
+        reopened = ContactFlow(self.root)
+        # The new name drives get-tags, find conditions, expressions and reports.
+        self.assertEqual(reopened.get_tags("A"), ["lead", "华东"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["lead"])], ["A", "B"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='"lead" && !"华东"')], ["B"])
+        self.assertEqual(reopened.funnel_report(tags=["lead"])["total"]["contacts"], 2)
+        self.assertEqual(reopened.followup_report("2026-01-01", "2026-12-31",
+                                                  tags=["lead"])["records"][0]["contact_id"], "A")
+        # The old name keeps its literal meaning: no alias, no rewritten expression.
+        self.assertEqual(reopened.find(tags=["vip"]), [])
+        self.assertEqual(reopened.find(tag_expression='"vip"'), [])
+        self.assertEqual(reopened.funnel_report(tags=["vip"])["total"]["contacts"], 0)
+        # Unfiltered reports, profiles, followups, opportunities, history,
+        # amounts and reminders keep their values.
+        self.assertEqual(reopened.funnel_report(), before_funnel)
+        self.assertEqual(reopened.opportunity_amount_report(), before_amounts)
+        self.assertEqual(reopened.find()[0],
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+        self.assertEqual(reopened.timeline("A"), [{"contact_id": "A", "on": "2026-10-01", "note": "first"}])
+        self.assertEqual(reopened.find_opportunities(contact_id="A"), [
+            {"opportunity_id": "O1", "contact_id": "A", "title": "Deal one",
+             "stage": "won", "amount": "100.50"}])
+        self.assertEqual(reopened.stage_history("O1"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-15"},
+        ])
+        self.assertEqual(reopened.due_reminders("2099-01-01"), [
+            {"contact_id": "A", "due_on": "2026-11-05", "note": "call back",
+             "repeat_monthly": True, "anchor_day": 5}])
+
+    def test_cli_rename_tags_success_failure_and_outer_array(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip"])
+        self.app.set_tags("B", ["vip", "north"])
+        payload = self.root / "renames.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "rename-tags", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"renames": [{"old_tag": " VIP ", "new_tag": " Lead "}]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "tags": ["lead"]},
+            {"contact_id": "B", "tags": ["lead", "north"]},
+        ])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"renames": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"renames": [{"old_tag": "ghost", "new_tag": "x"}]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # renames must be a list.
+        not_list = cli({"renames": {"old_tag": "lead", "new_tag": "x"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # An outer array runs whole batches independently; a later failed batch
+        # keeps the earlier successful batch.
+        payload.write_text(json.dumps([
+            {"renames": [{"old_tag": "lead", "new_tag": "warm"}]},
+            {"renames": [{"old_tag": "ghost", "new_tag": "x"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "rename-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["warm"])
+
     def seed_followups(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "books")
