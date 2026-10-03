@@ -797,6 +797,67 @@ class ContactFlow(JsonStore):
             raise ValueError("unknown contact")
         return list(data.get("tags", {}).get(contact_id, []))
 
+    def rename_tags(self, renames):
+        # Rename a tag across every contact at once. The whole batch validates
+        # against the pre-call tag sets before any tag changes, so a rejected
+        # batch never touches storage; every rename commits in a single write.
+        if not isinstance(renames, list):
+            raise ValueError("renames must be a list")
+        if not renames:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        old_seen = set()
+        for item in renames:
+            if not isinstance(item, dict) or set(item) != {"old_tag", "new_tag"}:
+                raise ValueError("each rename must be an object with exactly old_tag and new_tag")
+            # Both names reuse the set-tags rule exactly: trim, casefold, keep
+            # inner whitespace, and reject blank ones.
+            old_value, new_value = item["old_tag"], item["new_tag"]
+            if not isinstance(old_value, str) or not isinstance(new_value, str):
+                raise ValueError("each tag must be a string")
+            old_tag = old_value.strip().casefold()
+            new_tag = new_value.strip().casefold()
+            if not old_tag or not new_tag:
+                raise ValueError("tags must be nonempty strings")
+            # A repeated normalized source rejects the whole batch, even when
+            # the two items are identical. Several sources may rename to the
+            # same new tag, merging their contacts' sets together.
+            if old_tag in old_seen:
+                raise ValueError("duplicate old tag in renames")
+            old_seen.add(old_tag)
+            entries.append((old_tag, new_tag))
+        data = self._read()
+        tag_store = data.get("tags", {})
+        used = {tag for tags in tag_store.values() for tag in tags}
+        # Every source must be in use by at least one contact before the call;
+        # old data without a tags collection reads as the empty set, so any
+        # nonempty batch raises there instead of creating the data file.
+        for old_tag, _ in entries:
+            if old_tag not in used:
+                raise ValueError("unknown tag")
+        mapping = dict(entries)
+        # Renames apply simultaneously against the pre-call sets: each original
+        # tag is replaced at most once, so chains, swaps, cycles, merges into an
+        # already-present target and same-name renames all land on one final
+        # state regardless of item order.
+        results = []
+        renamed_store = dict(tag_store)
+        for contact_id, tags in tag_store.items():
+            current = set(tags)
+            updated = {mapping.get(tag, tag) for tag in current}
+            if updated != current:
+                renamed_store[contact_id] = sorted(updated)
+                results.append({"contact_id": contact_id, "tags": sorted(updated)})
+        if not results:
+            # Every final tag set already matched the pre-call one: report
+            # nothing without rewriting the file.
+            return []
+        results.sort(key=lambda row: row["contact_id"])
+        data["tags"] = renamed_store
+        self._write(data)
+        return results
+
     def add_opportunity(self, opportunity_id, contact_id, title):
         opportunity_id = text(opportunity_id, "opportunity_id")
         title = text(title, "title")

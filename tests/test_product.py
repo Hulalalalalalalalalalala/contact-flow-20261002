@@ -2478,6 +2478,236 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(sorted(by_id), ["A-2", "B"])
         self.assertEqual(by_id["A-2"]["name"], "Alice")
 
+    def test_rename_tags_applies_simultaneously_and_reports_changed_only(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_tags("A", ["a"])
+        self.app.set_tags("B", ["a", "b"])
+        # C carries a tag untouched by the batch and must never be reported.
+        self.app.set_tags("C", ["z"])
+        result = self.app.rename_tags([
+            {"old_tag": "a", "new_tag": "b"},
+            {"old_tag": "b", "new_tag": "c"},
+        ])
+        # Each original tag is replaced once against the pre-call sets: the
+        # contact with only a gets b; the one with a and b gets b and c.
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["b"]},
+            {"contact_id": "B", "tags": ["b", "c"]},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["b"])
+        self.assertEqual(reopened.get_tags("B"), ["b", "c"])
+        self.assertEqual(reopened.get_tags("C"), ["z"])
+
+    def test_rename_tags_swaps_cycles_merges_and_existing_targets(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_tags("A", ["a"])
+        self.app.set_tags("B", ["b"])
+        self.app.set_tags("C", ["a", "b"])
+        # Swap two names simultaneously.
+        self.assertEqual(self.app.rename_tags([
+            {"old_tag": "a", "new_tag": "b"},
+            {"old_tag": "b", "new_tag": "a"},
+        ]), [
+            {"contact_id": "A", "tags": ["b"]},
+            {"contact_id": "B", "tags": ["a"]},
+        ])
+        # C had both names, so the swap leaves its set unchanged and excludes it.
+        self.assertEqual(ContactFlow(self.root).get_tags("C"), ["a", "b"])
+        # Several sources merge into one name that is itself already present.
+        merged = ContactFlow(self.root)
+        merged.set_tags("A", ["m", "n", "t"])
+        self.assertEqual(merged.rename_tags([
+            {"old_tag": "m", "new_tag": "t"},
+            {"old_tag": "n", "new_tag": "t"},
+        ]), [{"contact_id": "A", "tags": ["t"]}])
+        # A same-name rename is a no-op: empty result, no rewrite.
+        before = merged.path.read_bytes()
+        self.assertEqual(merged.rename_tags([{"old_tag": "t", "new_tag": "t"}]), [])
+        self.assertEqual(merged.path.read_bytes(), before)
+        # A chain landing everyone on their original sets is likewise a no-op:
+        # every contact carries either both swapped names or neither.
+        self.app.set_tags("A", ["a", "b"])
+        self.app.set_tags("B", ["a", "b"])
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.rename_tags([
+            {"old_tag": "a", "new_tag": "b"},
+            {"old_tag": "b", "new_tag": "a"},
+        ]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_rename_tags_normalizes_like_set_tags(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["vip level", "x"])
+        # Trim edges, casefold, keep inner whitespace.
+        result = self.app.rename_tags([
+            {"old_tag": "  VIP LEVEL ", "new_tag": " Top Tier "},
+        ])
+        self.assertEqual(result, [{"contact_id": "A", "tags": ["top tier", "x"]}])
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["top tier", "x"])
+        # Unicode code point order governs both contacts and tags.
+        other = ContactFlow(self.root / "other")
+        for contact_id in ("é", "a", "中"):
+            other.add_contact(contact_id, contact_id, contact_id + "@example.test", "O")
+            other.set_tags(contact_id, ["β", "α"])
+        rows = other.rename_tags([{"old_tag": "α", "new_tag": "γ"}])
+        self.assertEqual([row["contact_id"] for row in rows], ["a", "é", "中"])
+        self.assertTrue(all(row["tags"] == ["β", "γ"] for row in rows))
+
+    def test_rename_tags_validates_without_partial_changes(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_tags("A", ["a"])
+        self.app.set_tags("B", ["b"])
+        before = self.app.path.read_bytes()
+        for bad in (None, {}, "a", 5, True, {"old_tag": "a", "new_tag": "b"}):
+            with self.assertRaises(ValueError):
+                self.app.rename_tags(bad)
+        bad_batches = [
+            [None], [["a", "b"]], ["rename"], [5], [True], [{}],
+            [{"old_tag": "a"}],
+            [{"new_tag": "b"}],
+            [{"old_tag": "a", "new_tag": "b", "extra": 1}],
+            [{"old_tag": "", "new_tag": "b"}],
+            [{"old_tag": "   ", "new_tag": "b"}],
+            [{"old_tag": None, "new_tag": "b"}],
+            [{"old_tag": 5, "new_tag": "b"}],
+            [{"old_tag": "a", "new_tag": ""}],
+            [{"old_tag": "a", "new_tag": "   "}],
+            [{"old_tag": "a", "new_tag": None}],
+            [{"old_tag": "a", "new_tag": 5}],
+            # The source must be in use before the call.
+            [{"old_tag": "ghost", "new_tag": "b"}],
+            # Normalized source repeats within the batch, even when identical.
+            [{"old_tag": "a", "new_tag": "c"}, {"old_tag": " A ", "new_tag": "d"}],
+            [{"old_tag": "a", "new_tag": "c"}, {"old_tag": "a", "new_tag": "c"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.rename_tags(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.rename_tags()
+
+    def test_rename_tags_empty_or_unknown_creates_nothing(self):
+        fresh = ContactFlow(self.root / "fresh")
+        self.assertEqual(fresh.rename_tags([]), [])
+        self.assertFalse((self.root / "fresh").exists())
+        with self.assertRaises(ValueError):
+            fresh.rename_tags([{"old_tag": "a", "new_tag": "b"}])
+        self.assertFalse((self.root / "fresh").exists())
+        # Legacy document with contacts but no tags collection reads tags as
+        # empty, so any nonempty batch rejects without touching its bytes.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        legacy_path = legacy_root / "data.json"
+        legacy_path.write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        before = legacy_path.read_bytes()
+        with self.assertRaises(ValueError):
+            ContactFlow(legacy_root).rename_tags([{"old_tag": "a", "new_tag": "b"}])
+        self.assertEqual(legacy_path.read_bytes(), before)
+
+    def test_rename_tags_updates_queries_reports_and_leaves_other_data(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_tags("A", ["vip"])
+        self.app.follow_up("A", "2026-10-01", "a note")
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-09-01")
+        self.app.set_opportunity_amount("O1", "100.50")
+        self.app.set_reminder("A", "2026-11-05", "call back")
+        before_funnel = self.app.funnel_report()
+        before_amounts = self.app.opportunity_amount_report()
+        self.app.rename_tags([{"old_tag": "vip", "new_tag": "key"}])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["key"])
+        # Tag conditions and boolean expressions compute on the new sets...
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["key"])], ["A"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='"key" && !"vip"')], ["A"])
+        # ...while the old name still matches literally, with no alias stored.
+        self.assertEqual(reopened.find(tags=["vip"]), [])
+        self.assertEqual(reopened.find(tag_expression='"vip"'), [])
+        # A pure exclusion expression can still select the untagged contact.
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='!"key"')], ["B"])
+        # Unfiltered reports keep contact counts and money totals; tag-filtered
+        # reports answer under the new names.
+        self.assertEqual(reopened.funnel_report(), before_funnel)
+        self.assertEqual(reopened.opportunity_amount_report(), before_amounts)
+        self.assertEqual(
+            reopened.funnel_report(tags=["key"])["organizations"][0]["contacts"], 1)
+        self.assertEqual(reopened.funnel_report(tags=["vip"])["total"]["contacts"], 0)
+        # Profiles, followups, opportunities with history and amounts, and
+        # reminders keep their values.
+        self.assertEqual(reopened.timeline("A")[0]["note"], "a note")
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["amount"], "100.50")
+        self.assertEqual(reopened.stage_history("O1")[0]["to_stage"], "qualified")
+        self.assertEqual(reopened.due_reminders("2099-01-01")[0]["note"], "call back")
+
+    def test_cli_rename_tags_object_empty_array_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["a"])
+        self.app.set_tags("B", ["a", "b"])
+        payload = self.root / "renames.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "rename-tags", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"renames": [{"old_tag": " A ", "new_tag": " B "},
+                              {"old_tag": "b", "new_tag": "c"}]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "tags": ["b"]},
+            {"contact_id": "B", "tags": ["b", "c"]},
+        ])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"renames": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"renames": [{"old_tag": "ghost", "new_tag": "x"}]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # renames must be a list.
+        not_list = cli({"renames": {"old_tag": "b", "new_tag": "c"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+
+    def test_cli_rename_tags_outer_array_keeps_earlier_batches(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["a", "b"])
+        payload = self.root / "batches.json"
+        # An outer array runs whole batches independently; a later failed batch
+        # keeps the earlier successful one (unlike atomicity inside one list).
+        payload.write_text(json.dumps([
+            {"renames": [{"old_tag": "a", "new_tag": "c"}]},
+            {"renames": [{"old_tag": "ghost", "new_tag": "d"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "rename-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["b", "c"])
+
     def seed_followups(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "books")
