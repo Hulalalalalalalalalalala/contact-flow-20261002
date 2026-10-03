@@ -1242,6 +1242,68 @@ class ContactFlow(JsonStore):
             self._write(data)
         return {"opportunity_id": opportunity_id, "amount": amount}
 
+    def set_close_dates(self, updates):
+        # Maintain expected close dates on a batch of opportunities. The whole
+        # batch validates before any date changes, so a rejected item never
+        # leaves half the batch applied; every change commits in a single write.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != {"opportunity_id", "expected_close_on"}:
+                raise ValueError(
+                    "each update must be an object with exactly opportunity_id and expected_close_on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            # A JSON null clears the date; a provided date must be a trimmed real
+            # YYYY-MM-DD string (past, future and leap days allowed, no system clock).
+            on = item["expected_close_on"]
+            on = None if on is None else calendar_day(on, "expected_close_on")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even an
+            # identical item) rejects the whole batch.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in updates")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        planned = []
+        changed = False
+        for opportunity_id, on in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            # Terminal stages accept close dates too; clearing a date that was
+            # never set is a no-op like setting the value already stored.
+            if opportunity.get("expected_close_on") != on:
+                changed = True
+            planned.append((opportunity, on))
+        # Results are the complete opportunities in input order: a set date
+        # appears as expected_close_on, a cleared one drops the field, and a
+        # never-priced deal keeps no amount field.
+        results = []
+        for opportunity, on in planned:
+            result = dict(opportunity)
+            if on is None:
+                result.pop("expected_close_on", None)
+            else:
+                result["expected_close_on"] = on
+            results.append(result)
+        if not changed:
+            # Every item already matched the stored date: report the
+            # opportunities without rewriting the file.
+            return results
+        for opportunity, on in planned:
+            if on is None:
+                opportunity.pop("expected_close_on", None)
+            else:
+                opportunity["expected_close_on"] = on
+        self._write(data)
+        return results
+
     def find_opportunities(self, contact_id=None, stage=None):
         if contact_id is not None:
             contact_id = text(contact_id, "contact_id")
@@ -1786,11 +1848,25 @@ class ContactFlow(JsonStore):
 
     FORECAST_FIELDS = ("organization", "new", "qualified", "amount")
 
-    def forecast_report(self, probabilities, organization=None, tags=None, tag_mode="all"):
+    def forecast_report(self, probabilities, organization=None, tags=None, tag_mode="all",
+                        start_on=None, end_on=None):
         if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
             raise ValueError("probabilities must be an object containing exactly new and qualified")
         rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
                  for stage in ("new", "qualified")}
+        # Both dates omitted or null keeps the legacy unbounded behavior; a
+        # one-sided range, an invalid date or a backwards range rejects before
+        # any data is read, so a bad range fails even against an empty store.
+        if start_on is None and end_on is None:
+            close_range = None
+        else:
+            if start_on is None or end_on is None:
+                raise ValueError("start_on and end_on must be provided together")
+            start_on = calendar_day(start_on, "start_on")
+            end_on = calendar_day(end_on, "end_on")
+            if start_on > end_on:
+                raise ValueError("start_on must not be later than end_on")
+            close_range = (start_on, end_on)
         groups, scoped = self._organization_groups(organization, tags, tag_mode)
 
         # Weighted sums stay unrounded: amount cents times probability
@@ -1807,6 +1883,13 @@ class ContactFlow(JsonStore):
             # Only open opportunities count; won and lost never enter the forecast.
             if stage not in ("new", "qualified"):
                 continue
+            if close_range is not None:
+                # A bounded forecast counts only deals whose own expected close
+                # date falls inside the inclusive range; undated deals are
+                # excluded and stage-history dates are never borrowed.
+                close_on = opportunity.get("expected_close_on")
+                if close_on is None or not close_range[0] <= close_on <= close_range[1]:
+                    continue
             cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
             raw = cents * rates[stage]
             counts[key][stage] += raw

@@ -6126,5 +6126,281 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(reopened.timeline("B"),
                          [{"contact_id": "B", "on": "2026-10-02", "note": "b corrected"}])
 
+    def seed_close_date_deals(self):
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        self.app.add_contact("B", "Bob", "bob@example.test", "Music")
+        # O1 new with an amount; O2 qualified, never priced; O3 won (terminal).
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.set_opportunity_amount("O1", "100.00")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified", "2026-09-01")
+        self.app.set_opportunity_amount("O2", "200.00")
+        self.app.add_opportunity("O3", "B", "Third")
+        self.app.set_stage("O3", "qualified", "2026-09-10")
+        self.app.set_stage("O3", "won", "2026-09-20")
+
+    def test_set_close_dates_sets_clears_and_returns_full_opportunities_in_order(self):
+        self.seed_close_date_deals()
+        result = self.app.set_close_dates([
+            {"opportunity_id": " O2 ", "expected_close_on": " 2026-11-15 "},
+            {"opportunity_id": "O3", "expected_close_on": "2024-02-29"},  # terminal, past leap day
+            {"opportunity_id": "O1", "expected_close_on": "2027-01-01"},
+        ])
+        self.assertEqual([row["opportunity_id"] for row in result], ["O2", "O3", "O1"])
+        self.assertEqual(result[0], {"opportunity_id": "O2", "contact_id": "A", "title": "Second",
+                                     "stage": "qualified", "amount": "200.00",
+                                     "expected_close_on": "2026-11-15"})
+        self.assertEqual(result[1]["expected_close_on"], "2024-02-29")
+        self.assertEqual(result[2]["expected_close_on"], "2027-01-01")
+        # Persisted: a reopened root shows the maintained dates via find-opportunities.
+        by_id = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(by_id["O2"]["expected_close_on"], "2026-11-15")
+        self.assertEqual(by_id["O3"]["expected_close_on"], "2024-02-29")
+        # Clearing drops the field entirely; the amount stays untouched.
+        cleared = self.app.set_close_dates([{"opportunity_id": "O2", "expected_close_on": None}])
+        self.assertNotIn("expected_close_on", cleared[0])
+        self.assertEqual(cleared[0]["amount"], "200.00")
+        self.assertNotIn("expected_close_on",
+                         ContactFlow(self.root).find_opportunities(stage="qualified")[0])
+        # A never-priced opportunity gains no amount field from a date update.
+        self.app.add_opportunity("O4", "B", "Fourth")
+        result = self.app.set_close_dates([{"opportunity_id": "O4", "expected_close_on": "2026-12-01"}])
+        self.assertNotIn("amount", result[0])
+        self.assertEqual(result[0]["expected_close_on"], "2026-12-01")
+
+    def test_set_close_dates_requires_list_and_missing_argument_is_type_error(self):
+        with self.assertRaises(TypeError):
+            self.app.set_close_dates()
+        for bad in ("updates", 1, {"opportunity_id": "O1"}):
+            with self.assertRaises(ValueError):
+                self.app.set_close_dates(bad)
+        self.assertFalse(self.app.path.exists())
+
+    def test_set_close_dates_validates_items_without_partial_changes(self):
+        self.seed_close_date_deals()
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            [{"opportunity_id": "O1"}],                                            # missing key
+            [{"opportunity_id": "O1", "expected_close_on": "2026-01-01", "x": 1}], # extra key
+            [{"opportunity_id": "O1", "expected_close_on": "2026-01-01"}, "nope"], # non-object item
+            [{"opportunity_id": "  ", "expected_close_on": "2026-01-01"}],         # blank id
+            [{"opportunity_id": "O1", "expected_close_on": "2026-13-01"}],         # unreal date
+            [{"opportunity_id": "O1", "expected_close_on": "2026-02-29"}],         # non-leap year
+            [{"opportunity_id": "O1", "expected_close_on": "2026-1-01"}],          # bad shape
+            [{"opportunity_id": "O1", "expected_close_on": 20260101}],             # non-string date
+            [{"opportunity_id": "ZZZ", "expected_close_on": "2026-01-01"}],        # unknown deal
+            [{"opportunity_id": "O1", "expected_close_on": "2026-01-01"},          # duplicate id
+             {"opportunity_id": " O1 ", "expected_close_on": None}],
+            [{"opportunity_id": "O1", "expected_close_on": "2026-01-01"},          # later item fails
+             {"opportunity_id": "ZZZ", "expected_close_on": "2026-01-01"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError, msg=batch):
+                self.app.set_close_dates(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Ids stay case-sensitive after trimming.
+        with self.assertRaises(ValueError):
+            self.app.set_close_dates([{"opportunity_id": "o1", "expected_close_on": "2026-01-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_set_close_dates_empty_list_and_noop_write_nothing(self):
+        # An empty batch against a fresh root creates no directory or file.
+        empty_root = self.root / "empty"
+        self.assertEqual(ContactFlow(empty_root).set_close_dates([]), [])
+        self.assertFalse(empty_root.exists())
+        self.seed_close_date_deals()
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-11-15"}])
+        before = self.app.path.read_bytes()
+        result = self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-11-15"},  # same value
+            {"opportunity_id": "O2", "expected_close_on": None},          # never set
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(result[0]["expected_close_on"], "2026-11-15")
+        self.assertNotIn("expected_close_on", result[1])
+
+    def test_set_close_dates_failure_against_missing_root_creates_nothing(self):
+        gone = ContactFlow(self.root / "gone")
+        with self.assertRaises(ValueError):
+            gone.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-01-01"}])
+        self.assertFalse((self.root / "gone").exists())
+
+    def test_close_dates_survive_transfer_merge_rename_and_stage_changes(self):
+        self.seed_close_date_deals()
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-11-15"}])
+        self.app.set_stage("O1", "qualified", "2026-10-01")
+        self.app.transfer_opportunities([
+            {"opportunity_id": "O1", "source_contact_id": "A", "target_contact_id": "B"}])
+        self.app.rename_contacts([{"old_id": "B", "new_id": "B2"}])
+        self.app.merge_contacts("A", "B2")
+        by_id = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(by_id["O1"]["expected_close_on"], "2026-11-15")
+        self.assertEqual(by_id["O1"]["contact_id"], "B2")
+        self.assertEqual(by_id["O1"]["stage"], "qualified")
+        # New and imported opportunities carry no date of their own.
+        self.assertNotIn("expected_close_on", by_id["O2"])
+        csv_path = self.root / "import.csv"
+        csv_path.write_text("opportunity_id,contact_id,title,stage\nO9,B2,Ninth,new\n",
+                            encoding="utf-8")
+        self.app.import_opportunities(str(csv_path))
+        by_id = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertNotIn("expected_close_on", by_id["O9"])
+
+    def seed_forecast_orgs(self):
+        # Org "Books": O1 new 100.00 closing in range, O2 qualified 200.00 undated.
+        # Org "Music": O3 qualified 40.00 closing out of range; Carol has no deals.
+        self.app.add_contact("A", "Alice", "alice@example.test", "Books")
+        self.app.add_contact("B", "Bob", "bob@example.test", "Music")
+        self.app.add_contact("C", "Carol", "carol@example.test", "Music")
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.set_opportunity_amount("O1", "100.00")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified", "2026-09-01")
+        self.app.set_opportunity_amount("O2", "200.00")
+        self.app.add_opportunity("O3", "B", "Third")
+        self.app.set_stage("O3", "qualified", "2026-09-10")
+        self.app.set_opportunity_amount("O3", "40.00")
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-11-15"},
+                                  {"opportunity_id": "O3", "expected_close_on": "2027-03-01"}])
+
+    def test_forecast_report_date_range_filters_by_expected_close(self):
+        self.seed_forecast_orgs()
+        probabilities = {"new": "50", "qualified": "25"}
+        # Legacy behavior without a range: every open deal counts, dated or not.
+        legacy = self.app.forecast_report(probabilities)
+        self.assertEqual(legacy["total"], {"new": "50.00", "qualified": "60.00", "amount": "110.00"})
+        both_null = self.app.forecast_report(probabilities, start_on=None, end_on=None)
+        self.assertEqual(both_null, legacy)
+        positional = self.app.forecast_report(probabilities, None, None, "all")
+        self.assertEqual(positional, legacy)
+        # Bounded: only O1 closes inside the inclusive range; undated O2 and
+        # out-of-range O3 are excluded, and Carol's org keeps a zero row.
+        bounded = self.app.forecast_report(probabilities, start_on="2026-11-01", end_on="2026-11-30")
+        self.assertEqual(bounded["total"], {"new": "50.00", "qualified": "0.00", "amount": "50.00"})
+        by_org = {row["organization"]: row for row in bounded["organizations"]}
+        self.assertEqual(by_org["Books"], {"organization": "Books", "new": "50.00",
+                                           "qualified": "0.00", "amount": "50.00"})
+        self.assertEqual(by_org["Music"], {"organization": "Music", "new": "0.00",
+                                           "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(bounded["csv"],
+                         "organization,new,qualified,amount\n"
+                         "Books,50.00,0.00,50.00\n"
+                         "Music,0.00,0.00,0.00\n")
+        # Range ends are inclusive; a window missing every close date zeroes out.
+        edge = self.app.forecast_report(probabilities, start_on="2026-11-15", end_on="2026-11-15")
+        self.assertEqual(edge["total"]["amount"], "50.00")
+        none = self.app.forecast_report(probabilities, start_on="2026-11-16", end_on="2026-11-29")
+        self.assertEqual(none["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        # Terminal deals stay excluded even when their close date is in range.
+        self.app.set_stage("O1", "qualified", "2026-10-01")
+        self.app.set_stage("O1", "won", "2026-10-02")
+        won = self.app.forecast_report(probabilities, start_on="2026-11-01", end_on="2026-11-30")
+        self.assertEqual(won["total"]["amount"], "0.00")
+
+    def test_forecast_report_date_range_validation(self):
+        probabilities = {"new": "50", "qualified": "25"}
+        # Empty store still validates the range and stays read-only.
+        empty_root = self.root / "empty"
+        empty = ContactFlow(empty_root)
+        for kwargs in ({"start_on": "2026-01-01"}, {"end_on": "2026-01-01"},
+                       {"start_on": "2026-02-30", "end_on": "2026-03-01"},
+                       {"start_on": "2026-01-01", "end_on": "not-a-date"},
+                       {"start_on": "2026-01-01", "end_on": 20260101},
+                       {"start_on": "2026-05-02", "end_on": "2026-05-01"}):
+            with self.assertRaises(ValueError, msg=kwargs):
+                empty.forecast_report(probabilities, **kwargs)
+        report = empty.forecast_report(probabilities, start_on="2026-01-01", end_on="2026-12-31")
+        self.assertEqual(report, {"total": {"new": "0.00", "qualified": "0.00", "amount": "0.00"},
+                                  "organizations": [], "csv": "organization,new,qualified,amount\n"})
+        self.assertFalse(empty_root.exists())
+        # Bad probabilities still reject ahead of everything else.
+        with self.assertRaises(ValueError):
+            empty.forecast_report({"new": "50"}, start_on="2026-01-01", end_on="2026-12-31")
+        # A populated store rejects bad ranges without rewriting anything.
+        self.seed_forecast_orgs()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.forecast_report(probabilities, start_on="2026-12-31", end_on="2026-01-01")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_set_close_dates_object_array_and_failure(self):
+        self.seed_close_date_deals()
+        payload = self.root / "batch.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "set-close-dates", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"updates": [
+            {"opportunity_id": " O1 ", "expected_close_on": " 2026-11-15 "},
+            {"opportunity_id": "O3", "expected_close_on": None},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"opportunity_id": "O1", "contact_id": "A", "title": "First", "stage": "new",
+             "amount": "100.00", "expected_close_on": "2026-11-15"},
+            {"opportunity_id": "O3", "contact_id": "B", "title": "Third", "stage": "won"},
+        ])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"updates": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"updates": [{"opportunity_id": "O1", "expected_close_on": "2026-02-30"}]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter surfaces through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"updates": [{"opportunity_id": "O1", "expected_close_on": "2026-01-01"}]},
+                   root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_set_close_dates_outer_array_keeps_earlier_batches(self):
+        self.seed_close_date_deals()
+        payload = self.root / "batches.json"
+        payload.write_text(json.dumps([
+            {"updates": [{"opportunity_id": "O1", "expected_close_on": "2026-11-15"}]},
+            {"updates": [{"opportunity_id": "ZZZ", "expected_close_on": "2026-11-16"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "set-close-dates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        by_id = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(by_id["O1"]["expected_close_on"], "2026-11-15")
+
+    def test_cli_forecast_report_with_date_range(self):
+        self.seed_forecast_orgs()
+        payload = self.root / "query.json"
+
+        def cli(row):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                   "forecast-report", str(payload)], text=True, capture_output=True)
+
+        bounded = cli({"probabilities": {"new": "50", "qualified": "25"},
+                       "start_on": "2026-11-01", "end_on": "2026-11-30"})
+        self.assertEqual(bounded.returncode, 0, bounded.stderr)
+        self.assertEqual(json.loads(bounded.stdout)["total"],
+                         {"new": "50.00", "qualified": "0.00", "amount": "50.00"})
+        one_sided = cli({"probabilities": {"new": "50", "qualified": "25"},
+                         "start_on": "2026-11-01"})
+        self.assertEqual(one_sided.returncode, 2)
+        self.assertEqual(one_sided.stdout, "")
+        self.assertIn("error", json.loads(one_sided.stderr))
+
 if __name__ == "__main__":
     unittest.main()
