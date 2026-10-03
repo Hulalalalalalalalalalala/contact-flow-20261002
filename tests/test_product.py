@@ -6126,5 +6126,321 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(reopened.timeline("B"),
                          [{"contact_id": "B", "on": "2026-10-02", "note": "b corrected"}])
 
+    def seed_close_dates(self):
+        # Two organizations; opportunities mix stages, amounts, dates and no dates.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O1", "A", "Deal one")        # new
+        self.app.add_opportunity("O2", "A", "Deal two")        # -> qualified
+        self.app.add_opportunity("O3", "A", "Deal three")      # -> won
+        self.app.add_opportunity("O4", "B", "Deal four")       # new, no amount
+        self.app.set_opportunity_amount("O1", "100.00")
+        self.app.set_opportunity_amount("O2", "200.00")
+        self.app.set_opportunity_amount("O3", "999.00")
+        # O2 reaches qualified with an October history date although its
+        # expected close date is elsewhere: the window must never borrow it.
+        self.app.set_stage("O2", "qualified", on="2026-10-02")
+        self.app.set_stage("O3", "qualified", on="2026-09-01")
+        self.app.set_stage("O3", "won", on="2026-09-05")
+
+    def test_set_close_dates_sets_trims_clears_and_persists(self):
+        self.seed_close_dates()
+        results = self.app.set_close_dates([
+            {"opportunity_id": " O1 ", "expected_close_on": " 2026-10-05 "},
+            {"opportunity_id": "O2", "expected_close_on": "2024-02-29"},  # legal leap day
+            {"opportunity_id": "O3", "expected_close_on": "2031-01-30"},
+            {"opportunity_id": "O4", "expected_close_on": None},          # never had one
+        ])
+        self.assertEqual([o["opportunity_id"] for o in results], ["O1", "O2", "O3", "O4"])
+        by_id = {o["opportunity_id"]: o for o in results}
+        self.assertEqual(by_id["O1"]["expected_close_on"], "2026-10-05")
+        self.assertEqual(by_id["O2"]["expected_close_on"], "2024-02-29")
+        self.assertEqual(by_id["O3"]["expected_close_on"], "2031-01-30")
+        self.assertNotIn("expected_close_on", by_id["O4"])
+        # Complete opportunities: other fields and the amount stay, and no
+        # amount is invented for a deal that was never priced.
+        self.assertEqual(by_id["O1"]["amount"], "100.00")
+        self.assertEqual(sorted(by_id["O4"]), ["contact_id", "opportunity_id", "stage", "title"])
+        # Reopening the same root shows the maintained dates, including on a terminal deal.
+        reopened = ContactFlow(self.root)
+        found = {o["opportunity_id"]: o for o in reopened.find_opportunities()}
+        self.assertEqual(found["O1"]["expected_close_on"], "2026-10-05")
+        self.assertEqual(found["O2"]["expected_close_on"], "2024-02-29")
+        self.assertEqual(found["O3"]["expected_close_on"], "2031-01-30")
+        self.assertEqual(found["O3"]["stage"], "won")
+        self.assertNotIn("expected_close_on", found["O4"])
+
+        # An all-no-op batch (same date and an already-absent one) does not rewrite.
+        before = self.app.path.read_bytes()
+        noop = self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},
+            {"opportunity_id": "O4", "expected_close_on": None},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(noop[0]["expected_close_on"], "2026-10-05")
+        self.assertNotIn("expected_close_on", noop[1])
+
+        # Clearing removes the field from the stored object; other fields survive.
+        cleared = self.app.set_close_dates([{"opportunity_id": " O1 ", "expected_close_on": None}])
+        self.assertNotIn("expected_close_on", cleared[0])
+        self.assertEqual(cleared[0]["amount"], "100.00")
+        self.assertNotIn("expected_close_on",
+                         ContactFlow(self.root).find_opportunities(stage="new")[0])
+
+    def test_set_close_dates_validation_atomicity_and_no_creation(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-10-05"}])
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            "not a list",
+            [{"opportunity_id": "O1"}],                                       # missing key
+            [{"opportunity_id": "O1", "expected_close_on": "2026-10-05",
+              "extra": 1}],                                                   # extra key
+            ["not an object"],
+            [{"opportunity_id": " O1 ", "expected_close_on": "2026-10-05"},
+             {"opportunity_id": "O1", "expected_close_on": "2026-10-06"}],    # duplicate normalized id
+            [{"opportunity_id": "  ", "expected_close_on": "2026-10-05"}],    # blank id
+            [{"opportunity_id": 7, "expected_close_on": "2026-10-05"}],       # id type
+            [{"opportunity_id": "O1", "expected_close_on": "2026-10"}],       # bad format
+            [{"opportunity_id": "O1", "expected_close_on": "2026-02-30"}],    # not a real date
+            [{"opportunity_id": "O1", "expected_close_on": 5}],               # non-string date
+            [{"opportunity_id": "O1", "expected_close_on": "  "}],            # blank date
+            [{"opportunity_id": "ZZZ", "expected_close_on": "2026-10-05"}],   # unknown opportunity
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.set_close_dates(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # The one valid item in a rejected mixed batch must not have applied.
+        with self.assertRaises(ValueError):
+            self.app.set_close_dates([
+                {"opportunity_id": "O2", "expected_close_on": "2026-12-01"},
+                {"opportunity_id": "O1", "expected_close_on": "not-a-date"},
+            ])
+        self.assertNotIn("expected_close_on",
+                         [o for o in ContactFlow(self.root).find_opportunities()
+                          if o["opportunity_id"] == "O2"][0])
+        # Empty batch: empty result, no write; a nonexistent root stays absent.
+        self.assertEqual(self.app.set_close_dates([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        fresh_root = self.root / "fresh"
+        self.assertEqual(ContactFlow(fresh_root).set_close_dates([]), [])
+        self.assertFalse(fresh_root.exists())
+        # A rejected nonempty batch against a nonexistent root creates nothing.
+        gone_root = self.root / "gone"
+        with self.assertRaises(ValueError):
+            ContactFlow(gone_root).set_close_dates(
+                [{"opportunity_id": "O1", "expected_close_on": "2026-10-05"}])
+        self.assertFalse(gone_root.exists())
+        # Missing the required argument is a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            self.app.set_close_dates()
+
+    def test_close_dates_survive_stage_ownership_changes_and_skips_new_imports(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},
+            {"opportunity_id": "O3", "expected_close_on": "2026-10-10"},
+        ])
+        # A stage change keeps the date.
+        self.app.set_stage("O1", "qualified", on="2026-10-03")
+        # Reopening a terminal deal keeps the date.
+        self.app.reopen_opportunities(
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-08"}])
+        # Transfer keeps the date.
+        self.app.add_contact("C", "Cara", "c@example.test", "Games")
+        self.app.transfer_opportunities(
+            [{"opportunity_id": "O3", "source_contact_id": "A", "target_contact_id": "C"}])
+        # A contact merge keeps dates on every moved opportunity.
+        self.app.merge_contacts("C", "B")
+        # A contact rename keeps dates on the opportunities that follow them.
+        self.app.rename_contacts([{"old_id": "B", "new_id": "B2"}])
+        found = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(found["O1"]["expected_close_on"], "2026-10-05")
+        self.assertEqual(found["O3"]["expected_close_on"], "2026-10-10")
+        self.assertEqual(found["O3"]["contact_id"], "B2")
+        # New opportunities and CSV imports never receive a date automatically.
+        self.app.add_opportunity("O5", "A", "Brand new")
+        import csv as csv_module
+        csv_path = self.root / "opps.csv"
+        with open(csv_path, "w", encoding="utf-8", newline="") as stream:
+            writer = csv_module.writer(stream)
+            writer.writerow(["opportunity_id", "contact_id", "title", "stage"])
+            writer.writerow(["O6", "A", "Imported", "new"])
+        self.app.import_opportunities(str(csv_path))
+        found = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertNotIn("expected_close_on", found["O5"])
+        self.assertNotIn("expected_close_on", found["O6"])
+
+    def test_forecast_report_window_includes_only_dated_open_deals(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},   # new, 100.00
+            {"opportunity_id": "O2", "expected_close_on": "2026-09-15"},   # qualified, 200.00, out
+            {"opportunity_id": "O3", "expected_close_on": "2026-10-10"},   # won, excluded
+            {"opportunity_id": "O4", "expected_close_on": "2026-10-20"},   # new, no amount
+        ])
+        probs = {"new": "50", "qualified": "25"}
+        legacy = self.app.forecast_report(probs)
+        # Omitting both or passing null for both keeps the original behavior exactly.
+        self.assertEqual(self.app.forecast_report(probs, start_on=None, end_on=None), legacy)
+        # Legacy counts every open deal: new = (100.00 + 0.00) * 50% = 50.00,
+        # qualified = 200.00 * 25% = 50.00.
+        self.assertEqual(legacy["total"], {"new": "50.00", "qualified": "50.00", "amount": "100.00"})
+
+        report = self.app.forecast_report(probs, start_on="2026-10-01", end_on="2026-10-31")
+        # O2 is out of range, O3 is terminal, so only O1 (priced) and O4 (0.00) count.
+        self.assertEqual(report["total"], {"new": "50.00", "qualified": "0.00", "amount": "50.00"})
+        rows = {row["organization"]: row for row in report["organizations"]}
+        # Both filtered organizations survive: Books with its forecast, Music as a zero row.
+        self.assertEqual(set(rows), {"Books", "Music"})
+        self.assertEqual(rows["Books"], {"organization": "Books", "new": "50.00",
+                                         "qualified": "0.00", "amount": "50.00"})
+        self.assertEqual(rows["Music"], {"organization": "Music", "new": "0.00",
+                                         "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(report["csv"],
+                         "organization,new,qualified,amount\n"
+                         "Books,50.00,0.00,50.00\n"
+                         "Music,0.00,0.00,0.00\n")
+
+        # The range is inclusive: a one-day window on O1's date still includes it.
+        single = self.app.forecast_report(probs, start_on="2026-10-05", end_on="2026-10-05")
+        self.assertEqual(single["total"]["new"], "50.00")
+        # A window matching no deal keeps zero rows for every filtered organization.
+        empty_window = self.app.forecast_report(probs, start_on="2026-11-01", end_on="2026-11-30")
+        self.assertEqual(empty_window["total"],
+                         {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual([row["organization"] for row in empty_window["organizations"]],
+                         ["Books", "Music"])
+        self.assertEqual(empty_window["csv"],
+                         "organization,new,qualified,amount\n"
+                         "Books,0.00,0.00,0.00\n"
+                         "Music,0.00,0.00,0.00\n")
+
+        # Independent per-level rounding: two organizations each have one 0.01
+        # deal at 50%, so each rounds 0.5 cent up to 0.01 while the total only
+        # carries the combined 1 cent: it is not derived from the rounded
+        # organization rows (Books 50.00 + Music 0.01 + Games 0.01 = 50.02, but
+        # the independently rounded total stays 50.01).
+        self.app.add_contact("D", "Dan", "d@example.test", "Games")
+        self.app.add_opportunity("O7", "D", "Small games deal")
+        self.app.set_opportunity_amount("O7", "0.01")
+        self.app.set_close_dates([{"opportunity_id": "O7", "expected_close_on": "2026-10-25"}])
+        self.app.set_opportunity_amount("O4", "0.01")
+        rounded = self.app.forecast_report(probs, start_on="2026-10-01", end_on="2026-10-31")
+        rounded_rows = {row["organization"]: row for row in rounded["organizations"]}
+        self.assertEqual(rounded_rows["Music"]["new"], "0.01")
+        self.assertEqual(rounded_rows["Games"]["new"], "0.01")
+        self.assertEqual(rounded["total"]["new"], "50.01")
+
+        # Clearing the date immediately removes the deal from windowed forecasts.
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": None}])
+        after_clear = self.app.forecast_report(probs, start_on="2026-10-01", end_on="2026-10-31")
+        self.assertEqual(after_clear["total"]["new"], "0.01")
+
+        # Organization/tag filters still intersect the window, and the original
+        # positional calling convention stays compatible.
+        positional = self.app.forecast_report(probs, "music", None, "all",
+                                              "2026-10-01", "2026-10-31")
+        self.assertEqual([row["organization"] for row in positional["organizations"]], ["Music"])
+        tagged = self.app.forecast_report(probs, tags=["missing"],
+                                          start_on="2026-10-01", end_on="2026-10-31")
+        self.assertEqual(tagged["organizations"], [])
+
+    def test_forecast_report_window_validation_empty_store_and_readonly(self):
+        probs = {"new": "50", "qualified": "25"}
+        for kwargs in [
+            {"start_on": "2026-10-01"},                            # only one side
+            {"end_on": "2026-10-31"},
+            {"start_on": None, "end_on": "2026-10-31"},
+            {"start_on": "2026-10-01", "end_on": None},
+            {"start_on": "bad", "end_on": "2026-10-31"},           # bad date
+            {"start_on": "2026-10-01", "end_on": "2026-02-30"},    # not a real date
+            {"start_on": 5, "end_on": "2026-10-31"},               # wrong type
+            {"start_on": "2026-11-01", "end_on": "2026-10-31"},    # start after end
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.forecast_report(probs, **kwargs)
+        # Validation runs even on an empty store, and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.forecast_report(probs, start_on="2026-10-01")
+        report = fresh.forecast_report(probs, start_on="2026-01-01", end_on="2026-12-31")
+        self.assertEqual(report["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"], "organization,new,qualified,amount\n")
+        self.assertFalse(fresh_root.exists())
+        # A populated store is also untouched by a read-only windowed query.
+        self.seed_close_dates()
+        before = self.app.path.read_bytes()
+        self.app.forecast_report(probs, start_on="2026-10-01", end_on="2026-10-31")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_set_close_dates_and_forecast_window(self):
+        self.seed_close_dates()
+        payload = self.root / "close.json"
+
+        def cli(action, row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   action, str(payload)],
+                                  text=True, capture_output=True)
+
+        ok = cli("set-close-dates", {"updates": [
+            {"opportunity_id": " O1 ", "expected_close_on": " 2026-10-05 "},
+            {"opportunity_id": "O2", "expected_close_on": None},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        values = json.loads(ok.stdout)
+        self.assertEqual(values[0]["expected_close_on"], "2026-10-05")
+        self.assertNotIn("expected_close_on", values[1])
+        found = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(found["O1"]["expected_close_on"], "2026-10-05")
+        self.assertNotIn("expected_close_on", found["O2"])
+
+        # Validation failure: exit 2, empty stdout, JSON error, bytes preserved.
+        before = self.app.path.read_bytes()
+        failed = cli("set-close-dates",
+                     {"updates": [{"opportunity_id": "O2", "expected_close_on": "2026-13-01"}]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing updates is a TypeError surfaced through the same envelope.
+        missing = cli("set-close-dates", {})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+
+        # An outer array is independent batch calls; a later failure keeps the first.
+        array_run = cli("set-close-dates", [
+            {"updates": [{"opportunity_id": "O2", "expected_close_on": "2026-09-15"}]},
+            {"updates": [{"opportunity_id": "ZZZ", "expected_close_on": "2026-09-15"}]},
+        ])
+        self.assertEqual(array_run.returncode, 2)
+        self.assertEqual(array_run.stdout, "")
+        self.assertEqual(
+            [o for o in ContactFlow(self.root).find_opportunities()
+             if o["opportunity_id"] == "O2"][0]["expected_close_on"], "2026-09-15")
+
+        # Empty batch prints [] against a nonexistent root and creates nothing.
+        empty_root = self.root / "empty"
+        empty = cli("set-close-dates", {"updates": []}, root=empty_root)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(json.loads(empty.stdout), [])
+        self.assertFalse(empty_root.exists())
+
+        # forecast-report accepts the window as JSON arguments.
+        probs = {"new": "50", "qualified": "25"}
+        window_ok = cli("forecast-report",
+                        {"probabilities": probs, "start_on": "2026-10-01", "end_on": "2026-10-31"})
+        self.assertEqual(window_ok.returncode, 0, window_ok.stderr)
+        self.assertEqual(json.loads(window_ok.stdout)["total"],
+                         {"new": "50.00", "qualified": "0.00", "amount": "50.00"})
+        window_bad = cli("forecast-report", {"probabilities": probs, "start_on": "2026-10-01"})
+        self.assertEqual(window_bad.returncode, 2)
+        self.assertEqual(window_bad.stdout, "")
+        self.assertIn("error", json.loads(window_bad.stderr))
+
 if __name__ == "__main__":
     unittest.main()
