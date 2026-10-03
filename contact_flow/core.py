@@ -2316,6 +2316,108 @@ class ContactFlow(JsonStore):
 
         return {"total": total_row, "organizations": organizations, "csv": buffer.getvalue()}
 
+    QUALIFIED_DURATION_FIELDS = ("opportunity_id", "contact_id", "organization", "entry_index",
+                                "entered_on", "ended_on", "outcome", "days")
+
+    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # Export every qualified stay in progress or ended by the cutoff. The
+        # date and the filter arguments validate before any data is read, so a
+        # bad argument rejects even against an empty store. The query is read
+        # only: it never creates the data directory, rewrites data or saves a
+        # file elsewhere.
+        as_of = calendar_day(as_of, "as_of")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        history_store = data.get("stage_history", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            # Filtering is exactly the organization reports', judged on the
+            # opportunity's current ownership: current organization plus the
+            # owner's current tags, all/any as chosen.
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        cutoff = date.fromisoformat(as_of)
+        records = []
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            history = history_store.get(opportunity["opportunity_id"], [])
+            for index, entry in enumerate(history):
+                # Each round starts at a saved entry into qualified whose date
+                # is known and on/before the cutoff. A null-date entry, a date
+                # after the cutoff, or no entry history at all produces no row;
+                # the current stage is never back-filled as an entry.
+                if entry["to_stage"] != "qualified":
+                    continue
+                entered_on = entry["on"]
+                if entered_on is None or entered_on > as_of:
+                    continue
+                # The stay ends at the first record after this entry and before
+                # the next entry into qualified whose from_stage is qualified;
+                # later records (a later close of the same round, or another
+                # round) never substitute for a missing or null exit date.
+                exit_entry = None
+                for later in history[index + 1:]:
+                    if later["to_stage"] == "qualified":
+                        break
+                    if later["from_stage"] == "qualified":
+                        exit_entry = later
+                        break
+                if exit_entry is None:
+                    # No exit record before the next entry (or the end of the
+                    # history): the stay is open at the cutoff and ends there;
+                    # the current stage is never read as an exit.
+                    outcome, ended_on, days = (
+                        "open", as_of, (cutoff - date.fromisoformat(entered_on)).days)
+                elif exit_entry["on"] is None:
+                    # An exit record whose business date is unknown: the
+                    # outcome is unknown and no date is borrowed from another
+                    # round or the current stage.
+                    outcome, ended_on, days = "unknown", None, None
+                elif exit_entry["on"] > as_of:
+                    # The leave happens only after the cutoff, so by as_of the
+                    # stay is still open and ends at the cutoff itself.
+                    outcome, ended_on, days = (
+                        "open", as_of, (cutoff - date.fromisoformat(entered_on)).days)
+                else:
+                    outcome = exit_entry["to_stage"]
+                    ended_on = exit_entry["on"]
+                    days = (date.fromisoformat(ended_on) - date.fromisoformat(entered_on)).days
+                records.append({"opportunity_id": opportunity["opportunity_id"],
+                                "contact_id": contact["contact_id"],
+                                "organization": contact["organization"],
+                                "entry_index": index, "entered_on": entered_on,
+                                "ended_on": ended_on, "outcome": outcome, "days": days})
+        # Ascending entry date, then opportunity id by Unicode code point, then
+        # the zero-based history position, so close-and-reopen rounds of one
+        # deal entered on the same day stay in history order.
+        records.sort(key=lambda record: (record["entered_on"], record["opportunity_id"],
+                                         record["entry_index"]))
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(self.QUALIFIED_DURATION_FIELDS)
+        for record in records:
+            writer.writerow(tuple("" if record[field] is None else record[field]
+                                  for field in self.QUALIFIED_DURATION_FIELDS))
+        return {"records": records, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):
