@@ -788,6 +788,110 @@ class ContactFlow(JsonStore):
         self._write(data)
         return {"contact": contacts[target_id], "moved_followups": moved}
 
+    def batch_merge_contacts(self, merges):
+        # The whole batch validates against the pre-call state before any contact,
+        # followup, opportunity, tag or reminder changes, so a rejected item never
+        # leaves half the batch applied; every change commits in a single write.
+        if not isinstance(merges, list):
+            raise ValueError("merges must be a list")
+        if not merges:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        seen = set()
+        for item in merges:
+            if not isinstance(item, dict) or set(item) != {"source_id", "target_id"}:
+                raise ValueError("each merge must be an object with exactly source_id and target_id")
+            source_id = text(item["source_id"], "source_id")
+            target_id = text(item["target_id"], "target_id")
+            if source_id == target_id:
+                raise ValueError("source and target must differ")
+            # Normalized ids are case-sensitive; a repeated source id (even an
+            # identical item) rejects the whole batch.
+            if source_id in seen:
+                raise ValueError("duplicate source id in merges")
+            seen.add(source_id)
+            entries.append((source_id, target_id))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        for source_id, target_id in entries:
+            if source_id not in contacts or target_id not in contacts:
+                raise ValueError("unknown contact")
+        # Chains collapse onto the one member that is never a source; following
+        # each source's edges either reaches that final target or loops forever,
+        # which is reported as a cycle. Item order never affects the resolution.
+        mapping = dict(entries)
+        final = {}
+        for source_id, _ in entries:
+            visited = set()
+            node = source_id
+            while node in mapping:
+                if node in visited:
+                    raise ValueError("merges must not form a cycle")
+                visited.add(node)
+                node = mapping[node]
+            final[source_id] = node
+        groups = {}
+        for source_id, _ in entries:
+            groups.setdefault(final[source_id], []).append(source_id)
+        # moved_followups counts each source's own pre-call records, so a record
+        # belonging to a mid-chain source is counted only for that source.
+        followups = data.get("followups", [])
+        moved = {source_id: 0 for source_id in final}
+        for entry in followups:
+            owner = entry["contact_id"]
+            if owner in moved:
+                moved[owner] += 1
+        # Everything validated; apply group by group against the pre-call snapshot.
+        for target_id, sources in groups.items():
+            members = set(sources)
+            for entry in followups:
+                if entry["contact_id"] in members:
+                    entry["contact_id"] = target_id
+            for opportunity in data.get("opportunities", {}).values():
+                if opportunity["contact_id"] in members:
+                    opportunity["contact_id"] = target_id
+            tag_store = data.setdefault("tags", {})
+            merged_tags = set(tag_store.get(target_id, []))
+            for source_id in sources:
+                merged_tags |= set(tag_store.pop(source_id, []))
+            if merged_tags:
+                tag_store[target_id] = sorted(merged_tags)
+            else:
+                tag_store.pop(target_id, None)
+            if not tag_store:
+                data.pop("tags", None)
+            reminder_store = data.get("reminders")
+            if reminder_store is not None:
+                candidates = []
+                target_reminder = reminder_store.get(target_id)
+                if target_reminder is not None:
+                    candidates.append((target_id, target_reminder))
+                for source_id in sources:
+                    source_reminder = reminder_store.pop(source_id, None)
+                    if source_reminder is not None:
+                        candidates.append((source_id, source_reminder))
+                # Earliest due date wins; a same-day tie prefers the final
+                # target's own reminder, then the code-point-smallest owner id.
+                chosen = None
+                if candidates:
+                    chosen = min(candidates,
+                                 key=lambda pair: (pair[1]["due_on"], pair[0] != target_id, pair[0]))
+                if chosen is not None:
+                    reminder = dict(chosen[1])
+                    reminder["contact_id"] = target_id
+                    reminder_store[target_id] = reminder
+                else:
+                    reminder_store.pop(target_id, None)
+                if not reminder_store:
+                    data.pop("reminders", None)
+            for source_id in sources:
+                del contacts[source_id]
+        self._write(data)
+        # Results follow input order; the contact is the final target's profile.
+        return [{"source_id": source_id, "contact": contacts[final[source_id]],
+                 "moved_followups": moved[source_id]} for source_id, _ in entries]
+
     def find(self, organization=None, tags=None, tag_mode="all"):
         wanted = [] if tags is None else normalize_tags(tags)
         if tag_mode not in ("all", "any"):
