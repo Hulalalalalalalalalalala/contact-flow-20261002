@@ -10,6 +10,7 @@ from .storage import JsonStore, text, calendar_day, positive, amount_string, amo
 CONTACT_FIELDS = ("contact_id", "name", "email", "organization")
 FOLLOWUP_FIELDS = ("contact_id", "on", "note")
 OPPORTUNITY_FIELDS = ("opportunity_id", "contact_id", "title", "stage")
+TAG_IMPORT_FIELDS = ("contact_id", "tag")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
@@ -526,6 +527,78 @@ class ContactFlow(JsonStore):
                 imported.append(dict(opportunity))
             self._write(data)
         return imported
+
+    def import_contact_tags(self, csv_path):
+        # Append-only tag supplement for already registered contacts: it never
+        # removes tags, creates contacts or lets a blank tag clear data. The
+        # whole file validates before any write, like the other CSV imports.
+        if not isinstance(csv_path, str) or not csv_path.strip():
+            raise ValueError("csv_path must be a nonempty string")
+        with open(csv_path, encoding="utf-8-sig", newline="") as stream:
+            try:
+                content = stream.read()
+            except UnicodeDecodeError as error:
+                raise ValueError("CSV file must be valid UTF-8") from error
+        try:
+            rows = csv.reader(io.StringIO(content), strict=True)
+            header = next(rows, None)
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+        if header is None:
+            raise ValueError("CSV file is empty")
+        if (len(header) != len(TAG_IMPORT_FIELDS) or set(header) != set(TAG_IMPORT_FIELDS)
+                or len(set(header)) != len(header)):
+            raise ValueError("CSV header must contain exactly contact_id,tag in any order")
+
+        entries = []
+        try:
+            for row in rows:
+                if not row:
+                    # Only a genuine zero-field blank line is ignored; a pair of
+                    # empty fields is a record with a blank id and blank tag.
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("each CSV record must have %d fields" % len(header))
+                values = dict(zip(header, row))
+                # Ids trim but stay case-sensitive; tags reuse set-tags exactly:
+                # trim, casefold, keep inner whitespace, and reject blank ones.
+                contact_id = text(values["contact_id"], "contact_id")
+                tag = values["tag"].strip().casefold()
+                if not tag:
+                    raise ValueError("tags must be nonempty strings")
+                entries.append((contact_id, tag))
+        except csv.Error as error:
+            raise ValueError("invalid CSV syntax") from error
+
+        data = self._read()
+        contacts = data.get("contacts", {})
+        # Every contact is checked up front, so an unknown id in a later row
+        # rejects tags parsed from earlier rows too.
+        for contact_id, _ in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+        store = data.get("tags", {})
+        order = []
+        unions = {}
+        changed = False
+        for contact_id, tag in entries:
+            if contact_id not in unions:
+                # Result order follows the normalized id's first file appearance.
+                order.append(contact_id)
+                unions[contact_id] = set(store.get(contact_id, []))
+            if tag not in unions[contact_id]:
+                # Only a tag absent both from the stored set and from earlier
+                # file rows counts as a change; identical rows duplicate freely.
+                unions[contact_id].add(tag)
+                changed = True
+        results = [{"contact_id": contact_id, "tags": sorted(unions[contact_id])}
+                   for contact_id in order]
+        if changed:
+            for contact_id, tags in unions.items():
+                store[contact_id] = sorted(tags)
+            data["tags"] = store
+            self._write(data)
+        return results
 
     def follow_up(self, contact_id, on, note):
         note = text(note, "note")

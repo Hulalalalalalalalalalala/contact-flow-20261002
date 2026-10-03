@@ -1114,6 +1114,243 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def test_import_contact_tags_appends_union_in_first_seen_order(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("b", "Bob", "b@example.test", "Music")
+        self.app.add_contact("陈", "Chen", "chen@example.test", "Games")
+        self.app.set_tags("A", ["vip"])
+        before = self.app.path.read_bytes()
+        csv_path = self.write_csv("tags.csv",
+            "tag,contact_id\r\n"
+            " VIP , A \r\n"                       # trimmed, casefolded: already present
+            '"VIP",A\r\n'                         # identical record duplicates freely
+            "New Tag,A\r\n"                       # inner whitespace is kept
+            "华东, 陈 \r\n"
+            "vip,b\r\n"                           # b first appears here, after A
+            "lead, A \r\n"
+            "陈,陈\r\n")                          # tag equal to the contact id is fine
+        result = self.app.import_contact_tags(str(csv_path))
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["lead", "new tag", "vip"]},
+            {"contact_id": "陈", "tags": ["华东", "陈"]},
+            {"contact_id": "b", "tags": ["vip"]},
+        ])
+        for row in result:
+            self.assertEqual(set(row), {"contact_id", "tags"})
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["lead", "new tag", "vip"])
+        self.assertEqual(reopened.get_tags("b"), ["vip"])
+        self.assertEqual(reopened.get_tags("陈"), ["华东", "陈"])
+        # Existing tags were preserved, not replaced; tag filters are case-insensitive.
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["VIP"])], ["A", "b"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["LEAD"])], ["A"])
+        self.assertNotEqual(self.app.path.read_bytes(), before)
+
+    def test_import_contact_tags_bom_reordered_header_and_tag_expressions(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        csv_path = self.write_csv("tags.csv",
+            "﻿contact_id,tag\n A ,  Team A \n")
+        self.assertEqual(self.app.import_contact_tags(str(csv_path)),
+                         [{"contact_id": "A", "tags": ["team a"]}])
+        # Inner whitespace survives casefold and is queryable through expressions.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='"TEAM A"')], ["A"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='!"other"')], ["A"])
+
+    def test_import_contact_tags_header_only_creates_nothing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        for content in ["", "﻿", "\n", "\r\n"]:
+            path = self.write_csv("empty-%d.csv" % len(content.encode("utf-8")), content)
+            with self.assertRaises(ValueError):
+                fresh.import_contact_tags(str(path))
+        self.assertFalse(fresh_root.exists())
+        for content in ["contact_id,tag\n", "contact_id,tag\n\n\r\n\n"]:
+            path = self.write_csv("header-%d.csv" % len(content), content)
+            self.assertEqual(fresh.import_contact_tags(str(path)), [])
+        # A legal header with no records never creates the data directory.
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_contact_tags_rejects_bad_headers(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        bad_headers = [
+            "contact_id\n",
+            "contact_id,tag,extra\n",
+            "contact_id,contact_id\n",
+            "tag,tag\n",
+            "Contact_ID,tag\n",
+            "contact_id,Tag\n",
+            "contact_id,tag,x\nA,y,extra\n",
+        ]
+        for content in bad_headers:
+            path = self.write_csv("bad-%d.csv" % len(content), content)
+            with self.assertRaises(ValueError):
+                fresh.import_contact_tags(str(path))
+        self.assertFalse(fresh_root.exists())
+
+    def test_import_contact_tags_rejects_bad_records_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["vip"])
+        before = self.app.path.read_bytes()
+        bad_files = [
+            "contact_id,tag\nA\n",                # too few fields
+            "contact_id,tag\nA,x,extra\n",        # too many fields
+            "contact_id,tag\n,x\n",               # blank id
+            "contact_id,tag\n   ,x\n",
+            "contact_id,tag\nA,\n",               # blank tag cannot clear data
+            "contact_id,tag\nA,   \n",
+            "contact_id,tag\n,\n",                # row of empties is not a blank line
+            'contact_id,tag\nA,"x\n',             # unterminated quoted field
+            "contact_id,tag\nZZZ,x\n",            # unknown contact
+            "contact_id,tag\nA,ok\nZ,x\n",        # later row unknown
+            "contact_id,tag\na,ok\n",             # ids are case-sensitive
+        ]
+        for i, content in enumerate(bad_files):
+            path = self.write_csv("bad-record-%d.csv" % i, content)
+            with self.assertRaises(ValueError):
+                self.app.import_contact_tags(str(path))
+            self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).get_tags("A"), ["vip"])
+
+    def test_import_contact_tags_rejects_invalid_utf8(self):
+        path = self.write_csv("latin.csv", b"contact_id,tag\nA,\xff\n")
+        with self.assertRaises(ValueError):
+            self.app.import_contact_tags(str(path))
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_contact_tags_all_existing_does_not_rewrite_and_reimports_equal(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "new tag"])
+        before = self.app.path.read_bytes()
+        csv_path = self.write_csv("tags.csv",
+            "contact_id,tag\n A , VIP \nB,x\n A , new tag \n")
+        # B gains "x"; afterwards reimporting the identical file changes nothing.
+        first = self.app.import_contact_tags(str(csv_path))
+        self.assertEqual(first, [
+            {"contact_id": "A", "tags": ["new tag", "vip"]},
+            {"contact_id": "B", "tags": ["x"]},
+        ])
+        after_first = self.app.path.read_bytes()
+        self.assertNotEqual(after_first, before)
+        second = self.app.import_contact_tags(str(csv_path))
+        self.assertEqual(second, first)
+        self.assertEqual(self.app.path.read_bytes(), after_first)
+        # A wholly redundant file is a no-op even on a fresh contact set.
+        redundant = self.write_csv("redundant.csv", "contact_id,tag\nA,new tag\nA,VIP\n")
+        self.assertEqual(self.app.import_contact_tags(str(redundant)),
+                         [{"contact_id": "A", "tags": ["new tag", "vip"]}])
+        self.assertEqual(self.app.path.read_bytes(), after_first)
+
+    def test_import_contact_tags_validates_path_and_permissions(self):
+        for bad in [None, 5, "", "   "]:
+            with self.assertRaises(ValueError):
+                self.app.import_contact_tags(bad)
+        with self.assertRaises(FileNotFoundError):
+            self.app.import_contact_tags(str(self.root / "missing.csv"))
+        self.assertFalse(self.app.path.exists())
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        path = self.write_csv("locked.csv", "contact_id,tag\nA,x\n")
+        path.chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                self.app.import_contact_tags(str(path))
+        finally:
+            path.chmod(0o644)
+        self.assertFalse(self.app.path.exists())
+
+    def test_import_contact_tags_relative_path_legacy_and_other_data(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.write_csv("people.csv", "contact_id,tag\nA,ok\n")
+        old_cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(self.app.import_contact_tags("people.csv")[0]["tags"], ["ok"])
+        finally:
+            os.chdir(old_cwd)
+        # Legacy data without a tags collection treats tags as an empty set.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"L": {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                                "organization": "Old"}}}), encoding="utf-8")
+        path = self.write_csv("legacy.csv", "contact_id,tag\n L , Hi \n")
+        legacy = ContactFlow(legacy_root)
+        self.assertEqual(legacy.import_contact_tags(str(path)),
+                         [{"contact_id": "L", "tags": ["hi"]}])
+        self.assertEqual(ContactFlow(legacy_root).get_tags("L"), ["hi"])
+        # Unrelated records stay byte-identical in value; reports keep totals.
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.follow_up("A", "2026-10-01", "note")
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_opportunity_amount("O1", "12.50")
+        self.app.set_reminder("A", "2099-01-01", "call")
+        funnel_before = self.app.funnel_report()
+        money_before = self.app.opportunity_amount_report()
+        more = self.write_csv("more.csv",
+            "contact_id,tag\nA,lead\nB,lead\n")
+        self.app.import_contact_tags(str(more))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["lead", "ok"])
+        self.assertEqual(reopened.timeline("A")[0]["note"], "note")
+        self.assertEqual(reopened.find_opportunities(contact_id="A")[0]["title"], "Deal")
+        self.assertEqual(reopened.due_reminders("2099-12-31"),
+                         [{"contact_id": "A", "due_on": "2099-01-01", "note": "call"}])
+        self.assertEqual(reopened.funnel_report(), funnel_before)
+        self.assertEqual(reopened.opportunity_amount_report(), money_before)
+        # The new tag drives find, expressions and every tag-filtering report.
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["lead"])], ["A", "B"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='"lead" && !"ok"')],
+                         ["B"])
+        self.assertEqual(reopened.funnel_report(tags=["lead"])["total"]["contacts"], 2)
+        self.assertEqual(reopened.funnel_report(tags=["ok"])["total"]["contacts"], 1)
+        self.assertEqual(reopened.followup_report("2024-01-01", "2100-01-01",
+                                                  tags=["lead"])["records"][0]["contact_id"], "A")
+
+    def test_cli_import_contact_tags_success_failure_and_array(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("b", "Bob", "b@example.test", "Music")
+        csv_path = self.write_csv("tags.csv",
+            "contact_id,tag\n A , VIP \nb,lead\nA,华东\n")
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"csv_path": str(csv_path)}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "import-contact-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "tags": ["vip", "华东"]},
+            {"contact_id": "b", "tags": ["lead"]},
+        ])
+        # Unknown contact: stderr JSON with error, exit 2, empty stdout, no write.
+        before = self.app.path.read_bytes()
+        bad_csv = self.write_csv("bad.csv", "contact_id,tag\nZZZ,x\n")
+        payload.write_text(json.dumps({"csv_path": str(bad_csv)}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "import-contact-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing argument is a TypeError surfaced through the same envelope.
+        payload.write_text(json.dumps({}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "import-contact-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # Array input: each import is independent and a later failure keeps earlier writes.
+        other = self.write_csv("other.csv", "contact_id,tag\nb,extra\n")
+        payload.write_text(json.dumps([{"csv_path": str(other)}, {"csv_path": str(bad_csv)}]),
+                           encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "import-contact-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        json.loads(partial.stderr)
+        self.assertEqual(ContactFlow(self.root).get_tags("b"), ["extra", "lead"])
+
     def seed_funnel(self):
         # Books (casefold group): A with two opportunities (new + won), D with one qualified.
         # books: B with one lost. Music: C with no opportunities.
