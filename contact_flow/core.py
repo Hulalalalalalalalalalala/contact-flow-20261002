@@ -788,6 +788,125 @@ class ContactFlow(JsonStore):
         self._write(data)
         return {"contact": contacts[target_id], "moved_followups": moved}
 
+    def batch_merge_contacts(self, merges):
+        # The whole batch validates against the pre-call state before any
+        # contact, followup, opportunity, tag or reminder changes, so a
+        # rejected item never leaves part of the batch applied; every change
+        # commits in a single write.
+        if not isinstance(merges, list):
+            raise ValueError("merges must be a list")
+        if not merges:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        mapping = {}
+        for item in merges:
+            if not isinstance(item, dict) or set(item) != {"source_id", "target_id"}:
+                raise ValueError("each merge must be an object with exactly source_id and target_id")
+            source_id = text(item["source_id"], "source_id")
+            target_id = text(item["target_id"], "target_id")
+            if source_id == target_id:
+                raise ValueError("source and target must differ")
+            # Normalized ids are case-sensitive; a repeated source id (even an
+            # identical item) rejects the whole batch. Several sources may point
+            # at the same target, and a target may itself be a source.
+            if source_id in mapping:
+                raise ValueError("duplicate source id in merges")
+            mapping[source_id] = target_id
+            entries.append((source_id, target_id))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        for source_id, target_id in entries:
+            if source_id not in contacts or target_id not in contacts:
+                raise ValueError("unknown contact")
+        # Chains collapse to the one target that is not itself a source; any
+        # cycle in the mapping rejects the whole batch.
+        finals = {}
+        for source_id in mapping:
+            seen = set()
+            node = source_id
+            while node in mapping:
+                if node in seen:
+                    raise ValueError("merges must not form a cycle")
+                seen.add(node)
+                node = mapping[node]
+            finals[source_id] = node
+        # Group membership is order-independent: sources sharing a final target
+        # merge together with it, so item order only changes the result order.
+        groups = {}
+        for source_id, final_id in finals.items():
+            groups.setdefault(final_id, []).append(source_id)
+        followups = data.get("followups", [])
+        # moved_followups counts only records directly owned by each source
+        # before the call; records of other sources in the chain never
+        # double-count.
+        moved = {}
+        for entry in followups:
+            owner = entry["contact_id"]
+            if owner in finals:
+                moved[owner] = moved.get(owner, 0) + 1
+        # Followups and opportunities (terminal stages included) only change
+        # ownership; save order, duplicates, ids, titles, stages, amounts and
+        # stage history stay as they were.
+        for entry in followups:
+            final_id = finals.get(entry["contact_id"])
+            if final_id is not None:
+                entry["contact_id"] = final_id
+        for opportunity in data.get("opportunities", {}).values():
+            final_id = finals.get(opportunity["contact_id"])
+            if final_id is not None:
+                opportunity["contact_id"] = final_id
+        tag_store = data.get("tags", {})
+        reminder_store = data.get("reminders", {})
+        for final_id, sources in groups.items():
+            members = [final_id] + sources
+            # Tags merge as the deduplicated union of the whole group, sorted
+            # like set-tags normalizes them.
+            merged_tags = sorted({tag for member in members for tag in tag_store.get(member, [])})
+            for source_id in sources:
+                tag_store.pop(source_id, None)
+            if merged_tags:
+                tag_store[final_id] = merged_tags
+            else:
+                tag_store.pop(final_id, None)
+            # One reminder per group: the earliest due date wins; a same-day
+            # tie keeps the final target's original reminder, otherwise the
+            # original owner id smallest by Unicode code point. The chosen
+            # reminder keeps every field except its contact_id.
+            chosen = None
+            for member in members:
+                reminder = reminder_store.get(member)
+                if reminder is None:
+                    continue
+                key = (reminder["due_on"], 0 if member == final_id else 1, member)
+                if chosen is None or key < chosen[0]:
+                    chosen = (key, reminder)
+            for source_id in sources:
+                reminder_store.pop(source_id, None)
+            if chosen is not None:
+                reminder = dict(chosen[1])
+                reminder["contact_id"] = final_id
+                reminder_store[final_id] = reminder
+            else:
+                reminder_store.pop(final_id, None)
+        for source_id in mapping:
+            del contacts[source_id]
+        if tag_store:
+            data["tags"] = tag_store
+        else:
+            data.pop("tags", None)
+        if reminder_store:
+            data["reminders"] = reminder_store
+        else:
+            data.pop("reminders", None)
+        self._write(data)
+        # Results follow input order: the normalized source id, the final
+        # target's complete contact and that source's own moved followup count.
+        return [{"source_id": source_id,
+                 "contact": contacts[finals[source_id]],
+                 "moved_followups": moved.get(source_id, 0)}
+                for source_id, _ in entries]
+
     def find(self, organization=None, tags=None, tag_mode="all"):
         wanted = [] if tags is None else normalize_tags(tags)
         if tag_mode not in ("all", "any"):
