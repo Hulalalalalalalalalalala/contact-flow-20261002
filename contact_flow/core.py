@@ -14,6 +14,15 @@ UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
 
+def forecast_probability(value, label):
+    # Probabilities reuse the amount grammar (trimmed nonnegative decimal, at
+    # most two fraction digits); keep the percent as hundredths so a weighted
+    # amount stays in exact integer arithmetic. Range is inclusive 0..100.
+    hundredths = amount_cents(amount_string(value, label))
+    if hundredths > 10000:
+        raise ValueError(label + " must be between 0 and 100")
+    return hundredths
+
 def normalize_tags(value):
     if not isinstance(value, list):
         raise ValueError("tags must be a list")
@@ -1518,6 +1527,90 @@ class ContactFlow(JsonStore):
         for row in organizations:
             writer.writerow((row["organization"], row["new"], row["qualified"],
                              row["won"], row["lost"], row["amount"]))
+
+        return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
+
+    def forecast_report(self, probabilities, organization=None, tags=None, tag_mode="all"):
+        if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
+            raise ValueError("probabilities must be an object containing exactly new and qualified")
+        rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
+                 for stage in ("new", "qualified")}
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        # Weighted sums stay unrounded: amount cents times probability
+        # hundredths, where weighted cents = raw / 10000. Each stage, group and
+        # total rounds its own raw sum half up to the cent, never derived from
+        # rounded children.
+        def empty_counts():
+            return {"new": 0, "qualified": 0}
+
+        totals = empty_counts()
+        groups = {}
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
+            elif contact["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among filtered contacts.
+                group["display"] = contact["organization"]
+
+        for opportunity in data.get("opportunities", {}).values():
+            stage = opportunity["stage"]
+            # Only open opportunities count; won and lost never enter the forecast.
+            if stage not in ("new", "qualified"):
+                continue
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
+            raw = cents * rates[stage]
+            groups[contact["organization"].casefold()]["counts"][stage] += raw
+            totals[stage] += raw
+
+        def quantized_cents(raw):
+            return (raw + 5000) // 10000
+
+        def money_row(counts):
+            return {"new": format_cents(quantized_cents(counts["new"])),
+                    "qualified": format_cents(quantized_cents(counts["qualified"])),
+                    "amount": format_cents(quantized_cents(counts["new"] + counts["qualified"]))}
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(money_row(group["counts"]))
+            organizations.append(row)
+
+        totals_row = money_row(totals)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization", "new", "qualified", "amount"))
+        for row in organizations:
+            writer.writerow((row["organization"], row["new"], row["qualified"], row["amount"]))
 
         return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
 
