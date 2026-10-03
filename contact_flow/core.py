@@ -1523,7 +1523,14 @@ class ContactFlow(JsonStore):
                                      pair["right"]["contact_id"]))
         return pairs
 
-    def funnel_report(self, organization=None, tags=None, tag_mode="all"):
+    def _organization_groups(self, organization, tags, tag_mode):
+        # Shared scope of the organization-grouped reports. The filter
+        # arguments validate before any data is read; matching contacts bucket
+        # by their organization's casefold value, keeping the code-point-
+        # smallest original as the display name and counting the contacts.
+        # Returns (groups, scoped): groups maps each casefold key to
+        # {"display", "contacts"}, and scoped lists (group key, opportunity)
+        # for every opportunity owned by a matching contact, in save order.
         if organization is not None and not isinstance(organization, str):
             raise ValueError("organization must be a string")
         wanted = [] if tags is None else normalize_tags(tags)
@@ -1544,148 +1551,106 @@ class ContactFlow(JsonStore):
                 if tag_mode == "any" and not (set(wanted) & have):
                     return False
             return True
+
+        groups = {}
+        allowed = set()
+        for contact in contacts.values():
+            if not matches(contact):
+                continue
+            allowed.add(contact["contact_id"])
+            key = contact["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": contact["organization"], "contacts": 1}
+            else:
+                if contact["organization"] < group["display"]:
+                    # Display name is the code-point-smallest original value among filtered contacts.
+                    group["display"] = contact["organization"]
+                group["contacts"] += 1
+
+        scoped = []
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or contact["contact_id"] not in allowed:
+                continue
+            scoped.append((contact["organization"].casefold(), opportunity))
+        return groups, scoped
+
+    @staticmethod
+    def _organization_result(groups, details, fields):
+        # Shared report shape: one row per group in ascending casefold-key
+        # order, pairing the display name with its detail fields; the CSV
+        # carries the same fields as header and rows, one LF per line.
+        organizations = []
+        for key in sorted(groups):
+            row = {"organization": groups[key]["display"]}
+            row.update(details[key])
+            organizations.append(row)
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(fields)
+        for row in organizations:
+            writer.writerow(tuple(row[field] for field in fields))
+        return organizations, buffer.getvalue()
+
+    FUNNEL_FIELDS = ("organization", "contacts", "new", "qualified", "won", "lost", "opportunities")
+
+    def funnel_report(self, organization=None, tags=None, tag_mode="all"):
+        groups, scoped = self._organization_groups(organization, tags, tag_mode)
 
         def empty_counts():
             return {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0, "opportunities": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-            groups[key]["counts"]["contacts"] += 1
-            totals["contacts"] += 1
+        counts = {}
+        for key, group in groups.items():
+            counts[key] = empty_counts()
+            counts[key]["contacts"] = group["contacts"]
+            totals["contacts"] += group["contacts"]
 
-        for opportunity in data.get("opportunities", {}).values():
-            contact = contacts.get(opportunity["contact_id"])
-            if contact is None or not matches(contact):
-                continue
-            counts = groups[contact["organization"].casefold()]["counts"]
-            counts[opportunity["stage"]] += 1
-            counts["opportunities"] += 1
+        for key, opportunity in scoped:
+            counts[key][opportunity["stage"]] += 1
+            counts[key]["opportunities"] += 1
             totals[opportunity["stage"]] += 1
             totals["opportunities"] += 1
 
-        organizations = []
-        for key in sorted(groups):
-            group = groups[key]
-            row = {"organization": group["display"]}
-            row.update(group["counts"])
-            organizations.append(row)
+        organizations, csv_text = self._organization_result(groups, counts, self.FUNNEL_FIELDS)
+        return {"total": totals, "organizations": organizations, "csv": csv_text}
 
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(("organization", "contacts", "new", "qualified", "won", "lost", "opportunities"))
-        for row in organizations:
-            writer.writerow((row["organization"], row["contacts"], row["new"], row["qualified"],
-                            row["won"], row["lost"], row["opportunities"]))
-
-        return {"total": totals, "organizations": organizations, "csv": buffer.getvalue()}
+    AMOUNT_FIELDS = ("organization", "new", "qualified", "won", "lost", "amount")
 
     def opportunity_amount_report(self, organization=None, tags=None, tag_mode="all"):
-        if organization is not None and not isinstance(organization, str):
-            raise ValueError("organization must be a string")
-        wanted = [] if tags is None else normalize_tags(tags)
-        if tag_mode not in ("all", "any"):
-            raise ValueError("tag_mode must be 'all' or 'any'")
-        data = self._read()
-        contacts = data.get("contacts", {})
-        tag_store = data.get("tags", {})
-        org_key = organization.strip().casefold() if organization is not None else None
-
-        def matches(contact):
-            if org_key is not None and contact["organization"].casefold() != org_key:
-                return False
-            if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
-                if tag_mode == "all" and not set(wanted) <= have:
-                    return False
-                if tag_mode == "any" and not (set(wanted) & have):
-                    return False
-            return True
+        groups, scoped = self._organization_groups(organization, tags, tag_mode)
 
         # Sums accumulate in integer cents, so totals are exact to the cent.
         def empty_counts():
             return {"new": 0, "qualified": 0, "won": 0, "lost": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-
-        for opportunity in data.get("opportunities", {}).values():
-            contact = contacts.get(opportunity["contact_id"])
-            if contact is None or not matches(contact):
-                continue
+        counts = {key: empty_counts() for key in groups}
+        for key, opportunity in scoped:
             # An opportunity without a price contributes 0.00 to its current stage.
             cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
-            counts = groups[contact["organization"].casefold()]["counts"]
-            counts[opportunity["stage"]] += cents
+            counts[key][opportunity["stage"]] += cents
             totals[opportunity["stage"]] += cents
 
-        def money_row(counts):
-            row = {stage: format_cents(counts[stage]) for stage in STAGES}
-            row["amount"] = format_cents(sum(counts.values()))
+        def money_row(stage_counts):
+            row = {stage: format_cents(stage_counts[stage]) for stage in STAGES}
+            row["amount"] = format_cents(sum(stage_counts.values()))
             return row
 
-        organizations = []
-        for key in sorted(groups):
-            group = groups[key]
-            row = {"organization": group["display"]}
-            row.update(money_row(group["counts"]))
-            organizations.append(row)
+        details = {key: money_row(stage_counts) for key, stage_counts in counts.items()}
+        organizations, csv_text = self._organization_result(groups, details, self.AMOUNT_FIELDS)
+        return {"total": money_row(totals), "organizations": organizations, "csv": csv_text}
 
-        totals_row = money_row(totals)
-
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(("organization", "new", "qualified", "won", "lost", "amount"))
-        for row in organizations:
-            writer.writerow((row["organization"], row["new"], row["qualified"],
-                             row["won"], row["lost"], row["amount"]))
-
-        return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
+    FORECAST_FIELDS = ("organization", "new", "qualified", "amount")
 
     def forecast_report(self, probabilities, organization=None, tags=None, tag_mode="all"):
         if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
             raise ValueError("probabilities must be an object containing exactly new and qualified")
         rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
                  for stage in ("new", "qualified")}
-        if organization is not None and not isinstance(organization, str):
-            raise ValueError("organization must be a string")
-        wanted = [] if tags is None else normalize_tags(tags)
-        if tag_mode not in ("all", "any"):
-            raise ValueError("tag_mode must be 'all' or 'any'")
-        data = self._read()
-        contacts = data.get("contacts", {})
-        tag_store = data.get("tags", {})
-        org_key = organization.strip().casefold() if organization is not None else None
-
-        def matches(contact):
-            if org_key is not None and contact["organization"].casefold() != org_key:
-                return False
-            if wanted:
-                have = set(tag_store.get(contact["contact_id"], []))
-                if tag_mode == "all" and not set(wanted) <= have:
-                    return False
-                if tag_mode == "any" and not (set(wanted) & have):
-                    return False
-            return True
+        groups, scoped = self._organization_groups(organization, tags, tag_mode)
 
         # Weighted sums stay unrounded: amount cents times probability
         # hundredths, where weighted cents = raw / 10000. Each stage, group and
@@ -1695,55 +1660,28 @@ class ContactFlow(JsonStore):
             return {"new": 0, "qualified": 0}
 
         totals = empty_counts()
-        groups = {}
-        for contact in contacts.values():
-            if not matches(contact):
-                continue
-            key = contact["organization"].casefold()
-            group = groups.get(key)
-            if group is None:
-                groups[key] = {"display": contact["organization"], "counts": empty_counts()}
-            elif contact["organization"] < group["display"]:
-                # Display name is the code-point-smallest original value among filtered contacts.
-                group["display"] = contact["organization"]
-
-        for opportunity in data.get("opportunities", {}).values():
+        counts = {key: empty_counts() for key in groups}
+        for key, opportunity in scoped:
             stage = opportunity["stage"]
             # Only open opportunities count; won and lost never enter the forecast.
             if stage not in ("new", "qualified"):
                 continue
-            contact = contacts.get(opportunity["contact_id"])
-            if contact is None or not matches(contact):
-                continue
             cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
             raw = cents * rates[stage]
-            groups[contact["organization"].casefold()]["counts"][stage] += raw
+            counts[key][stage] += raw
             totals[stage] += raw
 
         def quantized_cents(raw):
             return (raw + 5000) // 10000
 
-        def money_row(counts):
-            return {"new": format_cents(quantized_cents(counts["new"])),
-                    "qualified": format_cents(quantized_cents(counts["qualified"])),
-                    "amount": format_cents(quantized_cents(counts["new"] + counts["qualified"]))}
+        def money_row(stage_counts):
+            return {"new": format_cents(quantized_cents(stage_counts["new"])),
+                    "qualified": format_cents(quantized_cents(stage_counts["qualified"])),
+                    "amount": format_cents(quantized_cents(stage_counts["new"] + stage_counts["qualified"]))}
 
-        organizations = []
-        for key in sorted(groups):
-            group = groups[key]
-            row = {"organization": group["display"]}
-            row.update(money_row(group["counts"]))
-            organizations.append(row)
-
-        totals_row = money_row(totals)
-
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(("organization", "new", "qualified", "amount"))
-        for row in organizations:
-            writer.writerow((row["organization"], row["new"], row["qualified"], row["amount"]))
-
-        return {"total": totals_row, "organizations": organizations, "csv": buffer.getvalue()}
+        details = {key: money_row(stage_counts) for key, stage_counts in counts.items()}
+        organizations, csv_text = self._organization_result(groups, details, self.FORECAST_FIELDS)
+        return {"total": money_row(totals), "organizations": organizations, "csv": csv_text}
 
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
