@@ -1617,6 +1617,48 @@ class ContactFlow(JsonStore):
         organizations, csv_text = self._organization_result(groups, counts, self.FUNNEL_FIELDS)
         return {"total": totals, "organizations": organizations, "csv": csv_text}
 
+    FUNNEL_SNAPSHOT_FIELDS = ("organization", "contacts", "new", "qualified", "won", "lost",
+                              "unknown", "opportunities")
+
+    def funnel_snapshot_report(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # as_of reuses the real-calendar rule (trimmed YYYY-MM-DD, past, future
+        # and leap days allowed, no system clock) and validates before any data
+        # is read, so a bad date rejects even against an empty store.
+        as_of = calendar_day(as_of, "as_of")
+        groups, scoped = self._organization_groups(organization, tags, tag_mode)
+        history_store = self._read().get("stage_history", {})
+
+        def empty_counts():
+            return {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0,
+                    "unknown": 0, "opportunities": 0}
+
+        totals = empty_counts()
+        counts = {}
+        for key, group in groups.items():
+            counts[key] = empty_counts()
+            counts[key]["contacts"] = group["contacts"]
+            totals["contacts"] += group["contacts"]
+
+        for key, opportunity in scoped:
+            # The snapshot stage is the to_stage of the last saved history
+            # record (save order) whose non-null date is on/before the cutoff;
+            # same-day changes resolve to the last one saved. A deal without
+            # any qualifying record counts as unknown: the current stage and
+            # from_stage never back-fill, so new, imported, history-less and
+            # only-future/null-dated deals all land there.
+            stage = "unknown"
+            for entry in history_store.get(opportunity["opportunity_id"], []):
+                if entry["on"] is not None and entry["on"] <= as_of:
+                    stage = entry["to_stage"]
+            counts[key][stage] += 1
+            counts[key]["opportunities"] += 1
+            totals[stage] += 1
+            totals["opportunities"] += 1
+
+        organizations, csv_text = self._organization_result(groups, counts,
+                                                            self.FUNNEL_SNAPSHOT_FIELDS)
+        return {"total": totals, "organizations": organizations, "csv": csv_text}
+
     AMOUNT_FIELDS = ("organization", "new", "qualified", "won", "lost", "amount")
 
     def opportunity_amount_report(self, organization=None, tags=None, tag_mode="all"):

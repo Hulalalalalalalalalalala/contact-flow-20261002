@@ -1507,6 +1507,228 @@ class ProductTests(unittest.TestCase):
         json.loads(failed.stderr)
         self.assertEqual(self.app.funnel_report()["total"]["opportunities"], 4)
 
+    def seed_snapshot(self):
+        # Books (casefold group): A with O1 (no history) and O2 (qualified on
+        # 2024-01-10, won on 2024-02-10); D with O3 (qualified on 2024-01-15).
+        # books: B with O4 (lost on 2024-01-20). Music: C with no opportunities.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Books")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.add_opportunity("O1", "A", "First")
+        self.app.add_opportunity("O2", "A", "Second")
+        self.app.set_stage("O2", "qualified", on="2024-01-10")
+        self.app.set_stage("O2", "won", on="2024-02-10")
+        self.app.add_opportunity("O3", "D", "Third")
+        self.app.set_stage("O3", "qualified", on="2024-01-15")
+        self.app.add_opportunity("O4", "B", "Fourth")
+        self.app.set_stage("O4", "lost", on="2024-01-20")
+
+    def test_funnel_snapshot_report_counts_stages_as_of_date(self):
+        self.seed_snapshot()
+        report = self.app.funnel_snapshot_report("2024-01-31")
+        self.assertEqual(set(report), {"total", "organizations", "csv"})
+        # O2 was qualified on the cutoff, O1 has no history at all.
+        self.assertEqual(report["total"],
+            {"contacts": 4, "new": 0, "qualified": 2, "won": 0, "lost": 1,
+             "unknown": 1, "opportunities": 4})
+        self.assertEqual([row["organization"] for row in report["organizations"]],
+                         ["Books", "Music"])
+        self.assertEqual(report["organizations"][0],
+            {"organization": "Books", "contacts": 3, "new": 0, "qualified": 2,
+             "won": 0, "lost": 1, "unknown": 1, "opportunities": 4})
+        self.assertEqual(report["organizations"][1],
+            {"organization": "Music", "contacts": 1, "new": 0, "qualified": 0,
+             "won": 0, "lost": 0, "unknown": 0, "opportunities": 0})
+        # After the win date O2 counts as won; opportunities always equal the
+        # four stages plus unknown.
+        later = self.app.funnel_snapshot_report("2024-02-10")
+        self.assertEqual(later["total"],
+            {"contacts": 4, "new": 0, "qualified": 1, "won": 1, "lost": 1,
+             "unknown": 1, "opportunities": 4})
+        # Before any dated record everything is unknown.
+        early = self.app.funnel_snapshot_report("2024-01-01")
+        self.assertEqual(early["total"],
+            {"contacts": 4, "new": 0, "qualified": 0, "won": 0, "lost": 0,
+             "unknown": 4, "opportunities": 4})
+
+    def test_funnel_snapshot_report_ignores_current_stage_and_future_or_null_records(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        # Imported directly at won with no history: counts as unknown, never won.
+        payload = self.root / "opps.csv"
+        payload.write_text("opportunity_id,contact_id,title,stage\nO1,A,Deal,won\n",
+                           encoding="utf-8")
+        self.app.import_opportunities(str(payload))
+        report = self.app.funnel_snapshot_report("2024-06-01")
+        self.assertEqual(report["total"],
+            {"contacts": 1, "new": 0, "qualified": 0, "won": 0, "lost": 0,
+             "unknown": 1, "opportunities": 1})
+        # Only future-dated or null-dated records: still unknown.
+        self.app.add_opportunity("O2", "A", "Future")
+        self.app.set_stage("O2", "qualified", on="2099-01-01")
+        self.app.add_opportunity("O3", "A", "Undated")
+        self.app.set_stage("O3", "qualified")
+        report = self.app.funnel_snapshot_report("2024-06-01")
+        self.assertEqual(report["total"]["unknown"], 3)
+        self.assertEqual(report["total"]["qualified"], 0)
+        # A far-future cutoff picks up the dated record but never the null one.
+        future = self.app.funnel_snapshot_report("2099-12-31")
+        self.assertEqual(future["total"]["qualified"], 1)
+        self.assertEqual(future["total"]["unknown"], 2)
+
+    def test_funnel_snapshot_report_same_day_and_reopen_resolution(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2024-03-01")
+        self.app.set_stage("O1", "won", on="2024-03-10")
+        self.app.reopen_opportunities([{"opportunity_id": "O1", "expected_stage": "won",
+                                        "on": "2024-03-20"}])
+        # Between the dated win and the reopen the deal counts as won.
+        self.assertEqual(self.app.funnel_snapshot_report("2024-03-15")["total"]["won"], 1)
+        # On the reopen day it counts as qualified.
+        reopened = self.app.funnel_snapshot_report("2024-03-20")
+        self.assertEqual(reopened["total"]["qualified"], 1)
+        self.assertEqual(reopened["total"]["won"], 0)
+        # Closed again on the reopen day: the last saved same-day change wins.
+        self.app.set_stage("O1", "lost", on="2024-03-20")
+        total = self.app.funnel_snapshot_report("2024-03-20")["total"]
+        self.assertEqual(total["lost"], 1)
+        self.assertEqual(total["qualified"], 0)
+        # Each opportunity counts exactly once.
+        self.assertEqual(total["opportunities"], 1)
+        self.assertEqual(total["new"] + total["qualified"] + total["won"]
+                         + total["lost"] + total["unknown"], 1)
+        # Reopening the same root recomputes from the latest data identically.
+        self.assertEqual(ContactFlow(self.root).funnel_snapshot_report("2024-03-20")["total"],
+                         total)
+
+    def test_funnel_snapshot_report_csv_layout_and_escaping(self):
+        self.seed_snapshot()
+        report = self.app.funnel_snapshot_report("2024-02-10")
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["organization", "contacts", "new", "qualified",
+                                   "won", "lost", "unknown", "opportunities"])
+        decoded = [dict(zip(rows[0], row)) for row in rows[1:]]
+        for decoded_row, row in zip(decoded, report["organizations"]):
+            for field in rows[0][1:]:
+                self.assertEqual(int(decoded_row[field]), row[field])
+        self.assertTrue(report["csv"].endswith("\n"))
+        self.assertNotIn("\r", report["csv"])
+        self.assertEqual(len(report["csv"].splitlines()), len(report["organizations"]) + 1)
+        # Standard escaping survives a strict round-trip.
+        self.app.add_contact("E", "Eve", "e@example.test", "Book, \"店\"\n二楼")
+        escaped = self.app.funnel_snapshot_report("2024-02-10")
+        self.assertIn('"Book, ""店""\n二楼",1,0,0,0,0,0,0', escaped["csv"])
+        strict = list(csv.reader(io.StringIO(escaped["csv"]), strict=True))
+        self.assertEqual(strict[1][0], "Book, \"店\"\n二楼")
+
+    def test_funnel_snapshot_report_filters_and_recomputes_after_updates(self):
+        self.seed_snapshot()
+        by_org = self.app.funnel_snapshot_report("2024-02-10", organization=" BOOKS ")
+        self.assertEqual([row["organization"] for row in by_org["organizations"]], ["Books"])
+        self.assertEqual(by_org["total"]["contacts"], 3)
+        tagged = self.app.funnel_snapshot_report("2024-02-10", tags=["VIP"])
+        self.assertEqual(tagged["total"],
+            {"contacts": 1, "new": 0, "qualified": 0, "won": 1, "lost": 0,
+             "unknown": 1, "opportunities": 2})
+        self.assertEqual(self.app.funnel_snapshot_report(
+            "2024-02-10", tags=["vip", "missing"], tag_mode="any")["total"]["contacts"], 1)
+        # Correcting a history date moves the deal between snapshot buckets.
+        self.app.correct_stage_dates([{"opportunity_id": "O2", "index": 1, "on": "2024-01-25"}])
+        moved = self.app.funnel_snapshot_report("2024-01-31")
+        self.assertEqual(moved["total"]["won"], 1)
+        self.assertEqual(moved["total"]["qualified"], 1)
+        # Updating a profile regroups; transferring re-buckets the opportunity.
+        self.app.update_contact("D", {"organization": "Music"})
+        regrouped = self.app.funnel_snapshot_report("2024-02-10")
+        by_name = {row["organization"]: row for row in regrouped["organizations"]}
+        self.assertEqual(by_name["Music"]["qualified"], 1)
+        self.assertEqual(by_name["Music"]["contacts"], 2)
+        self.app.transfer_opportunities([{"opportunity_id": "O3", "source_contact_id": "D",
+                                          "target_contact_id": "C"}])
+        transferred = self.app.funnel_snapshot_report("2024-02-10")
+        by_name = {row["organization"]: row for row in transferred["organizations"]}
+        self.assertEqual(by_name["Music"]["qualified"], 1)
+        # Merging keeps the opportunity count and moves the deals with the contact.
+        before = self.app.funnel_snapshot_report("2024-02-10")["total"]["opportunities"]
+        self.app.merge_contacts("D", "C")
+        merged = self.app.funnel_snapshot_report("2024-02-10")
+        self.assertEqual(merged["total"]["opportunities"], before)
+
+    def test_funnel_snapshot_report_empty_and_validation(self):
+        # Empty store: counts all zero, no organizations, header-only CSV, and
+        # the query never creates the directory.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        report = fresh.funnel_snapshot_report("2024-06-01")
+        self.assertEqual(report["total"],
+            {"contacts": 0, "new": 0, "qualified": 0, "won": 0, "lost": 0,
+             "unknown": 0, "opportunities": 0})
+        self.assertEqual(report["organizations"], [])
+        self.assertEqual(report["csv"],
+                         "organization,contacts,new,qualified,won,lost,unknown,opportunities\n")
+        self.assertFalse(fresh_root.exists())
+        # Dates and filters validate even against the empty store.
+        for kwargs in [{"as_of": "2024-13-01"}, {"as_of": "2023-02-29"},
+                       {"as_of": " 2024-01-01x"}, {"as_of": 20240101}, {"as_of": None},
+                       {"as_of": "2024-01-01", "organization": 5},
+                       {"as_of": "2024-01-01", "tags": "vip"},
+                       {"as_of": "2024-01-01", "tag_mode": "ALL"}]:
+            with self.assertRaises(ValueError):
+                fresh.funnel_snapshot_report(**kwargs)
+        self.assertFalse(fresh_root.exists())
+        # A missing as_of is a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            fresh.funnel_snapshot_report()
+        # Legal leap days, past and future dates and surrounding whitespace pass.
+        self.assertEqual(fresh.funnel_snapshot_report(" 2024-02-29 ")["total"]["contacts"], 0)
+        self.assertEqual(fresh.funnel_snapshot_report("1999-12-31")["total"]["opportunities"], 0)
+        self.assertFalse(fresh_root.exists())
+        # No match: zero counts, empty organizations, header-only CSV, no writes.
+        self.seed_snapshot()
+        before = self.app.path.read_bytes()
+        none = self.app.funnel_snapshot_report("2024-02-10", organization="Missing")
+        self.assertEqual(none["total"]["contacts"], 0)
+        self.assertEqual(none["organizations"], [])
+        self.assertEqual(none["csv"],
+                         "organization,contacts,new,qualified,won,lost,unknown,opportunities\n")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_funnel_snapshot_report_success_and_failure(self):
+        self.seed_snapshot()
+        payload = self.root / "snapshot.json"
+        payload.write_text(json.dumps({"as_of": "2024-02-10"}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "funnel-snapshot-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        report = json.loads(ok.stdout)
+        self.assertEqual(report["total"],
+            {"contacts": 4, "new": 0, "qualified": 1, "won": 1, "lost": 1,
+             "unknown": 1, "opportunities": 4})
+        # Array input: each item is an independent call.
+        payload.write_text(json.dumps([{"as_of": "2024-01-01"},
+                                       {"as_of": "2024-02-10", "organization": "Music"}]),
+                           encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                "funnel-snapshot-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"]["unknown"], 4)
+        self.assertEqual(values[1]["organizations"][0]["organization"], "Music")
+        # Missing as_of or an invalid date: exit 2, empty stdout, JSON error.
+        payload.write_text(json.dumps({"as_of": "not-a-date"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                 "funnel-snapshot-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        json.loads(failed.stderr)
+        payload.write_text(json.dumps({}), encoding="utf-8")
+        missing = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "funnel-snapshot-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 2)
+        json.loads(missing.stderr)
+
     def test_set_reminder_replaces_and_persists_trimmed_values(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         result = self.app.set_reminder(" A ", "2024-02-29", "  call  him  ")
