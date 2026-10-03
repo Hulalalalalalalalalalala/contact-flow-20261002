@@ -118,6 +118,98 @@ class ProductTests(unittest.TestCase):
         # contact return structure is unchanged
         self.assertEqual(self.app.find(tags=["vip"])[0], {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
 
+    def test_find_tag_expression_semantics(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.add_contact("D", "Dan", "d@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东", "暂停"])
+        self.app.set_tags("B", ["vip", "华南"])
+        self.app.set_tags("C", ["vip", "华东"])
+        # D has no tags at all.
+        expression = '"vip" && ("华东" || "华南") && !"暂停"'
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression=expression)], ["B", "C"])
+        # Precedence: ! binds tightest, then &&, then ||.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='"华东" || "华南" && !"vip"')], ["A", "C"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='!"华东" && !"华南"')], ["D"])
+        # Consecutive negations and nested parentheses.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='!!"vip"')], ["A", "B", "C"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='!(("华东" || "华南") && !"vip")')],
+                         ["A", "B", "C", "D"])
+        # Unknown tags count as absent, so their negation is true; a pure
+        # exclusion expression selects contacts without any tags.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='!"missing"')], ["A", "B", "C", "D"])
+        self.assertEqual(self.app.find(tag_expression='"missing"'), [])
+        # Tags normalize like set-tags: trimmed and casefolded.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression=' " VIP " ')], ["A", "B", "C"])
+        # JSON escapes decode before normalization; Unicode whitespace between
+        # tokens is ignored.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='"\\u0076ip"\u3000&&\t"华东"')], ["A", "C"])
+        # Operators and parentheses inside quotes are tag content.
+        self.app.set_tags("D", ["a&&b", "x(y)"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='"a&&b" && "x(y)"')], ["D"])
+        # The expression intersects with organization and tags/tag_mode.
+        self.assertEqual([c["contact_id"] for c in self.app.find(organization="music", tag_expression='"vip"')], ["C"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tags=["华东"], tag_expression='"vip"')], ["A", "C"])
+        self.assertEqual([c["contact_id"] for c in self.app.find(tags=["华东"], tag_expression='!"暂停"')], ["C"])
+        # Results stay sorted by contact id with each contact at most once.
+        self.assertEqual([c["contact_id"] for c in self.app.find(tag_expression='"vip" || "华东"')], ["A", "B", "C"])
+        # Omitting the parameter or passing None keeps the legacy behavior.
+        self.assertEqual(self.app.find(tag_expression=None), self.app.find())
+
+    def test_find_tag_expression_validation(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_tags("A", ["vip"])
+        bad = [
+            "", "   ", '"unterminated', '"bad\\xescape"', '"a" "b"', '"a" &&',
+            '&& "a"', "!", "()", "(", ")", '("a"', '"a")', "vip", '"a" & "b"',
+            '"a" | "b"', '"a" ? "b"', '("a"))', '" "', '""', '"a" && ()',
+        ]
+        for expression in bad:
+            with self.assertRaises(ValueError, msg=expression):
+                self.app.find(tag_expression=expression)
+        for not_string in [5, True, ["vip"], {"tag": "vip"}]:
+            with self.assertRaises(ValueError):
+                self.app.find(tag_expression=not_string)
+        # The whole expression validates even when nothing could match: an
+        # unknown organization or an empty store never hides a malformed tail.
+        with self.assertRaises(ValueError):
+            self.app.find(organization="nobody", tag_expression='"vip" &&')
+        empty = ContactFlow(Path(self.temp.name) / "empty")
+        with self.assertRaises(ValueError):
+            empty.find(tag_expression='"vip" &&')
+        self.assertFalse(empty.path.exists())
+        # A failed query never creates the directory or rewrites data.
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.find(tag_expression='"a" "b"')
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_find_tag_expression(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        payload = self.root / "find.json"
+        payload.write_text(json.dumps({"tag_expression": '"vip" && !"华东"'}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([c["contact_id"] for c in json.loads(ok.stdout)], ["B"])
+        # Each item of an outer array is an independent query.
+        payload.write_text(json.dumps([{"tag_expression": '"vip"'}, {"tag_expression": '"华东"'}]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root), "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        self.assertEqual([[c["contact_id"] for c in row] for row in json.loads(batch.stdout)], [["A", "B"], ["A"]])
+        # A malformed expression reports the error envelope on stderr, keeps
+        # stdout empty, exits 2 and never creates a data directory.
+        fresh = Path(self.temp.name) / "fresh"
+        payload.write_text(json.dumps({"tag_expression": '"vip" &&'}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(fresh), "find", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertFalse((fresh / "data.json").exists())
+
     def test_duplicate_candidates_pairs_and_ordering(self):
         self.app.add_contact("A", "陈小明", "a@example.test", "Books")
         self.app.add_contact("B", "陈晓明", "b@example.test", "Books")

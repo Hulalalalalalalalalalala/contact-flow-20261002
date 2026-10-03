@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import unicodedata
 from calendar import monthrange
 from datetime import date
@@ -25,6 +26,111 @@ def normalize_tags(value):
             raise ValueError("tags must be nonempty strings")
         tags.add(tag)
     return sorted(tags)
+
+def _scan_json_string(expression, start):
+    # A tag is one JSON double-quoted string; operators and parentheses inside
+    # the quotes are tag content. The token ends at the first unescaped quote.
+    index = start + 1
+    while index < len(expression):
+        char = expression[index]
+        if char == "\\":
+            index += 2
+        elif char == '"':
+            try:
+                value = json.loads(expression[start:index + 1])
+            except ValueError as error:
+                raise ValueError("invalid JSON string in tag expression") from error
+            # Decoded tags follow set-tags normalization: trim, casefold, keep
+            # inner whitespace and every other character.
+            tag = value.strip().casefold()
+            if not tag:
+                raise ValueError("tags must be nonempty strings")
+            return ("tag", tag), index + 1
+        else:
+            index += 1
+    raise ValueError("unterminated string in tag expression")
+
+def _tokenize_tag_expression(expression):
+    # Unicode whitespace between tokens is ignored; anything that is not a
+    # quoted tag, &&, ||, ! or a parenthesis is an unknown symbol (a bare tag
+    # included).
+    tokens = []
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if char.isspace():
+            index += 1
+        elif char == '"':
+            token, index = _scan_json_string(expression, index)
+            tokens.append(token)
+        elif expression.startswith("&&", index):
+            tokens.append("&&")
+            index += 2
+        elif expression.startswith("||", index):
+            tokens.append("||")
+            index += 2
+        elif char in "!()":
+            tokens.append(char)
+            index += 1
+        else:
+            raise ValueError("unexpected character in tag expression: " + char)
+    return tokens
+
+def _parse_or(tokens, position):
+    left, position = _parse_and(tokens, position)
+    while position < len(tokens) and tokens[position] == "||":
+        right, position = _parse_and(tokens, position + 1)
+        left = _both_or(left, right)
+    return left, position
+
+def _both_or(left, right):
+    return lambda tags: left(tags) or right(tags)
+
+def _parse_and(tokens, position):
+    left, position = _parse_unary(tokens, position)
+    while position < len(tokens) and tokens[position] == "&&":
+        right, position = _parse_unary(tokens, position + 1)
+        left = _both_and(left, right)
+    return left, position
+
+def _both_and(left, right):
+    return lambda tags: left(tags) and right(tags)
+
+def _parse_unary(tokens, position):
+    # Negation binds tightest and stacks: !!“a” is “a”.
+    if position < len(tokens) and tokens[position] == "!":
+        inner, position = _parse_unary(tokens, position + 1)
+        return (lambda tags, inner=inner: not inner(tags)), position
+    return _parse_primary(tokens, position)
+
+def _parse_primary(tokens, position):
+    if position >= len(tokens):
+        raise ValueError("missing operand in tag expression")
+    token = tokens[position]
+    if isinstance(token, tuple):
+        tag = token[1]
+        return (lambda tags, tag=tag: tag in tags), position + 1
+    if token == "(":
+        inner, position = _parse_or(tokens, position + 1)
+        if position >= len(tokens) or tokens[position] != ")":
+            raise ValueError("unbalanced parentheses in tag expression")
+        return inner, position + 1
+    # An operator or ")" where an operand belongs: missing operand (this also
+    # covers empty parentheses).
+    raise ValueError("missing operand in tag expression")
+
+def _tag_expression_predicate(expression):
+    # The whole expression tokenizes and parses up front, so a malformed tail
+    # rejects even when the store is empty or earlier conditions already decide.
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("tag_expression must be a nonempty string")
+    tokens = _tokenize_tag_expression(expression)
+    predicate, position = _parse_or(tokens, 0)
+    if position != len(tokens):
+        # Adjacent tags with no operator, a stray ")" or any other trailing
+        # content after a complete expression.
+        raise ValueError("unexpected content after complete tag expression")
+    return predicate
 
 # Distinguishes an omitted next_reminder (auto-renew a monthly reminder) from
 # an explicit None (terminate repetition and clear the reminder).
@@ -907,10 +1013,14 @@ class ContactFlow(JsonStore):
                  "moved_followups": moved.get(source_id, 0)}
                 for source_id, _ in entries]
 
-    def find(self, organization=None, tags=None, tag_mode="all"):
+    def find(self, organization=None, tags=None, tag_mode="all", tag_expression=None):
         wanted = [] if tags is None else normalize_tags(tags)
         if tag_mode not in ("all", "any"):
             raise ValueError("tag_mode must be 'all' or 'any'")
+        # An omitted or None tag_expression keeps the legacy behavior; a given
+        # one parses and validates in full before any data is read, then
+        # intersects with the organization and tags/tag_mode conditions.
+        predicate = None if tag_expression is None else _tag_expression_predicate(tag_expression)
         data = self._read()
         contacts = data.get("contacts", {}).values()
         tag_store = data.get("tags", {})
@@ -918,11 +1028,20 @@ class ContactFlow(JsonStore):
         def matches(contact):
             if organization is not None and contact["organization"].casefold() != organization.strip().casefold():
                 return False
+            have = None
             if wanted:
                 have = set(tag_store.get(contact["contact_id"], []))
                 if tag_mode == "all" and not set(wanted) <= have:
                     return False
                 if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            if predicate is not None:
+                # Contacts without a tag set (or old data without the tags
+                # collection) evaluate against the empty set, so a pure
+                # exclusion expression can still select them.
+                if have is None:
+                    have = set(tag_store.get(contact["contact_id"], []))
+                if not predicate(have):
                     return False
             return True
 
