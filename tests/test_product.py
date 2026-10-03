@@ -4487,5 +4487,333 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(by_id["O2"]["stage"], "qualified")
         self.assertEqual(by_id["O3"]["stage"], "won")
 
+    def test_reopen_opportunities_batch_returns_full_opportunities_in_order(self):
+        self.seed_stage_deals()
+        result = self.app.reopen_opportunities([
+            {"opportunity_id": " O3 ", "expected_stage": " won ", "on": " 2026-10-01 "},
+            {"opportunity_id": "O4", "expected_stage": "lost", "on": "2026-10-02"},
+        ])
+        # Input order, not id order; values are trimmed; the full opportunity is
+        # returned with title, ownership, amount and id preserved.
+        self.assertEqual(result, [
+            {"opportunity_id": "O3", "contact_id": "B", "title": "Third",
+             "stage": "qualified", "amount": "12.50"},
+            {"opportunity_id": "O4", "contact_id": "B", "title": "Fourth", "stage": "qualified"},
+        ])
+        reopened = ContactFlow(self.root)
+        by_id = {o["opportunity_id"]: o for o in reopened.find_opportunities()}
+        self.assertEqual({oid: o["stage"] for oid, o in by_id.items()},
+                         {"O1": "new", "O2": "qualified", "O3": "qualified", "O4": "qualified"})
+        # Amount survives on O3; the never-priced O4 keeps no amount field.
+        self.assertEqual(by_id["O3"]["amount"], "12.50")
+        self.assertNotIn("amount", by_id["O4"])
+        # One record appended at the end of each deal's existing history.
+        self.assertEqual(reopened.stage_history("O3"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-10"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-20"},
+            {"from_stage": "won", "to_stage": "qualified", "on": "2026-10-01"},
+        ])
+        self.assertEqual(reopened.stage_history("O4"), [
+            {"from_stage": "new", "to_stage": "lost", "on": "2026-08-01"},
+            {"from_stage": "lost", "to_stage": "qualified", "on": "2026-10-02"},
+        ])
+
+    def test_reopen_opportunities_requires_list_and_missing_argument_is_type_error(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        for bad in [None, {}, {"reopens": []}, "x", 5, True,
+                    ({"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"},)]:
+            with self.assertRaises(ValueError):
+                self.app.reopen_opportunities(bad)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.reopen_opportunities()
+
+    def test_reopen_opportunities_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.reopen_opportunities([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.reopen_opportunities([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_reopen_opportunities_validates_item_shape_and_fields_without_partial_changes(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        bad_batches = [
+            [None], [5], ["x"], [[]], [{}],
+            [{"opportunity_id": "O3", "expected_stage": "won"}],
+            [{"opportunity_id": "O3", "on": "2026-10-01"}],
+            [{"expected_stage": "won", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01", "extra": 1}],
+            [{"opportunity_id": "O3", "expected_stage": "Won", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": "qualified", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": "new", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": "  ", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": None, "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": 5, "on": "2026-10-01"}],
+            [{"opportunity_id": "", "expected_stage": "won", "on": "2026-10-01"}],
+            [{"opportunity_id": "   ", "expected_stage": "won", "on": "2026-10-01"}],
+            [{"opportunity_id": 5, "expected_stage": "won", "on": "2026-10-01"}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": None}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": 5}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-1-1"}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-02-30"}],
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "not-a-date"}],
+            # A valid first item followed by an invalid second item rolls both back.
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"},
+             {"opportunity_id": "O4", "expected_stage": "lost", "on": "bad"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.reopen_opportunities(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_reopen_opportunities_rejects_unknown_duplicate_mismatch_and_dates(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        # Unknown opportunity, including a case-sensitive miss and an empty store.
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O9", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "o3", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.reopen_opportunities(
+                [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertFalse((self.root / "fresh").exists())
+        # Duplicate normalized ids reject the batch, even when the items are identical.
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities([
+                {"opportunity_id": " O3 ", "expected_stage": "won", "on": "2026-10-01"},
+                {"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The expected stage must equal the current one: wrong terminal stage,
+        # and deals still open (new or qualified) cannot reopen at all.
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O3", "expected_stage": "lost", "on": "2026-10-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O4", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O2", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Date regression against the latest non-null history date rejects; same
+        # day, future dates and legal leap days are accepted.
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-09-19"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        ok = self.app.reopen_opportunities(
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-09-20"}])
+        self.assertEqual(ok[0]["stage"], "qualified")
+        self.app.set_stage("O3", "lost", "2099-01-01")
+        again = self.app.reopen_opportunities(
+            [{"opportunity_id": "O3", "expected_stage": "lost", "on": "2099-01-01"}])
+        self.assertEqual(again[0]["stage"], "qualified")
+
+    def test_reopen_opportunities_is_atomic_when_a_later_item_fails(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities([
+                {"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"},
+                {"opportunity_id": "O4", "expected_stage": "won", "on": "2026-10-02"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.find_opportunities(stage="won")[0]["opportunity_id"], "O3")
+        self.assertEqual(reopened.find_opportunities(stage="lost")[0]["opportunity_id"], "O4")
+        self.assertEqual(len(reopened.stage_history("O3")), 2)
+        self.assertEqual(len(reopened.stage_history("O4")), 1)
+
+    def test_reopen_opportunities_again_requires_reclosing(self):
+        self.seed_stage_deals()
+        self.app.reopen_opportunities(
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"}])
+        before = self.app.path.read_bytes()
+        # Reopening again without re-closing rejects: the deal is qualified now.
+        with self.assertRaises(ValueError):
+            self.app.reopen_opportunities(
+                [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-02"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # set-stage and set-stages still refuse to move a deal out of a terminal
+        # stage directly; only reopen_opportunities brings it back to qualified.
+        with self.assertRaises(ValueError):
+            self.app.set_stage("O4", "qualified")
+        with self.assertRaises(ValueError):
+            self.app.set_stages([{"opportunity_id": "O4", "stage": "qualified"}])
+        # After a fresh close the deal can be reopened once more.
+        self.app.set_stage("O3", "won", "2026-10-05")
+        result = self.app.reopen_opportunities(
+            [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-06"}])
+        self.assertEqual(result[0]["stage"], "qualified")
+        self.assertEqual([h["to_stage"] for h in self.app.stage_history("O3")],
+                         ["qualified", "won", "qualified", "won", "qualified"])
+
+    def test_reopen_opportunities_reflects_in_reports_and_preserves_records(self):
+        self.seed_stage_deals()
+        self.app.set_tags("A", ["vip"])
+        self.app.follow_up("A", "2026-09-15", "note one")
+        self.app.set_reminder("B", "2026-11-05", "call back")
+        self.app.reopen_opportunities([
+            {"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"},
+            {"opportunity_id": "O4", "expected_stage": "lost", "on": "2026-10-02"},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["note one"])
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "B", "due_on": "2026-11-05", "note": "call back"}])
+        by_id = {o["opportunity_id"]: o for o in reopened.find_opportunities()}
+        self.assertEqual((by_id["O3"]["contact_id"], by_id["O3"]["title"]), ("B", "Third"))
+        # Funnel and amount reports count the deals as qualified; totals stay.
+        funnel = reopened.funnel_report()
+        self.assertEqual(funnel["total"],
+                         {"contacts": 2, "new": 1, "qualified": 3, "won": 0, "lost": 0,
+                          "opportunities": 4})
+        amounts = reopened.opportunity_amount_report()["total"]
+        self.assertEqual((amounts["qualified"], amounts["won"], amounts["amount"]),
+                         ("12.50", "0.00", "12.50"))
+        # The stage-change report shows the new reopen records.
+        changes = reopened.stage_change_report("2026-08-01", "2026-10-31")
+        self.assertEqual([(r["opportunity_id"], r["to_stage"], r["on"]) for r in changes["records"]],
+                         [("O4", "lost", "2026-08-01"),
+                          ("O2", "qualified", "2026-09-01"),
+                          ("O3", "qualified", "2026-09-10"),
+                          ("O3", "won", "2026-09-20"),
+                          ("O3", "qualified", "2026-10-01"),
+                          ("O4", "qualified", "2026-10-02")])
+        # Stalled query measures from the reopen date, not the original entry.
+        stalled = reopened.stalled_opportunities("2026-10-10", 5)
+        self.assertEqual([(row["opportunity"]["opportunity_id"], row["age_days"])
+                          for row in stalled], [("O2", 39), ("O3", 9), ("O4", 8)])
+        # Win-cycle and conversion reports keep their existing rules: the old won
+        # event still counts and the reopen record does not rewrite the outcome.
+        cycle = reopened.win_cycle_report("2026-09-01", "2026-09-30")["total"]
+        self.assertEqual((cycle["won"], cycle["measured"], cycle["days"], cycle["average"]),
+                         (1, 1, 10, "10.00"))
+        conversion = reopened.conversion_report("2026-09-01", "2026-09-30", "2026-09-30")["total"]
+        self.assertEqual((conversion["entered"], conversion["won"], conversion["open"],
+                          conversion["win_rate"]), (2, 1, 1, "50.00"))
+
+    def test_reopen_opportunities_on_legacy_data_without_collections(self):
+        # No opportunities collection: a nonempty batch fails with the file bytes
+        # intact and creates nothing extra; an empty batch still succeeds quietly.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"A": {"contact_id": "A", "name": "Alice",
+                                "email": "a@example.test", "organization": "Books"}}}),
+            encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        self.assertEqual(legacy.reopen_opportunities([]), [])
+        with self.assertRaises(ValueError):
+            legacy.reopen_opportunities(
+                [{"opportunity_id": "O1", "expected_stage": "won", "on": "2026-10-01"}])
+        self.assertEqual(json.loads((legacy_root / "data.json").read_text(encoding="utf-8")),
+                         {"contacts": {"A": {"contact_id": "A", "name": "Alice",
+                                             "email": "a@example.test", "organization": "Books"}}})
+        # A legacy store with a closed deal but no stage_history collection starts
+        # recording from the closed stage, with no back-filled earlier records.
+        other_root = self.root / "other"
+        other_root.mkdir()
+        (other_root / "data.json").write_text(json.dumps({
+            "contacts": {"A": {"contact_id": "A", "name": "Alice",
+                               "email": "a@example.test", "organization": "Books"}},
+            "opportunities": {"O1": {"opportunity_id": "O1", "contact_id": "A",
+                                     "title": "Deal", "stage": "lost"}}}), encoding="utf-8")
+        other = ContactFlow(other_root)
+        result = other.reopen_opportunities(
+            [{"opportunity_id": "O1", "expected_stage": "lost", "on": "2024-02-29"}])
+        self.assertEqual(result, [{"opportunity_id": "O1", "contact_id": "A",
+                                   "title": "Deal", "stage": "qualified"}])
+        self.assertEqual(ContactFlow(other_root).stage_history("O1"),
+                         [{"from_stage": "lost", "to_stage": "qualified", "on": "2024-02-29"}])
+
+    def test_cli_reopen_opportunities_object_array_and_failure(self):
+        self.seed_stage_deals()
+        payload = self.root / "batch.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "reopen-opportunities", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"reopens": [
+            {"opportunity_id": " O3 ", "expected_stage": " won ", "on": " 2026-10-01 "},
+            {"opportunity_id": "O4", "expected_stage": "lost", "on": "2026-10-02"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"opportunity_id": "O3", "contact_id": "B", "title": "Third",
+             "stage": "qualified", "amount": "12.50"},
+            {"opportunity_id": "O4", "contact_id": "B", "title": "Fourth", "stage": "qualified"},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.stage_history("O4")[-1],
+                         {"from_stage": "lost", "to_stage": "qualified", "on": "2026-10-02"})
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"reopens": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"reopens": [
+            {"opportunity_id": "O1", "expected_stage": "new", "on": "2026-10-01"},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # reopens must be a list.
+        not_list = cli({"reopens": {"opportunity_id": "O3", "expected_stage": "won",
+                                    "on": "2026-10-01"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"reopens": [{"opportunity_id": "O3", "expected_stage": "won",
+                                 "on": "2026-10-01"}]}, root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_reopen_opportunities_outer_array_keeps_earlier_batches(self):
+        self.seed_stage_deals()
+        payload = self.root / "batches.json"
+        # Outer array runs whole batches independently; a later failed batch keeps
+        # the earlier successful batch (unlike atomicity inside one reopens list).
+        payload.write_text(json.dumps([
+            {"reopens": [{"opportunity_id": "O3", "expected_stage": "won", "on": "2026-10-01"}]},
+            {"reopens": [{"opportunity_id": "ZZZ", "expected_stage": "lost", "on": "2026-10-02"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "reopen-opportunities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        by_id = {o["opportunity_id"]: o for o in ContactFlow(self.root).find_opportunities()}
+        self.assertEqual(by_id["O3"]["stage"], "qualified")
+        self.assertEqual(by_id["O4"]["stage"], "lost")
+
 if __name__ == "__main__":
     unittest.main()

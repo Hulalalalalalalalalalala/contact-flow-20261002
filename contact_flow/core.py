@@ -918,6 +918,76 @@ class ContactFlow(JsonStore):
         self._write(data)
         return results
 
+    def reopen_opportunities(self, reopens):
+        # Reopen a batch of closed deals back to qualified. The whole batch
+        # validates against each deal's pre-call stage before any stage or
+        # history changes, so a rejected item never leaves half the batch
+        # applied; stage changes and history appends commit in a single write.
+        if not isinstance(reopens, list):
+            raise ValueError("reopens must be a list")
+        if not reopens:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        reopen_keys = {"opportunity_id", "expected_stage", "on"}
+        entries = []
+        seen = set()
+        for item in reopens:
+            if not isinstance(item, dict) or set(item) != reopen_keys:
+                raise ValueError(
+                    "each reopen must be an object with exactly opportunity_id, "
+                    "expected_stage and on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            # Only the two terminal stages can be expected, case preserved.
+            expected_stage = text(item["expected_stage"], "expected_stage")
+            if expected_stage not in ("won", "lost"):
+                raise ValueError("expected_stage must be won or lost")
+            # The reopen date is required: a trimmed real YYYY-MM-DD string
+            # (past, future and leap days allowed, no system clock).
+            on = calendar_day(item["on"], "on")
+            # Normalized ids are case-sensitive; a repeated opportunity id (even
+            # an identical item) rejects the whole batch.
+            if opportunity_id in seen:
+                raise ValueError("duplicate opportunity id in reopens")
+            seen.add(opportunity_id)
+            entries.append((opportunity_id, expected_stage, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        history_store = data.get("stage_history", {})
+        planned = []
+        for opportunity_id, expected_stage, on in entries:
+            opportunity = opportunities.get(opportunity_id)
+            if opportunity is None:
+                raise ValueError("unknown opportunity")
+            # Only a closed deal reopens, and the claimed stage must equal the
+            # actual current one; an already reopened (qualified) deal rejects
+            # until it is closed again.
+            if opportunity["stage"] != expected_stage:
+                raise ValueError("expected_stage does not match the current stage")
+            # The date must not precede the latest non-null date already
+            # recorded for this deal; same day is allowed and null records
+            # never move that lower bound. Each deal appears once, so the
+            # pre-call history is the only history its date is checked against.
+            dated = [entry["on"] for entry in history_store.get(opportunity_id, [])
+                     if entry["on"] is not None]
+            if dated and on < dated[-1]:
+                raise ValueError("on must not be earlier than the latest recorded stage date")
+            planned.append((opportunity_id, opportunity, expected_stage, on))
+        # Results are the complete opportunities in input order; ids, titles,
+        # ownership and amounts stay as they were, and a deal never priced
+        # keeps no amount field.
+        results = []
+        for opportunity_id, opportunity, expected_stage, on in planned:
+            opportunity["stage"] = "qualified"
+            # The history lives outside the opportunity object itself; deals
+            # without a history collection (old data included) start recording
+            # from the closed stage, with no back-filled earlier records.
+            history_store.setdefault(opportunity_id, []).append(
+                {"from_stage": expected_stage, "to_stage": "qualified", "on": on})
+            results.append(dict(opportunity))
+        data.setdefault("stage_history", history_store)
+        self._write(data)
+        return results
+
     def set_opportunity_amount(self, opportunity_id, amount):
         opportunity_id = text(opportunity_id, "opportunity_id")
         amount = amount_string(amount, "amount")
