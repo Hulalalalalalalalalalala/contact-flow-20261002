@@ -1364,6 +1364,218 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(ContactFlow(self.root).due_reminders("2030-12-31"),
                          [{"contact_id": "A", "due_on": "2030-01-01", "note": "far"}])
 
+    def test_set_reminder_monthly_anchors_on_day_and_persists(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        result = self.app.set_reminder("A", "2024-01-31", "call", repeat_monthly=True)
+        self.assertEqual(result,
+                         {"contact_id": "A", "due_on": "2024-01-31", "note": "call",
+                          "repeat_monthly": True, "anchor_day": 31})
+        # Reopening the same root keeps the repeat rule and anchor.
+        reopened = ContactFlow(self.root)
+        due = reopened.due_reminders("2099-01-01")
+        self.assertEqual(due,
+                         [{"contact_id": "A", "due_on": "2024-01-31", "note": "call",
+                           "repeat_monthly": True, "anchor_day": 31}])
+        # Still at most one reminder per contact.
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(list(raw["reminders"]), ["A"])
+
+    def test_set_reminder_one_shot_shape_unchanged_by_default_or_false(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        # Omitted and explicit false both keep the original three-field shape.
+        self.assertEqual(self.app.set_reminder("A", "2024-02-29", "x"),
+                         {"contact_id": "A", "due_on": "2024-02-29", "note": "x"})
+        self.assertEqual(self.app.set_reminder("A", "2024-03-01", "y", repeat_monthly=False),
+                         {"contact_id": "A", "due_on": "2024-03-01", "note": "y"})
+        # Replacing a repeating reminder with false drops the whole repeat rule.
+        self.app.set_reminder("A", "2024-04-01", "rep", repeat_monthly=True)
+        replaced = self.app.set_reminder("A", "2024-05-01", "one", repeat_monthly=False)
+        self.assertEqual(set(replaced), {"contact_id", "due_on", "note"})
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["reminders"]["A"],
+                         {"contact_id": "A", "due_on": "2024-05-01", "note": "one"})
+
+    def test_set_reminder_monthly_rejects_non_boolean_without_writing(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        before = self.app.path.read_bytes()
+        # ints (even 0/1), strings, None and containers are not booleans.
+        for bad in [0, 1, "true", "false", None, [], {}]:
+            with self.assertRaises(ValueError):
+                self.app.set_reminder("A", "2024-10-01", "x", bad)
+        # Every rejection leaves the stored bytes exactly as they were.
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A rejected call against a root that never existed creates nothing.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.set_reminder("ZZZ", "2024-10-01", "x", "true")
+        self.assertFalse((self.root / "fresh").exists())
+        # Real booleans are accepted; a later rejected call leaves the file bytes unchanged.
+        self.app.set_reminder("A", "2024-10-01", "keep", repeat_monthly=False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_reminder("A", "2024-10-01", "x", "true")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_complete_monthly_renews_from_next_month_clamping_month_end(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2024-01-31", "call", repeat_monthly=True)
+        # Complete on the due day: the next month lacks a 31st, so it lands on the 29th
+        # (2024 is a leap year), keeping the anchor, note and repeat flag.
+        first = self.app.complete_reminder("A", "2024-01-31", "done one")
+        self.assertEqual(first["reminder"],
+                         {"contact_id": "A", "due_on": "2024-02-29", "note": "call",
+                          "repeat_monthly": True, "anchor_day": 31})
+        self.assertEqual(first["followup"],
+                         {"contact_id": "A", "on": "2024-01-31", "note": "done one"})
+        # Completing the clamped date then restores the 31st in March.
+        second = self.app.complete_reminder("A", "2024-02-29", "done two")
+        self.assertEqual(second["reminder"]["due_on"], "2024-03-31")
+        self.assertEqual(second["reminder"]["anchor_day"], 31)
+        # Exactly one followup per completion, each keeping its own completion note;
+        # the reminder note stays the original.
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("A")],
+                         ["done one", "done two"])
+
+    def test_complete_monthly_early_completion_skips_current_month(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2024-03-31", "call", repeat_monthly=True)
+        # Completing before the due date never keeps this month's instance.
+        result = self.app.complete_reminder("A", "2024-03-10", "early")
+        self.assertEqual(result["reminder"]["due_on"], "2024-04-30")
+
+    def test_complete_monthly_late_completion_advances_past_completion_date(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "2024-01-15", "call", repeat_monthly=True)
+        # A late completion skips intervening months without back-filling them and
+        # takes the first anchor date strictly later than the completion date.
+        result = self.app.complete_reminder("A", "2024-05-20", "late")
+        self.assertEqual(result["reminder"]["due_on"], "2024-06-15")
+        self.assertEqual(len(ContactFlow(self.root).timeline("A")), 1)
+
+    def test_complete_monthly_explicit_null_terminates_and_object_replaces(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        # Explicit null clears the repeating reminder and drops the rule.
+        self.app.set_reminder("A", "2024-01-15", "call", repeat_monthly=True)
+        terminated = self.app.complete_reminder("A", "2024-01-15", "done", None)
+        self.assertIsNone(terminated["reminder"])
+        self.assertEqual(self.app.due_reminders("2099-01-01"), [])
+        # An object replaces the repeating reminder with a one-shot reminder.
+        self.app.set_reminder("A", "2024-01-15", "call", repeat_monthly=True)
+        replaced = self.app.complete_reminder(
+            "A", "2024-01-15", "done", {"due_on": "2024-02-01", "note": "once"})
+        self.assertEqual(replaced["reminder"],
+                         {"contact_id": "A", "due_on": "2024-02-01", "note": "once"})
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["reminders"]["A"],
+                         {"contact_id": "A", "due_on": "2024-02-01", "note": "once"})
+        # The replacement is now one-shot: completing with next_reminder omitted clears it.
+        self.assertIsNone(self.app.complete_reminder("A", "2024-02-01", "again")["reminder"])
+
+    def test_complete_monthly_overflow_and_validation_reject_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.set_reminder("A", "9999-12-31", "call", repeat_monthly=True)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.complete_reminder("A", "9999-12-31", "done")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The existing replacement-date checks still apply to an explicit object.
+        self.app.set_reminder("A", "2024-01-15", "call", repeat_monthly=True)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.complete_reminder("A", "2024-01-15", "done",
+                                      {"due_on": "2024-01-15", "note": "x"})
+        with self.assertRaises(ValueError):
+            self.app.complete_reminder("A", "2024-01-15", "done",
+                                      {"due_on": "10000-01-01", "note": "x"})
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(ContactFlow(self.root).timeline("A")), 0)
+
+    def test_complete_reminders_batch_renews_monthly_in_order_atomically(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_reminder("A", "2024-01-31", "a rep", repeat_monthly=True)
+        self.app.set_reminder("B", "2024-02-15", "b rep", repeat_monthly=True)
+        result = self.app.complete_reminders([
+            {"contact_id": "A", "expected_due_on": "2024-01-31", "on": "2024-01-31",
+             "note": "a done"},
+            {"contact_id": "B", "expected_due_on": "2024-02-15", "on": "2024-02-15",
+             "note": "b done", "next_reminder": None},
+        ])
+        # Input order preserved; A auto-renews, B's explicit null terminates.
+        self.assertEqual(result[0]["reminder"]["due_on"], "2024-02-29")
+        self.assertEqual(result[0]["reminder"]["anchor_day"], 31)
+        self.assertIsNone(result[1]["reminder"])
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["contact_id"], r["due_on"]) for r in reopened.due_reminders("2099-01-01")],
+                         [("A", "2024-02-29")])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["a done"])
+        self.assertEqual([r["note"] for r in reopened.timeline("B")], ["b done"])
+
+    def test_complete_reminders_monthly_mismatch_and_overflow_roll_back(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_reminder("A", "2024-01-31", "a rep", repeat_monthly=True)
+        self.app.set_reminder("B", "9999-12-31", "b rep", repeat_monthly=True)
+        before = self.app.path.read_bytes()
+        # A mismatched expected_due_on rejects the whole batch.
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                {"contact_id": "A", "expected_due_on": "2024-01-30",
+                 "on": "2024-01-31", "note": "x"}])
+        # One item whose renewal overflows also rejects the whole batch with no
+        # partial followups or reminder changes.
+        with self.assertRaises(ValueError):
+            self.app.complete_reminders([
+                {"contact_id": "A", "expected_due_on": "2024-01-31",
+                 "on": "2024-01-31", "note": "x"},
+                {"contact_id": "B", "expected_due_on": "9999-12-31",
+                 "on": "9999-12-31", "note": "y"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(len(reopened.timeline("A")), 0)
+        self.assertEqual(len(reopened.timeline("B")), 0)
+        self.assertEqual([r["due_on"] for r in reopened.due_reminders("9999-12-31")],
+                         ["2024-01-31", "9999-12-31"])
+
+    def test_monthly_reminder_clear_and_merge_keep_or_drop_anchor(self):
+        self.app.add_contact("S", "Src", "s@example.test", "X")
+        self.app.add_contact("T", "Tgt", "t@example.test", "Y")
+        # Only the source has the earlier repeating reminder; merge keeps its anchor.
+        self.app.set_reminder("S", "2024-01-31", "src", repeat_monthly=True)
+        self.app.merge_contacts("S", "T")
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["reminders"]["T"],
+                         {"contact_id": "T", "due_on": "2024-01-31", "note": "src",
+                          "repeat_monthly": True, "anchor_day": 31})
+        self.assertEqual(ContactFlow(self.root).complete_reminder("T", "2024-01-31", "d")
+                         ["reminder"]["due_on"], "2024-02-29")
+        # Clearing removes the whole repeat rule.
+        self.assertIs(self.app.clear_reminder("T"), True)
+        self.assertNotIn("reminders", json.loads(self.app.path.read_text(encoding="utf-8")))
+
+    def test_cli_set_reminder_monthly_success_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        payload = self.root / "reminder.json"
+
+        def cli(obj):
+            payload.write_text(json.dumps(obj), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                   "set-reminder", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"contact_id": "A", "due_on": "2024-01-31", "note": "call",
+                  "repeat_monthly": True})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout),
+                         {"contact_id": "A", "due_on": "2024-01-31", "note": "call",
+                          "repeat_monthly": True, "anchor_day": 31})
+        before = self.app.path.read_bytes()
+        failed = cli({"contact_id": "A", "due_on": "2024-02-01", "note": "x",
+                      "repeat_monthly": "yes"})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def test_update_contact_changes_fields_and_persists_like_add(self):
         self.app.add_contact("A", "Alice", "alice@example.test", "Books")
         result = self.app.update_contact(" A ", {"name": "  Alice 王 ", "email": " ALICE@Example.TEST "})

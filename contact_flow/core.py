@@ -1,3 +1,4 @@
+import calendar
 import csv
 import io
 import unicodedata
@@ -11,6 +12,38 @@ OPPORTUNITY_FIELDS = ("opportunity_id", "contact_id", "title", "stage")
 UPDATABLE_FIELDS = ("name", "email", "organization")
 STAGES = ("new", "qualified", "won", "lost")
 STAGE_TRANSITIONS = {"new": ("qualified", "lost"), "qualified": ("won", "lost")}
+MAX_DATE = date(9999, 12, 31)
+# Distinguishes an omitted next_reminder (auto-renew a repeating reminder) from
+# an explicit None/JSON null (terminate the series and clear the reminder).
+_OMITTED = object()
+
+def shifted_month(year, month, offset):
+    # Absolute month counting turns a calendar month shift into a plain division;
+    # months are 1-based, so subtract one before the divide and add it back after.
+    total = (year * 12 + (month - 1)) + offset
+    return total // 12, total % 12 + 1
+
+def month_end_day(year, month):
+    return calendar.monthrange(year, month)[1]
+
+def next_monthly_due(due_on, completed_on, anchor_day):
+    # Renewal starts with the month after the current due date's month and keeps
+    # the anchor day, clamped to that month's last day when it is shorter. The
+    # first landing strictly later than the completion date wins, so completing
+    # before the due date never keeps the current month's instance and skipped
+    # months are not back-filled. A result past 9999-12-31 is impossible to store.
+    due = date.fromisoformat(due_on)
+    completed = date.fromisoformat(completed_on)
+    offset = 1
+    while True:
+        year, month = shifted_month(due.year, due.month, offset)
+        if year > MAX_DATE.year:
+            # Every later month is out of range too, so renewal is impossible.
+            raise ValueError("next reminder due_on must not be later than 9999-12-31")
+        candidate = date(year, month, min(anchor_day, month_end_day(year, month)))
+        if candidate > completed:
+            return candidate.isoformat()
+        offset += 1
 
 def normalize_tags(value):
     if not isinstance(value, list):
@@ -296,15 +329,24 @@ class ContactFlow(JsonStore):
         self._write(data)
         return entry
 
-    def set_reminder(self, contact_id, due_on, note):
+    def set_reminder(self, contact_id, due_on, note, repeat_monthly=False):
         contact_id = text(contact_id, "contact_id")
         note = text(note, "note")
         due_on = calendar_day(due_on, "due_on")
+        # Only a real boolean switches the repeat rule; ints, strings and None
+        # are rejected even though bool is a subtype of int in Python.
+        if type(repeat_monthly) is not bool:
+            raise ValueError("repeat_monthly must be a boolean")
         data = self._read()
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
-        # Each contact keeps at most one reminder; setting again replaces the whole entry.
+        # Each contact keeps at most one reminder; setting again replaces the whole
+        # entry, so a one-shot reminder drops any previous repeat fields and vice
+        # versa. A repeating reminder anchors on the first due date's day.
         reminder = {"contact_id": contact_id, "due_on": due_on, "note": note}
+        if repeat_monthly:
+            reminder["repeat_monthly"] = True
+            reminder["anchor_day"] = date.fromisoformat(due_on).day
         data.setdefault("reminders", {})[contact_id] = reminder
         self._write(data)
         return dict(reminder)
@@ -324,19 +366,57 @@ class ContactFlow(JsonStore):
         self._write(data)
         return True
 
-    def complete_reminder(self, contact_id, on, note, next_reminder=None):
+    @staticmethod
+    def _explicit_pending(contact_id, next_reminder, on):
+        # Validate the two-field object form and build the one-shot replacement;
+        # an explicit next reminder always drops any repeat rule.
+        if not isinstance(next_reminder, dict) or set(next_reminder) != {"due_on", "note"}:
+            raise ValueError("next_reminder must be an object with exactly due_on and note")
+        due_on = calendar_day(next_reminder["due_on"], "due_on")
+        if date.fromisoformat(due_on) > MAX_DATE:
+            raise ValueError("next reminder due_on must not be later than 9999-12-31")
+        if due_on <= on:
+            raise ValueError("next reminder due_on must be later than the completion date")
+        return {"contact_id": contact_id, "due_on": due_on,
+                "note": text(next_reminder["note"], "note")}
+
+    @staticmethod
+    def _resolve_pending(mode, explicit_pending, current, on):
+        # Decide the stored next reminder once the current one is known:
+        # "clear" (explicit null, or an omitted continuation on a one-shot reminder)
+        # removes it; "replace" installs the validated one-shot; "auto" either
+        # renews a repeating reminder by its anchor or clears a one-shot reminder.
+        if mode == "replace":
+            return dict(explicit_pending)
+        if mode == "clear":
+            return None
+        if current.get("repeat_monthly") is not True:
+            return None
+        anchor_day = current["anchor_day"]
+        renewed = {
+            "contact_id": current["contact_id"],
+            "due_on": next_monthly_due(current["due_on"], on, anchor_day),
+            # The renewal keeps the reminder's own note; the completion note only
+            # enters the appended followup record.
+            "note": current["note"],
+            "repeat_monthly": True,
+            "anchor_day": anchor_day,
+        }
+        return renewed
+
+    def complete_reminder(self, contact_id, on, note, next_reminder=_OMITTED):
         contact_id = text(contact_id, "contact_id")
         note = text(note, "note")
         on = calendar_day(on, "on")
-        pending = None
-        if next_reminder is not None:
-            if not isinstance(next_reminder, dict) or set(next_reminder) != {"due_on", "note"}:
-                raise ValueError("next_reminder must be an object with exactly due_on and note")
-            due_on = calendar_day(next_reminder["due_on"], "due_on")
-            if due_on <= on:
-                raise ValueError("next reminder due_on must be later than the completion date")
-            pending = {"contact_id": contact_id, "due_on": due_on,
-                       "note": text(next_reminder["note"], "note")}
+        # Omission must differ from an explicit JSON null on a repeating reminder:
+        # omitted auto-renews while null terminates the series.
+        if next_reminder is _OMITTED:
+            mode, explicit_pending = "auto", None
+        elif next_reminder is None:
+            mode, explicit_pending = "clear", None
+        else:
+            mode = "replace"
+            explicit_pending = self._explicit_pending(contact_id, next_reminder, on)
         # Everything validates before this point, so rejected calls never touch the file.
         data = self._read()
         if contact_id not in data.get("contacts", {}):
@@ -344,6 +424,7 @@ class ContactFlow(JsonStore):
         store = data.get("reminders", {})
         if contact_id not in store:
             raise ValueError("no current reminder")
+        pending = self._resolve_pending(mode, explicit_pending, store[contact_id], on)
         # Followup append and reminder clear/replace commit in a single write.
         entry = {"contact_id": contact_id, "on": on, "note": note}
         data.setdefault("followups", []).append(entry)
@@ -379,29 +460,28 @@ class ContactFlow(JsonStore):
             note = text(item["note"], "note")
             on = calendar_day(item["on"], "on")
             expected_due_on = calendar_day(item["expected_due_on"], "expected_due_on")
-            pending = None
-            next_reminder = item.get("next_reminder")
-            if next_reminder is not None:
-                if not isinstance(next_reminder, dict) or set(next_reminder) != {"due_on", "note"}:
-                    raise ValueError(
-                        "next_reminder must be an object with exactly due_on and note")
-                due_on = calendar_day(next_reminder["due_on"], "due_on")
-                if due_on <= on:
-                    raise ValueError(
-                        "next reminder due_on must be later than the completion date")
-                pending = {"contact_id": contact_id, "due_on": due_on,
-                           "note": text(next_reminder["note"], "note")}
+            # As with the single call, an omitted key auto-renews a repeating
+            # reminder, an explicit null terminates it, and an object replaces it
+            # with a one-shot reminder.
+            if "next_reminder" not in item:
+                mode, explicit_pending = "auto", None
+            elif item["next_reminder"] is None:
+                mode, explicit_pending = "clear", None
+            else:
+                mode = "replace"
+                explicit_pending = self._explicit_pending(
+                    contact_id, item["next_reminder"], on)
             # Normalized ids are case-sensitive; a repeated contact id (even an
             # identical item) rejects the whole batch.
             if contact_id in seen:
                 raise ValueError("duplicate contact id in completions")
             seen.add(contact_id)
-            entries.append((contact_id, expected_due_on, on, note, pending))
+            entries.append((contact_id, expected_due_on, on, note, mode, explicit_pending))
         data = self._read()
         contacts = data.get("contacts", {})
         store = data.get("reminders", {})
         planned = []
-        for contact_id, expected_due_on, on, note, pending in entries:
+        for contact_id, expected_due_on, on, note, mode, explicit_pending in entries:
             if contact_id not in contacts:
                 raise ValueError("unknown contact")
             current = store.get(contact_id)
@@ -411,6 +491,10 @@ class ContactFlow(JsonStore):
             # must equal the expected one supplied with the completion.
             if current["due_on"] != expected_due_on:
                 raise ValueError("expected_due_on does not match the current reminder due_on")
+            # Auto-renewal is derived from the stored repeat rule and anchor, so it
+            # is resolved here and may still reject (e.g. a next date past the
+            # maximum) before anything is written.
+            pending = self._resolve_pending(mode, explicit_pending, current, on)
             entry = {"contact_id": contact_id, "on": on, "note": note}
             planned.append((contact_id, entry, pending))
         # Everything validated; results follow input order and complete-reminder's shape.
