@@ -2316,6 +2316,91 @@ class ContactFlow(JsonStore):
 
         return {"total": total_row, "organizations": organizations, "csv": buffer.getvalue()}
 
+    QUALIFIED_DURATION_FIELDS = ("opportunity_id", "contact_id", "organization", "entry_index",
+                                 "entered_on", "ended_on", "outcome", "days")
+
+    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # One row per qualified stay round: every saved history entry into
+        # qualified whose non-null date is on/before the cutoff opens a round,
+        # including a fresh round after a close and reopen. Read-only: no
+        # directory creation, data rewrite or export file.
+        as_of = calendar_day(as_of, "as_of")
+        if organization is not None and not isinstance(organization, str):
+            raise ValueError("organization must be a string")
+        wanted = [] if tags is None else normalize_tags(tags)
+        if tag_mode not in ("all", "any"):
+            raise ValueError("tag_mode must be 'all' or 'any'")
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        history_store = data.get("stage_history", {})
+        org_key = organization.strip().casefold() if organization is not None else None
+
+        def matches(contact):
+            if org_key is not None and contact["organization"].casefold() != org_key:
+                return False
+            if wanted:
+                have = set(tag_store.get(contact["contact_id"], []))
+                if tag_mode == "all" and not set(wanted) <= have:
+                    return False
+                if tag_mode == "any" and not (set(wanted) & have):
+                    return False
+            return True
+
+        cutoff = date.fromisoformat(as_of)
+        records = []
+        for opportunity in data.get("opportunities", {}).values():
+            contact = contacts.get(opportunity["contact_id"])
+            if contact is None or not matches(contact):
+                continue
+            history = history_store.get(opportunity["opportunity_id"], [])
+            for index, entry in enumerate(history):
+                if entry["to_stage"] != "qualified":
+                    continue
+                entered_on = entry["on"]
+                # Null, future and missing-entry cases never open a row.
+                if entered_on is None or entered_on > as_of:
+                    continue
+                # The exit is the first later record (before the next entry into
+                # qualified) moving out of qualified; intermediate records and
+                # the following qualified entry itself are skipped.
+                outcome, ended_on = "open", as_of
+                for later in history[index + 1:]:
+                    if later["to_stage"] == "qualified":
+                        break
+                    if later["from_stage"] != "qualified":
+                        continue
+                    exit_on = later["on"]
+                    if exit_on is None:
+                        # A known move with an unknown date settles nothing: no
+                        # later round's date or the current stage back-fills it.
+                        outcome, ended_on = "unknown", None
+                        break
+                    if exit_on <= as_of:
+                        outcome, ended_on = later["to_stage"], exit_on
+                    # An exit dated after the cutoff leaves the round open at
+                    # as_of, but it still terminates the search.
+                    break
+                days = None if ended_on is None else (
+                    date.fromisoformat(ended_on) - date.fromisoformat(entered_on)).days
+                records.append({"opportunity_id": opportunity["opportunity_id"],
+                                "contact_id": contact["contact_id"],
+                                "organization": contact["organization"],
+                                "entry_index": index, "entered_on": entered_on,
+                                "ended_on": ended_on, "outcome": outcome, "days": days})
+        # Ascending entry day, then opportunity id code point, then round index.
+        records.sort(key=lambda record: (record["entered_on"], record["opportunity_id"],
+                                         record["entry_index"]))
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(self.QUALIFIED_DURATION_FIELDS)
+        for record in records:
+            writer.writerow(tuple(
+                "" if record[field] is None else record[field]
+                for field in self.QUALIFIED_DURATION_FIELDS))
+        return {"records": records, "csv": buffer.getvalue()}
+
     def timeline(self, contact_id):
         data = self._read()
         if contact_id not in data.get("contacts", {}):

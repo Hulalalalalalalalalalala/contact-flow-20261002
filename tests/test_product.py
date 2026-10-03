@@ -6442,5 +6442,293 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(window_bad.stdout, "")
         self.assertIn("error", json.loads(window_bad.stderr))
 
+    def seed_qualified_durations(self):
+        # Cutoff used by the tests: 2026-11-15. The raw document holds history
+        # shapes the transition API cannot create (null-date exits, a stray
+        # non-qualified record, future dates).
+        # A (Books, vip+华东): O1 qualified twice with won then lost exits;
+        # O2 a null-date entry (no row) and a dated entry with a null-date win;
+        # O3 enters qualified only after the cutoff; O4 open with a future win;
+        # O5 enters qualified on the cutoff itself.
+        # B (Books, vip): O6 won... actually lost on the same day it entered.
+        # C (Music): O7 a measured win; O8 imported qualified without history.
+        # D (Books): O9 exit preceded by a stray non-qualified record; O10 two
+        # rounds, the second ending in a null-date loss.
+        # 陈 (Books): 陈1 still open since September.
+        # E (org needing CSV escaping): O11 still open.
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "data.json").write_text(json.dumps({
+            "contacts": {
+                "A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                      "organization": "Books"},
+                "B": {"contact_id": "B", "name": "Bob", "email": "b@example.test",
+                      "organization": "Books"},
+                "C": {"contact_id": "C", "name": "Cara", "email": "c@example.test",
+                      "organization": "Music"},
+                "D": {"contact_id": "D", "name": "Dan", "email": "d@example.test",
+                      "organization": "Books"},
+                "陈": {"contact_id": "陈", "name": "Chen", "email": "chen@example.test",
+                       "organization": "Books"},
+                "E": {"contact_id": "E", "name": "Eve", "email": "e@example.test",
+                      "organization": 'Tea, "Q"\nLine2'}},
+            "tags": {"A": ["vip", "华东"], "B": ["vip"]},
+            "opportunities": {
+                "O1": {"opportunity_id": "O1", "contact_id": "A", "title": "Two rounds",
+                       "stage": "lost", "amount": "12.00"},
+                "O2": {"opportunity_id": "O2", "contact_id": "A", "title": "Null dates",
+                       "stage": "won"},
+                "O3": {"opportunity_id": "O3", "contact_id": "A", "title": "Future entry",
+                       "stage": "qualified"},
+                "O4": {"opportunity_id": "O4", "contact_id": "A", "title": "Future win",
+                       "stage": "qualified"},
+                "O5": {"opportunity_id": "O5", "contact_id": "A", "title": "Same day",
+                       "stage": "qualified"},
+                "O6": {"opportunity_id": "O6", "contact_id": "B", "title": "Zero day",
+                       "stage": "lost"},
+                "O7": {"opportunity_id": "O7", "contact_id": "C", "title": "Measured",
+                       "stage": "won"},
+                "O8": {"opportunity_id": "O8", "contact_id": "C", "title": "Imported",
+                       "stage": "qualified"},
+                "O9": {"opportunity_id": "O9", "contact_id": "D", "title": "Stray record",
+                       "stage": "won"},
+                "O10": {"opportunity_id": "O10", "contact_id": "D", "title": "Null second exit",
+                        "stage": "lost"},
+                "陈1": {"opportunity_id": "陈1", "contact_id": "陈", "title": "Open",
+                        "stage": "qualified"},
+                "O11": {"opportunity_id": "O11", "contact_id": "E", "title": "Escaped org",
+                        "stage": "qualified"}},
+            "stage_history": {
+                "O1": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-11"},
+                       {"from_stage": "won", "to_stage": "qualified", "on": "2026-10-01"},
+                       {"from_stage": "qualified", "to_stage": "lost", "on": "2026-10-06"}],
+                "O2": [{"from_stage": "new", "to_stage": "qualified", "on": None},
+                       {"from_stage": "lost", "to_stage": "qualified", "on": "2026-10-10"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": None}],
+                "O3": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-12-01"}],
+                "O4": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-11-10"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-11-20"}],
+                "O5": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-11-15"}],
+                "O6": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+                       {"from_stage": "qualified", "to_stage": "lost", "on": "2026-09-01"}],
+                "O7": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-10-01"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-10-11"}],
+                "O9": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-08-01"},
+                       {"from_stage": "new", "to_stage": "lost", "on": "2026-08-05"},
+                       {"from_stage": "qualified", "to_stage": "won", "on": "2026-08-20"}],
+                "O10": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-07-01"},
+                        {"from_stage": "qualified", "to_stage": "won", "on": "2026-07-05"},
+                        {"from_stage": "won", "to_stage": "qualified", "on": "2026-08-01"},
+                        {"from_stage": "qualified", "to_stage": "lost", "on": None}],
+                "陈1": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"}],
+                "O11": [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-15"}]}},
+        ), encoding="utf-8")
+        self.app = ContactFlow(self.root)
+
+    def test_qualified_duration_report_rounds_outcomes_and_order(self):
+        self.seed_qualified_durations()
+        result = self.app.qualified_duration_report(" 2026-11-15 ")
+        self.assertEqual(set(result), {"records", "csv"})
+        rows = [(r["opportunity_id"], r["entry_index"], r["entered_on"], r["ended_on"],
+                 r["outcome"], r["days"]) for r in result["records"]]
+        as_of = "2026-11-15"
+
+        def span(start, end):
+            return (date.fromisoformat(end) - date.fromisoformat(start)).days
+
+        self.assertEqual(rows, [
+            ("O10", 0, "2026-07-01", "2026-07-05", "won", span("2026-07-01", "2026-07-05")),
+            # Same entry day for two opportunities orders by id code point.
+            ("O10", 2, "2026-08-01", None, "unknown", None),
+            ("O9", 0, "2026-08-01", "2026-08-20", "won", span("2026-08-01", "2026-08-20")),
+            ("O1", 0, "2026-09-01", "2026-09-11", "won", 10),
+            # Same entry day orders by opportunity id code point; zero-day is 0.
+            ("O6", 0, "2026-09-01", "2026-09-01", "lost", 0),
+            ("陈1", 0, "2026-09-01", as_of, "open", span("2026-09-01", as_of)),
+            ("O11", 0, "2026-09-15", as_of, "open", span("2026-09-15", as_of)),
+            ("O1", 2, "2026-10-01", "2026-10-06", "lost", 5),
+            ("O7", 0, "2026-10-01", "2026-10-11", "won", 10),
+            # Null-date win: unknown, no borrowed date from the other round.
+            ("O2", 1, "2026-10-10", None, "unknown", None),
+            # Exit dated after the cutoff leaves the round open ended at as_of.
+            ("O4", 0, "2026-11-10", as_of, "open", 5),
+            ("O5", 0, "2026-11-15", as_of, "open", 0),
+        ])
+        # Every row carries exactly the eight specified fields; current profile
+        # values are used and no amount leaks in.
+        for record in result["records"]:
+            self.assertEqual(set(record),
+                             {"opportunity_id", "contact_id", "organization", "entry_index",
+                              "entered_on", "ended_on", "outcome", "days"})
+        o10 = [r for r in result["records"] if r["opportunity_id"] == "O10"]
+        self.assertEqual([(r["contact_id"], r["organization"]) for r in o10],
+                         [("D", "Books"), ("D", "Books")])
+        # Excluded entirely: future entry and history-less import; O2's null
+        # round produces no row while its dated round still does.
+        ids = {r["opportunity_id"] for r in result["records"]}
+        o2_rows = [r for r in result["records"] if r["opportunity_id"] == "O2"]
+        self.assertEqual([r["entry_index"] for r in o2_rows], [1])
+        self.assertNotIn("O3", ids)
+        self.assertNotIn("O8", ids)
+
+    def test_qualified_duration_report_csv_matches_records(self):
+        self.seed_qualified_durations()
+        result = self.app.qualified_duration_report("2026-11-15")
+        csv_text = result["csv"]
+        self.assertNotIn("\r", csv_text)
+        self.assertTrue(csv_text.endswith("\n"))
+        parsed = list(csv.reader(io.StringIO(csv_text), strict=True))
+        self.assertEqual(parsed[0],
+                         ["opportunity_id", "contact_id", "organization", "entry_index",
+                          "entered_on", "ended_on", "outcome", "days"])
+        self.assertEqual(len(parsed), len(result["records"]) + 1)
+        for raw_row, record in zip(parsed[1:], result["records"]):
+            expected = []
+            for field in parsed[0]:
+                value = record[field]
+                expected.append("" if value is None else str(value))
+            self.assertEqual(raw_row, expected)
+        # Standard escaping: quoting, doubled quotes and an embedded LF.
+        self.assertIn('"Tea, ""Q""\nLine2"', csv_text)
+        # Unknown rows have empty ended_on and days fields.
+        unknown_line = next(line for line in csv_text.splitlines()
+                            if line.startswith("O2,"))
+        self.assertEqual(unknown_line, "O2,A,Books,1,2026-10-10,,unknown,")
+
+    def test_qualified_duration_report_filters_organization_tags_and_intersection(self):
+        self.seed_qualified_durations()
+
+        def ids(**filters):
+            return [(r["opportunity_id"], r["entry_index"])
+                    for r in self.app.qualified_duration_report("2026-11-15", **filters)["records"]]
+
+        # Only C works at Music: just O7's single round.
+        self.assertEqual(ids(organization=" music "), [("O7", 0)])
+        # Books excludes the Music and escaped-org owners; every other round remains.
+        self.assertEqual(len(ids(organization="Books")), 10)
+        # vip covers A and B: O1 (two rounds), O2, O4, O5, O6.
+        self.assertEqual(ids(tags=["VIP"]),
+                         [("O1", 0), ("O6", 0), ("O1", 2), ("O2", 1), ("O4", 0), ("O5", 0)])
+        # all requires every tag: A alone.
+        self.assertEqual(ids(tags=["vip", "华东"]),
+                         [("O1", 0), ("O1", 2), ("O2", 1), ("O4", 0), ("O5", 0)])
+        # any keeps the union.
+        self.assertEqual(ids(tags=["vip", "华东"], tag_mode="any"),
+                         [("O1", 0), ("O6", 0), ("O1", 2), ("O2", 1), ("O4", 0), ("O5", 0)])
+        # Organization and tags intersect.
+        self.assertEqual(len(ids(organization="Books", tags=["华东"])), 5)
+        self.assertEqual(ids(organization="Music", tags=["vip"]), [])
+
+    def test_qualified_duration_report_uses_current_ownership_profile(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_opportunity("O1", "A", "Deal")
+        self.app.set_stage("O1", "qualified", on="2026-10-01")
+        self.app.set_stage("O1", "won", on="2026-10-10")
+        self.app.transfer_opportunities([
+            {"opportunity_id": "O1", "source_contact_id": "A", "target_contact_id": "B"}])
+        self.app.update_contact("B", {"organization": "Games"})
+        result = self.app.qualified_duration_report("2026-11-01", organization="games")
+        self.assertEqual(len(result["records"]), 1)
+        record = result["records"][0]
+        self.assertEqual(record["contact_id"], "B")
+        self.assertEqual(record["organization"], "Games")
+        self.assertEqual((record["entered_on"], record["ended_on"], record["outcome"],
+                          record["days"]), ("2026-10-01", "2026-10-10", "won", 9))
+        # The old owner's organization no longer matches the moved deal.
+        self.assertEqual(
+            self.app.qualified_duration_report("2026-11-01", organization="Books")["records"], [])
+
+    def test_qualified_duration_report_empty_legacy_and_readonly(self):
+        # No data file at all: header-only CSV, and nothing is created.
+        empty_root = self.root / "empty"
+        quiet = ContactFlow(empty_root)
+        result = quiet.qualified_duration_report("2026-11-15")
+        self.assertEqual(result["records"], [])
+        self.assertEqual(
+            result["csv"],
+            "opportunity_id,contact_id,organization,entry_index,entered_on,ended_on,outcome,days\n")
+        self.assertFalse(empty_root.exists())
+        # Old data missing the opportunities, history and tags collections reads
+        # as empty without error.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                               "organization": "Books"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root).qualified_duration_report("2026-11-15")
+        self.assertEqual(legacy["records"], [])
+        self.assertTrue(legacy["csv"].endswith("\n"))
+        # Queries never rewrite the bytes of populated data.
+        self.seed_qualified_durations()
+        before = self.app.path.read_bytes()
+        self.app.qualified_duration_report("2026-11-15")
+        self.app.qualified_duration_report("2026-01-01", tags=["vip"], organization="Music")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_qualified_duration_report_validates_arguments_even_when_empty(self):
+        for kwargs in ({"as_of": "2026-13-01"}, {"as_of": "2026-02-30"}, {"as_of": None},
+                       {"as_of": 20261115}, {"as_of": "  "}):
+            with self.assertRaises(ValueError):
+                self.app.qualified_duration_report(**kwargs)
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_report("2026-11-15", organization=7)
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_report("2026-11-15", tags=[" "])
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_report("2026-11-15", tag_mode="off")
+        # Filter validation runs before any data read, so an empty store rejects too.
+        with self.assertRaises(ValueError):
+            ContactFlow(self.root / "missing").qualified_duration_report(
+                "2026-11-15", tags=[" "])
+        # A missing required argument is a plain TypeError from the signature.
+        with self.assertRaises(TypeError):
+            self.app.qualified_duration_report()
+
+    def test_cli_qualified_duration_report_success_and_failure(self):
+        self.seed_qualified_durations()
+        payload = self.root / "qualified.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "qualified-duration-report", str(payload)],
+                                  text=True, capture_output=True)
+
+        ok = cli({"as_of": " 2026-11-15 "})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(set(value), {"records", "csv"})
+        self.assertEqual(len(value["records"]), 12)
+        # Outer array runs one independent query per object.
+        batch = cli([{"as_of": "2026-11-15", "tags": ["vip"]},
+                     {"as_of": "2026-11-15", "organization": "Music"}])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(len(values[0]["records"]), 6)
+        self.assertEqual([r["opportunity_id"] for r in values[1]["records"]], ["O7"])
+        # Bad date: exit 2, empty stdout, JSON error on stderr, data untouched.
+        before = self.app.path.read_bytes()
+        failed = cli({"as_of": "2026-11-15", "tag_mode": "off"})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing as_of is a TypeError through the same error envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # A query over a nonexistent root returns the header-only CSV and
+        # creates nothing.
+        empty = self.root / "empty"
+        quiet = cli({"as_of": "2026-11-15"}, root=empty)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        quiet_value = json.loads(quiet.stdout)
+        self.assertEqual(quiet_value["records"], [])
+        self.assertEqual(
+            quiet_value["csv"],
+            "opportunity_id,contact_id,organization,entry_index,entered_on,ended_on,outcome,days\n")
+        self.assertFalse(empty.exists())
+
 if __name__ == "__main__":
     unittest.main()
