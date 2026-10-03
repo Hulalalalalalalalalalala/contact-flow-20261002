@@ -758,6 +758,78 @@ class ContactFlow(JsonStore):
         # deals without any recorded change read as an empty history.
         return [dict(entry) for entry in data.get("stage_history", {}).get(opportunity_id, [])]
 
+    def correct_stage_dates(self, corrections):
+        # The whole batch validates against the pre-call history before any
+        # date changes, so a rejected item never leaves part of the batch
+        # applied; every correction commits in a single write.
+        if not isinstance(corrections, list):
+            raise ValueError("corrections must be a list")
+        if not corrections:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        CORRECTION_KEYS = {"opportunity_id", "index", "on"}
+        entries = []
+        seen = set()
+        for item in corrections:
+            if not isinstance(item, dict) or set(item) != CORRECTION_KEYS:
+                raise ValueError(
+                    "each correction must be an object with exactly opportunity_id, index and on")
+            opportunity_id = text(item["opportunity_id"], "opportunity_id")
+            index = item["index"]
+            # type(...) is int rejects bools, which are ints in Python but never a position.
+            if type(index) is not int or index < 0:
+                raise ValueError("index must be a nonnegative integer")
+            # The replacement date must be a trimmed real YYYY-MM-DD string
+            # (past, future and leap days allowed); null never corrects a date.
+            on = calendar_day(item["on"], "on")
+            # Normalized ids are case-sensitive; a repeated (opportunity,
+            # position) pair (even an identical item) rejects the whole batch.
+            key = (opportunity_id, index)
+            if key in seen:
+                raise ValueError("duplicate opportunity id and index in corrections")
+            seen.add(key)
+            entries.append((opportunity_id, index, on))
+        data = self._read()
+        opportunities = data.get("opportunities", {})
+        history_store = data.get("stage_history", {})
+        planned = {}
+        for opportunity_id, index, on in entries:
+            if opportunity_id not in opportunities:
+                raise ValueError("unknown opportunity")
+            # Positions index the history as saved before this call; deals
+            # without a history collection read as an empty one.
+            history = history_store.get(opportunity_id, [])
+            if index >= len(history):
+                raise ValueError("index out of range for the opportunity's stage history")
+            planned.setdefault(opportunity_id, {})[index] = on
+        # Monotonicity is judged on each involved deal's final history: the
+        # non-null dates in save order must not go backwards (same day is
+        # allowed, and null records never participate in the comparison).
+        for opportunity_id, fixes in planned.items():
+            dates = [entry["on"] for entry in history_store[opportunity_id]]
+            for index, on in fixes.items():
+                dates[index] = on
+            dated = [on for on in dates if on is not None]
+            if any(dated[position] < dated[position - 1] for position in range(1, len(dated))):
+                raise ValueError("corrected dates must not go backwards in the stage history")
+        # Results are the corrected records in input order, in stage-history's
+        # shape; a batch that changes nothing reports them without rewriting.
+        results = []
+        changed = False
+        for opportunity_id, index, on in entries:
+            record = history_store[opportunity_id][index]
+            if record["on"] != on:
+                changed = True
+            results.append({"from_stage": record["from_stage"],
+                            "to_stage": record["to_stage"], "on": on})
+        if not changed:
+            return results
+        for opportunity_id, index, on in entries:
+            history_store[opportunity_id][index]["on"] = on
+        data.setdefault("stage_history", history_store)
+        self._write(data)
+        return results
+
     def set_opportunity_amount(self, opportunity_id, amount):
         opportunity_id = text(opportunity_id, "opportunity_id")
         amount = amount_string(amount, "amount")

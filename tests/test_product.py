@@ -4208,5 +4208,255 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(by_id["O2"]["stage"], "qualified")
         self.assertEqual(by_id["O3"]["stage"], "won")
 
+    def test_correct_stage_dates_batch_returns_records_in_input_order(self):
+        self.seed_stage_deals()
+        # O2 has one dated record; O3 has two; O4 has one. Fill and rewrite across deals.
+        self.app.set_stage("O2", "lost")  # null-date record at index 1
+        result = self.app.correct_stage_dates([
+            {"opportunity_id": " O2 ", "index": 1, "on": " 2026-09-05 "},
+            {"opportunity_id": "O3", "index": 0, "on": "2026-09-08"},
+            {"opportunity_id": "O2", "index": 0, "on": "2026-09-02"},
+        ])
+        self.assertEqual(result, [
+            {"from_stage": "qualified", "to_stage": "lost", "on": "2026-09-05"},
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-08"},
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-02"},
+        ])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.stage_history("O2"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-02"},
+            {"from_stage": "qualified", "to_stage": "lost", "on": "2026-09-05"},
+        ])
+        self.assertEqual(reopened.stage_history("O3"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-08"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-20"},
+        ])
+        # Only the dates change: stages, ownership, titles and amounts stay as they were.
+        by_id = {o["opportunity_id"]: o for o in reopened.find_opportunities()}
+        self.assertEqual(by_id["O2"], {"opportunity_id": "O2", "contact_id": "A",
+                                       "title": "Second", "stage": "lost"})
+        self.assertEqual(by_id["O3"]["amount"], "12.50")
+
+    def test_correct_stage_dates_requires_list_and_missing_argument_is_type_error(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        for bad in [None, {}, {"corrections": []}, "x", 5, True,
+                    ({"opportunity_id": "O2", "index": 0, "on": "2026-09-02"},)]:
+            with self.assertRaises(ValueError):
+                self.app.correct_stage_dates(bad)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.correct_stage_dates()
+
+    def test_correct_stage_dates_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.correct_stage_dates([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.correct_stage_dates([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_stage_dates_validates_item_shape_and_fields(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        good = {"opportunity_id": "O2", "index": 0, "on": "2026-09-02"}
+        bad_items = [
+            5, "x", None, [],
+            {k: v for k, v in good.items() if k != "on"},          # missing key
+            dict(good, extra=1),                                    # extra key
+            dict(good, opportunity_id="  "),                        # blank id
+            dict(good, opportunity_id="o2"),                        # ids are case-sensitive
+            dict(good, opportunity_id=None),
+            dict(good, index=True),                                 # bool is not an int here
+            dict(good, index=-1),
+            dict(good, index=1.0),
+            dict(good, index="0"),
+            dict(good, on=None),                                    # null never corrects
+            dict(good, on="2026-9-2"),
+            dict(good, on="2026-02-30"),
+            dict(good, on=""),
+        ]
+        for item in bad_items:
+            with self.assertRaises(ValueError, msg=repr(item)):
+                self.app.correct_stage_dates([item])
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # Leap days and future dates are legal replacements.
+        self.assertEqual(self.app.correct_stage_dates(
+            [{"opportunity_id": "O2", "index": 0, "on": "2024-02-29"}]),
+            [{"from_stage": "new", "to_stage": "qualified", "on": "2024-02-29"}])
+
+    def test_correct_stage_dates_rejects_unknown_out_of_range_and_duplicate(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "ZZ", "index": 0, "on": "2026-09-02"}])
+        # O1 has no history at all: every position is out of range.
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "O1", "index": 0, "on": "2026-09-02"}])
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "O2", "index": 1, "on": "2026-09-02"}])
+        # Same normalized (opportunity, position) twice rejects, even with identical items.
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([
+                {"opportunity_id": "O2", "index": 0, "on": "2026-09-02"},
+                {"opportunity_id": " O2 ", "index": 0, "on": "2026-09-02"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_stage_dates_judges_final_history_order(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        # O3 history is 2026-09-10 then 2026-09-20; moving only the first one
+        # forward past the second regresses the final order.
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "O3", "index": 0, "on": "2026-09-21"}])
+        # Moving only the second one before the first regresses too.
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "O3", "index": 1, "on": "2026-09-09"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Adjusting both in one batch succeeds when the final order is legal.
+        result = self.app.correct_stage_dates([
+            {"opportunity_id": "O3", "index": 0, "on": "2026-09-15"},
+            {"opportunity_id": "O3", "index": 1, "on": "2026-09-15"},
+        ])
+        self.assertEqual([r["on"] for r in result], ["2026-09-15", "2026-09-15"])
+        # An uncorrected null record never participates in the comparison.
+        self.app.set_stage("O1", "qualified")  # null date
+        result = self.app.correct_stage_dates([{"opportunity_id": "O1", "index": 0, "on": "2026-09-03"}])
+        self.assertEqual(result, [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-03"}])
+
+    def test_correct_stage_dates_is_atomic_when_a_later_item_fails(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([
+                {"opportunity_id": "O2", "index": 0, "on": "2026-09-02"},
+                {"opportunity_id": "O3", "index": 9, "on": "2026-09-02"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).stage_history("O2")[0]["on"], "2026-09-01")
+
+    def test_correct_stage_dates_all_noop_returns_records_without_rewrite(self):
+        self.seed_stage_deals()
+        before = self.app.path.read_bytes()
+        result = self.app.correct_stage_dates([
+            {"opportunity_id": "O2", "index": 0, "on": " 2026-09-01 "},
+            {"opportunity_id": "O3", "index": 1, "on": "2026-09-20"},
+        ])
+        self.assertEqual(result, [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"},
+            {"from_stage": "qualified", "to_stage": "won", "on": "2026-09-20"},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_stage_dates_reflects_in_reports_and_preserves_other_data(self):
+        self.seed_stage_deals()
+        self.app.follow_up("A", "2026-09-01", "hello")
+        self.app.set_tags("A", ["vip"])
+        self.app.set_reminder("A", "2026-09-30", "call")
+        before_contacts = {c["contact_id"]: c for c in ContactFlow(self.root).find()}
+        self.app.correct_stage_dates([
+            {"opportunity_id": "O2", "index": 0, "on": "2026-07-01"},
+            {"opportunity_id": "O3", "index": 0, "on": "2026-07-10"},
+            {"opportunity_id": "O3", "index": 1, "on": "2026-07-20"},
+        ])
+        reopened = ContactFlow(self.root)
+        # Date-driven reports recompute from the corrected dates.
+        report = reopened.stage_change_report("2026-07-01", "2026-07-31")
+        self.assertEqual([(r["opportunity_id"], r["on"]) for r in report["records"]],
+                         [("O2", "2026-07-01"), ("O3", "2026-07-10"), ("O3", "2026-07-20")])
+        stalled = reopened.stalled_opportunities("2026-09-30", 30)
+        self.assertEqual([r["opportunity"]["opportunity_id"] for r in stalled], ["O2"])
+        self.assertEqual(stalled[0]["entered_on"], "2026-07-01")
+        # Contacts, tags, followups and reminders are untouched.
+        self.assertEqual({c["contact_id"]: c for c in reopened.find()}, before_contacts)
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["hello"])
+        self.assertEqual([r["contact_id"] for r in reopened.due_reminders("2026-09-30")], ["A"])
+
+    def test_correct_stage_dates_on_legacy_data_without_history_collection(self):
+        self.seed_stage_deals()
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del data["stage_history"]
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                                 encoding="utf-8")
+        # Every history reads as empty, so every position is out of range.
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.correct_stage_dates([{"opportunity_id": "O2", "index": 0, "on": "2026-09-02"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_correct_stage_dates_object_array_and_failure(self):
+        self.seed_stage_deals()
+        payload = self.root / "corrections.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "correct-stage-dates", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"corrections": [
+            {"opportunity_id": " O2 ", "index": 0, "on": " 2026-08-15 "},
+            {"opportunity_id": "O3", "index": 0, "on": "2026-09-11"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-08-15"},
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-11"},
+        ])
+        self.assertEqual(ContactFlow(self.root).stage_history("O2")[0]["on"], "2026-08-15")
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"corrections": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"corrections": [
+            {"opportunity_id": "O2", "index": 0, "on": "2026-08-16"},
+            {"opportunity_id": "O2", "index": 0, "on": "2026-08-17"},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # corrections must be a list.
+        not_list = cli({"corrections": {"opportunity_id": "O2", "index": 0, "on": "2026-08-16"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"corrections": [{"opportunity_id": "O2", "index": 0, "on": "2026-08-16"}]},
+                   root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_correct_stage_dates_outer_array_keeps_earlier_batches(self):
+        self.seed_stage_deals()
+        payload = self.root / "batches.json"
+        # Outer array runs whole batches independently; a later failed batch keeps
+        # the earlier successful batch (unlike atomicity inside one corrections list).
+        payload.write_text(json.dumps([
+            {"corrections": [{"opportunity_id": "O2", "index": 0, "on": "2026-08-15"}]},
+            {"corrections": [{"opportunity_id": "O3", "index": 9, "on": "2026-08-15"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "correct-stage-dates", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.stage_history("O2")[0]["on"], "2026-08-15")
+        self.assertEqual(reopened.stage_history("O3")[0]["on"], "2026-09-10")
+
 if __name__ == "__main__":
     unittest.main()
