@@ -266,6 +266,87 @@ class ContactFlow(JsonStore):
         self._write(data)
         return results
 
+    def rename_contacts(self, renames):
+        # Batch contact-id correction. The whole batch validates against the
+        # pre-call identities before anything changes, so renames can swap or
+        # cycle ids while a rejected item never leaves half the batch applied;
+        # every id change commits in a single write.
+        if not isinstance(renames, list):
+            raise ValueError("renames must be a list")
+        if not renames:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        entries = []
+        old_seen = set()
+        new_seen = set()
+        for item in renames:
+            if not isinstance(item, dict) or set(item) != {"old_id", "new_id"}:
+                raise ValueError("each rename must be an object with exactly old_id and new_id")
+            old_id = text(item["old_id"], "old_id")
+            new_id = text(item["new_id"], "new_id")
+            # Normalized ids are case-sensitive; a repeated old id or a repeated
+            # new id (even on identical items) rejects the whole batch. A new id
+            # matching another entry's old id is not a duplicate: it is a chain or
+            # swap resolved against the pre-call identities all at once.
+            if old_id in old_seen:
+                raise ValueError("duplicate old id in renames")
+            if new_id in new_seen:
+                raise ValueError("duplicate new id in renames")
+            old_seen.add(old_id)
+            new_seen.add(new_id)
+            entries.append((old_id, new_id))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        for old_id, new_id in entries:
+            if old_id not in contacts:
+                raise ValueError("unknown contact")
+            # A new id may only collide with a contact that itself renames away
+            # in this batch; taking an id kept by a non-participant rejects it all.
+            if new_id != old_id and new_id in contacts and new_id not in old_seen:
+                raise ValueError("contact id already exists")
+        # Results are complete contacts in input order, shaped like add_contact's
+        # return with only the contact_id replaced; name, email and organization
+        # keep their stored values.
+        results = [dict(contacts[old_id], contact_id=new_id) for old_id, new_id in entries]
+        if all(old_id == new_id for old_id, new_id in entries):
+            # Every item kept its id: report the contacts without rewriting the file.
+            return results
+        mapping = dict(entries)
+        # Rebuild the contacts dict under the new keys. A same-id rename keeps the
+        # object; moved contacts keep every field except contact_id. Rebuilding via
+        # a fresh dict also removes the old keys, so old ids left unused are
+        # unknown afterwards and can be registered again.
+        rebuilt = {}
+        for old_id, contact in contacts.items():
+            new_id = mapping.get(old_id, old_id)
+            if old_id != new_id:
+                contact["contact_id"] = new_id
+            rebuilt[new_id] = contact
+        data["contacts"] = rebuilt
+        # Tags, followups, reminders and opportunities follow their contacts.
+        tag_store = data.get("tags")
+        if tag_store is not None:
+            data["tags"] = self._rename_contact_keyed_store(tag_store, mapping)
+        reminder_store = data.get("reminders")
+        if reminder_store is not None:
+            renamed = self._rename_contact_keyed_store(reminder_store, mapping)
+            for new_id, reminder in renamed.items():
+                reminder["contact_id"] = new_id
+            data["reminders"] = renamed
+        for entry in data.get("followups", []):
+            entry["contact_id"] = mapping.get(entry["contact_id"], entry["contact_id"])
+        for opportunity in data.get("opportunities", {}).values():
+            opportunity["contact_id"] = mapping.get(opportunity["contact_id"],
+                                                    opportunity["contact_id"])
+        self._write(data)
+        return results
+
+    @staticmethod
+    def _rename_contact_keyed_store(store, mapping):
+        # Rebuild a contact-id-keyed dict (tags, reminders) under the new keys;
+        # non-participants and their values carry over untouched.
+        return {mapping.get(old_id, old_id): value for old_id, value in store.items()}
+
     def import_contacts(self, csv_path):
         if not isinstance(csv_path, str) or not csv_path.strip():
             raise ValueError("csv_path must be a nonempty string")
