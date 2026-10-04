@@ -7098,5 +7098,233 @@ class ProductTests(unittest.TestCase):
             "opportunity_id,contact_id,organization,entry_index,entered_on,ended_on,outcome,days\n")
         self.assertFalse(empty.exists())
 
+    def test_qualified_duration_summary_totals_groups_and_stats(self):
+        self.seed_qualified_durations()
+        result = self.app.qualified_duration_summary(" 2026-11-15 ")
+        self.assertEqual(set(result), {"total", "organizations", "csv"})
+        # The same twelve rounds as the detail report: ten measurable, two
+        # unknown (O10's null-date loss and O2's null-date win).
+        self.assertEqual(result["total"], {
+            "rounds": 12, "measured": 10, "unmeasured": 2,
+            # Days 0,0,4,5,5,10,10,19,61,75: sum 189, middle two 5 and 10,
+            # the ceil(0.9*10)=9th item counting from one is 61.
+            "average": "18.90", "median": "7.50", "p90": 61})
+        self.assertEqual(result["organizations"], [
+            {"organization": "Books", "rounds": 10, "measured": 8, "unmeasured": 2,
+             # Days 0,0,4,5,5,10,19,75: sum 118, middle two 5 and 5.
+             "average": "14.75", "median": "5.00", "p90": 75},
+            {"organization": "Music", "rounds": 1, "measured": 1, "unmeasured": 0,
+             "average": "10.00", "median": "10.00", "p90": 10},
+            {"organization": 'Tea, "Q"\nLine2', "rounds": 1, "measured": 1, "unmeasured": 0,
+             "average": "61.00", "median": "61.00", "p90": 61}])
+        # Every organization row carries exactly the display name plus the six
+        # total fields; groups order by the casefolded organization.
+        for row in result["organizations"]:
+            self.assertEqual(set(row), {"organization", "rounds", "measured", "unmeasured",
+                                        "average", "median", "p90"})
+        # The summary aggregates exactly the rounds the detail report selects.
+        detail = self.app.qualified_duration_report("2026-11-15")["records"]
+        days = sorted(r["days"] for r in detail if r["days"] is not None)
+        self.assertEqual(len(detail), result["total"]["rounds"])
+        self.assertEqual(len(days), result["total"]["measured"])
+        self.assertEqual(days[-1], 75)
+
+    def test_qualified_duration_summary_rounding_and_p90(self):
+        # Seven zero-day rounds and one one-day round: average 1/8 = 0.125
+        # rounds half-up to 0.13; the median of eight values averages the two
+        # middle zeros; the p90 position ceil(0.9*8)=8 counting from one lands
+        # on the one-day round.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for index in range(7):
+            opportunity_id = "O%d" % index
+            self.app.add_opportunity(opportunity_id, "A", "Deal %d" % index)
+            self.app.set_stage(opportunity_id, "qualified", on="2026-10-01")
+            self.app.set_stage(opportunity_id, "won", on="2026-10-01")
+        self.app.add_opportunity("O7", "A", "Deal 7")
+        self.app.set_stage("O7", "qualified", on="2026-10-01")
+        self.app.set_stage("O7", "won", on="2026-10-02")
+        result = self.app.qualified_duration_summary("2026-11-15")
+        self.assertEqual(result["total"], {
+            "rounds": 8, "measured": 8, "unmeasured": 0,
+            "average": "0.13", "median": "0.00", "p90": 1})
+        self.assertEqual(result["organizations"][0]["average"], "0.13")
+        # One more zero-day round: 1/9 = 0.111... rounds down to 0.11.
+        self.app.add_opportunity("O8", "A", "Deal 8")
+        self.app.set_stage("O8", "qualified", on="2026-10-01")
+        self.app.set_stage("O8", "won", on="2026-10-01")
+        self.assertEqual(self.app.qualified_duration_summary("2026-11-15")["total"]["average"],
+                         "0.11")
+
+    def test_qualified_duration_summary_csv_matches_organizations(self):
+        self.seed_qualified_durations()
+        result = self.app.qualified_duration_summary("2026-11-15")
+        csv_text = result["csv"]
+        self.assertNotIn("\r", csv_text)
+        self.assertTrue(csv_text.endswith("\n"))
+        parsed = list(csv.reader(io.StringIO(csv_text), strict=True))
+        self.assertEqual(parsed[0], ["organization", "rounds", "measured", "unmeasured",
+                                     "average", "median", "p90"])
+        self.assertEqual(len(parsed), len(result["organizations"]) + 1)
+        for raw_row, row in zip(parsed[1:], result["organizations"]):
+            self.assertEqual(raw_row, ["" if row[field] is None else str(row[field])
+                                       for field in parsed[0]])
+        # Standard escaping: quoting, doubled quotes and an embedded LF.
+        self.assertIn('"Tea, ""Q""\nLine2",1,1,0,61.00,61.00,61\n', csv_text)
+        self.assertEqual(csv_text.splitlines()[1], "Books,10,8,2,14.75,5.00,75")
+
+    def test_qualified_duration_summary_filters_and_empty(self):
+        self.seed_qualified_durations()
+        # Only C works at Music: O7's single measured round.
+        music = self.app.qualified_duration_summary("2026-11-15", organization=" music ")
+        self.assertEqual(music["total"], {"rounds": 1, "measured": 1, "unmeasured": 0,
+                                          "average": "10.00", "median": "10.00", "p90": 10})
+        self.assertEqual([row["organization"] for row in music["organizations"]], ["Music"])
+        # vip covers A and B: O1 twice, O2, O4, O5, O6 — one unknown (O2).
+        vip = self.app.qualified_duration_summary("2026-11-15", tags=["VIP"])
+        self.assertEqual(vip["total"], {"rounds": 6, "measured": 5, "unmeasured": 1,
+                                        # Days 0,0,5,5,10: sum 20, median 5.
+                                        "average": "4.00", "median": "5.00", "p90": 10})
+        self.assertEqual([row["organization"] for row in vip["organizations"]], ["Books"])
+        # No selected round: zero counts, null statistics, no groups, header only.
+        none = self.app.qualified_duration_summary("2026-11-15", organization="Music",
+                                                   tags=["vip"])
+        self.assertEqual(none["total"], {"rounds": 0, "measured": 0, "unmeasured": 0,
+                                         "average": None, "median": None, "p90": None})
+        self.assertEqual(none["organizations"], [])
+        self.assertEqual(none["csv"],
+                         "organization,rounds,measured,unmeasured,average,median,p90\n")
+        # Every round unmeasurable: counts still report, statistics are null.
+        self.app.add_contact("Z", "Zed", "z@example.test", "Void")
+        self.app.add_opportunity("OZ", "Z", "Null exit")
+        self.app.set_stage("OZ", "qualified", on="2026-10-01")
+        self.app.set_stage("OZ", "won", on=None)
+        void = self.app.qualified_duration_summary("2026-11-15", organization="void")
+        self.assertEqual(void["total"], {"rounds": 1, "measured": 0, "unmeasured": 1,
+                                         "average": None, "median": None, "p90": None})
+        self.assertEqual(void["csv"],
+                         "organization,rounds,measured,unmeasured,average,median,p90\n"
+                         "Void,1,0,1,,,\n")
+
+    def test_qualified_duration_summary_uses_current_ownership_profile(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "books")
+        self.app.add_opportunity("O1", "A", "Deal 1")
+        self.app.set_stage("O1", "qualified", on="2026-10-01")
+        self.app.set_stage("O1", "won", on="2026-10-10")
+        self.app.add_opportunity("O2", "B", "Deal 2")
+        self.app.set_stage("O2", "qualified", on="2026-10-01")
+        self.app.set_stage("O2", "won", on="2026-10-06")
+        # Same casefolded organization from two contacts: one group, display
+        # name is the code-point-smallest original value among the rounds.
+        result = self.app.qualified_duration_summary("2026-11-01")
+        self.assertEqual(result["organizations"], [
+            {"organization": "Books", "rounds": 2, "measured": 2, "unmeasured": 0,
+             "average": "7.00", "median": "7.00", "p90": 9}])
+        # After a transfer and a profile update both rounds regroup to the new
+        # organization of the current owner.
+        self.app.transfer_opportunities([
+            {"opportunity_id": "O1", "source_contact_id": "A", "target_contact_id": "B"}])
+        self.app.update_contact("B", {"organization": "Games"})
+        moved = self.app.qualified_duration_summary("2026-11-01")
+        self.assertEqual([row["organization"] for row in moved["organizations"]], ["Games"])
+        self.assertEqual(moved["total"]["rounds"], 2)
+        self.assertEqual(self.app.qualified_duration_summary(
+            "2026-11-01", organization="Books")["total"]["rounds"], 0)
+        # Reopening the root recomputes from the same stored data.
+        self.assertEqual(ContactFlow(self.root).qualified_duration_summary("2026-11-01"),
+                         moved)
+
+    def test_qualified_duration_summary_empty_legacy_and_readonly(self):
+        # No data file at all: zero counts, null statistics, header-only CSV,
+        # and nothing is created.
+        empty_root = self.root / "empty"
+        quiet = ContactFlow(empty_root)
+        result = quiet.qualified_duration_summary("2026-11-15")
+        self.assertEqual(result["total"], {"rounds": 0, "measured": 0, "unmeasured": 0,
+                                           "average": None, "median": None, "p90": None})
+        self.assertEqual(result["organizations"], [])
+        self.assertEqual(result["csv"],
+                         "organization,rounds,measured,unmeasured,average,median,p90\n")
+        self.assertFalse(empty_root.exists())
+        # Old data missing the opportunities, history and tags collections
+        # reads as empty without error.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {"A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                               "organization": "Books"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root).qualified_duration_summary("2026-11-15")
+        self.assertEqual(legacy["total"]["rounds"], 0)
+        self.assertTrue(legacy["csv"].endswith("\n"))
+        # Queries never rewrite the bytes of populated data.
+        self.seed_qualified_durations()
+        before = self.app.path.read_bytes()
+        self.app.qualified_duration_summary("2026-11-15")
+        self.app.qualified_duration_summary("2026-01-01", tags=["vip"], organization="Music")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_qualified_duration_summary_validates_arguments_even_when_empty(self):
+        for kwargs in ({"as_of": "2026-13-01"}, {"as_of": "2026-02-30"}, {"as_of": None},
+                       {"as_of": 20261115}, {"as_of": "  "}):
+            with self.assertRaises(ValueError):
+                self.app.qualified_duration_summary(**kwargs)
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_summary("2026-11-15", organization=7)
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_summary("2026-11-15", tags=[" "])
+        with self.assertRaises(ValueError):
+            self.app.qualified_duration_summary("2026-11-15", tag_mode="off")
+        # Filter validation runs before any data read, so an empty store rejects too.
+        with self.assertRaises(ValueError):
+            ContactFlow(self.root / "missing").qualified_duration_summary(
+                "2026-11-15", tags=[" "])
+        # A missing required argument is a plain TypeError from the signature.
+        with self.assertRaises(TypeError):
+            self.app.qualified_duration_summary()
+
+    def test_cli_qualified_duration_summary_success_and_failure(self):
+        self.seed_qualified_durations()
+        payload = self.root / "qualified-summary.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "qualified-duration-summary", str(payload)],
+                                  text=True, capture_output=True)
+
+        ok = cli({"as_of": " 2026-11-15 "})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(set(value), {"total", "organizations", "csv"})
+        self.assertEqual(value["total"]["rounds"], 12)
+        # Outer array runs one independent query per object.
+        batch = cli([{"as_of": "2026-11-15", "tags": ["vip"]},
+                     {"as_of": "2026-11-15", "organization": "Music"}])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual(values[0]["total"]["rounds"], 6)
+        self.assertEqual(values[1]["total"]["rounds"], 1)
+        # Bad filter: exit 2, empty stdout, JSON error on stderr, data untouched.
+        before = self.app.path.read_bytes()
+        failed = cli({"as_of": "2026-11-15", "tag_mode": "off"})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing as_of is a TypeError through the same error envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        # A query over a nonexistent root returns the header-only CSV and
+        # creates nothing.
+        empty = self.root / "empty"
+        quiet = cli({"as_of": "2026-11-15"}, root=empty)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        quiet_value = json.loads(quiet.stdout)
+        self.assertEqual(quiet_value["organizations"], [])
+        self.assertEqual(quiet_value["csv"],
+                         "organization,rounds,measured,unmeasured,average,median,p90\n")
+        self.assertFalse(empty.exists())
+
 if __name__ == "__main__":
     unittest.main()

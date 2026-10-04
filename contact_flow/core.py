@@ -2397,11 +2397,13 @@ class ContactFlow(JsonStore):
     QUALIFIED_DURATION_FIELDS = ("opportunity_id", "contact_id", "organization", "entry_index",
                                  "entered_on", "ended_on", "outcome", "days")
 
-    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
-        # One row per qualified stay round: every saved history entry into
-        # qualified whose non-null date is on/before the cutoff opens a round,
-        # including a fresh round after a close and reopen. Read-only: no
-        # directory creation, data rewrite or export file.
+    def _qualified_duration_rounds(self, as_of, organization, tags, tag_mode):
+        # Shared selection of qualified stay rounds for the duration report and
+        # its summary: every saved history entry into qualified whose non-null
+        # date is on/before the cutoff opens a round, including a fresh round
+        # after a close and reopen. Read-only: no directory creation, data
+        # rewrite or export file. Arguments validate before any read, so an
+        # empty store rejects bad filters too.
         as_of = calendar_day(as_of, "as_of")
         if organization is not None and not isinstance(organization, str):
             raise ValueError("organization must be a string")
@@ -2469,7 +2471,12 @@ class ContactFlow(JsonStore):
         # Ascending entry day, then opportunity id code point, then round index.
         records.sort(key=lambda record: (record["entered_on"], record["opportunity_id"],
                                          record["entry_index"]))
+        return records
 
+    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # One row per qualified stay round; see _qualified_duration_rounds for
+        # the selection rules.
+        records = self._qualified_duration_rounds(as_of, organization, tags, tag_mode)
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
         writer.writerow(self.QUALIFIED_DURATION_FIELDS)
@@ -2478,6 +2485,73 @@ class ContactFlow(JsonStore):
                 "" if record[field] is None else record[field]
                 for field in self.QUALIFIED_DURATION_FIELDS))
         return {"records": records, "csv": buffer.getvalue()}
+
+    QUALIFIED_DURATION_SUMMARY_FIELDS = ("organization", "rounds", "measured", "unmeasured",
+                                         "average", "median", "p90")
+
+    def qualified_duration_summary(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # Stay-length distribution over the same selected rounds as the detail
+        # report: each round counts once and a round with unknown days counts
+        # as unmeasurable. Read-only, no system clock.
+        records = self._qualified_duration_rounds(as_of, organization, tags, tag_mode)
+
+        def summarize(round_count, day_values):
+            # day_values holds one integer day count per measurable round.
+            days = sorted(day_values)
+            measured = len(days)
+            row = {"rounds": round_count, "measured": measured,
+                   "unmeasured": round_count - measured}
+            if measured:
+                average = (Decimal(sum(days)) / Decimal(measured)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                row["average"] = format(average, "f")
+                middle, remainder = divmod(measured, 2)
+                if remainder:
+                    median = Decimal(days[middle])
+                else:
+                    median = (Decimal(days[middle - 1]) + Decimal(days[middle])) / 2
+                row["median"] = format(median.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+                # The ceil(0.9*measured)-th item counting from 1, in exact
+                # integer arithmetic; duplicate day counts stay in the list.
+                row["p90"] = days[(9 * measured + 9) // 10 - 1]
+            else:
+                row["average"] = row["median"] = row["p90"] = None
+            return row
+
+        # Only organizations owning at least one selected round get a group.
+        groups = {}
+        for record in records:
+            key = record["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = group = {"display": record["organization"],
+                                       "rounds": 0, "days": []}
+            elif record["organization"] < group["display"]:
+                # Display name is the code-point-smallest original value among
+                # the organizations of the selected rounds.
+                group["display"] = record["organization"]
+            group["rounds"] += 1
+            if record["days"] is not None:
+                group["days"].append(record["days"])
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(summarize(group["rounds"], group["days"]))
+            organizations.append(row)
+
+        # The total aggregates every selected round directly.
+        total = summarize(len(records),
+                          [record["days"] for record in records if record["days"] is not None])
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(self.QUALIFIED_DURATION_SUMMARY_FIELDS)
+        for row in organizations:
+            writer.writerow(tuple("" if row[field] is None else row[field]
+                                  for field in self.QUALIFIED_DURATION_SUMMARY_FIELDS))
+        return {"total": total, "organizations": organizations, "csv": buffer.getvalue()}
 
     def timeline(self, contact_id):
         data = self._read()
