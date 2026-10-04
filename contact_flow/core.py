@@ -1051,6 +1051,77 @@ class ContactFlow(JsonStore):
         # ascending code point order.
         return [{"contact_id": contact_id, "tags": tags} for contact_id, tags in changed]
 
+    def change_contact_tags(self, updates):
+        # Check-then-mutate tag adjustments for a batch of contacts: each item
+        # pins the contact's complete pre-call tag set, then adds and removes
+        # tags while keeping every other tag. The whole batch validates against
+        # the pre-call state before any tag changes, so a rejected item never
+        # leaves part of the batch applied; every change commits in one write.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        update_keys = {"contact_id", "expected_tags", "add_tags", "remove_tags"}
+        entries = []
+        seen = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != update_keys:
+                raise ValueError(
+                    "each update must be an object with exactly contact_id, "
+                    "expected_tags, add_tags and remove_tags")
+            # Ids trim but stay case-sensitive; all three tag fields reuse the
+            # set-tags rule: lists of strings, trimmed, casefolded, deduplicated,
+            # inner whitespace kept.
+            contact_id = text(item["contact_id"], "contact_id")
+            expected = set(normalize_tags(item["expected_tags"]))
+            add = set(normalize_tags(item["add_tags"]))
+            remove = set(normalize_tags(item["remove_tags"]))
+            # A tag may not be added and removed by the same item.
+            if add & remove:
+                raise ValueError("a tag cannot be both added and removed")
+            # Normalized ids are case-sensitive; a repeated contact id (even an
+            # identical item) rejects the whole batch.
+            if contact_id in seen:
+                raise ValueError("duplicate contact id in updates")
+            seen.add(contact_id)
+            entries.append((contact_id, expected, add, remove))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        planned = []
+        for contact_id, expected, add, remove in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            # Every check uses the pre-call state: the normalized expected set
+            # must equal the contact's complete current tag set. A missing tags
+            # collection (old data) reads as the empty set.
+            current = set(tag_store.get(contact_id, []))
+            if expected != current:
+                raise ValueError("expected_tags do not match the current tag set")
+            # Adding an already present tag or removing an absent one is fine;
+            # tags outside both sets stay untouched.
+            updated = (current - remove) | add
+            planned.append((contact_id, current, updated))
+        # Results are the complete tag sets in input order. When every final
+        # set already equals the pre-call set, report them without rewriting.
+        results = [{"contact_id": contact_id, "tags": sorted(updated)}
+                   for contact_id, _, updated in planned]
+        if all(current == updated for _, current, updated in planned):
+            return results
+        for contact_id, _, updated in planned:
+            if updated:
+                tag_store[contact_id] = sorted(updated)
+            else:
+                # The contact's set is empty afterwards: drop it like set-tags.
+                tag_store.pop(contact_id, None)
+        if tag_store:
+            data["tags"] = tag_store
+        else:
+            data.pop("tags", None)
+        self._write(data)
+        return results
+
     def add_opportunity(self, opportunity_id, contact_id, title):
         opportunity_id = text(opportunity_id, "opportunity_id")
         title = text(title, "title")

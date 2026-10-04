@@ -3164,6 +3164,350 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(ContactFlow(self.root).get_tags("A"), ["warm"])
 
+    def seed_change_tag_contacts(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.add_contact("C", "Cara", "c@example.test", "Books")
+        self.app.add_contact("D", "Dan", "d@example.test", "Games")
+        self.app.set_tags("A", [" VIP ", "vip", "华东"])
+        self.app.set_tags("B", ["vip", "north"])
+        # C has never had tags; D's tags are not part of any batch below.
+        self.app.set_tags("D", ["keep"])
+
+    def test_change_contact_tags_adds_removes_preserves_and_normalizes(self):
+        self.seed_change_tag_contacts()
+        result = self.app.change_contact_tags([
+            {"contact_id": " A ", "expected_tags": [" VIP ", "华东"],
+             "add_tags": [" Lead  Tag ", "vip"], "remove_tags": ["ghost"]},
+            {"contact_id": "B", "expected_tags": ["north", "VIP"],
+             "add_tags": [" NORTH "], "remove_tags": ["VIP"]},
+            {"contact_id": "C", "expected_tags": [],
+             "add_tags": [" X "], "remove_tags": []},
+        ])
+        # Results follow request order; each item carries only contact_id and
+        # the complete adjusted tag set, sorted by Unicode code point.
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["lead  tag", "vip", "华东"]},
+            {"contact_id": "B", "tags": ["north"]},
+            {"contact_id": "C", "tags": ["x"]},
+        ])
+        self.assertEqual([set(item) for item in result], [set(item) for item in result])
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["lead  tag", "vip", "华东"])
+        self.assertEqual(reopened.get_tags("B"), ["north"])
+        self.assertEqual(reopened.get_tags("C"), ["x"])
+        # Uninvolved contacts and inner whitespace are kept.
+        self.assertEqual(reopened.get_tags("D"), ["keep"])
+
+    def test_change_contact_tags_checks_expected_and_is_atomic(self):
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        # A stale expectation on a later item rejects the earlier valid item too.
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "A", "expected_tags": ["vip", "华东"],
+                 "add_tags": ["lead"], "remove_tags": []},
+                {"contact_id": "B", "expected_tags": ["vip"],
+                 "add_tags": [], "remove_tags": []},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.get_tags("A"), ["vip", "华东"])
+        self.assertEqual(reopened.get_tags("B"), ["north", "vip"])
+        # A mismatch on the first item rejects just the same.
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "A", "expected_tags": ["vip"],
+                 "add_tags": ["lead"], "remove_tags": []},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The expectation is the complete set: an extra expected tag mismatches.
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "C", "expected_tags": ["vip"],
+                 "add_tags": [], "remove_tags": []},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_change_contact_tags_requires_list_and_missing_argument_is_type_error(self):
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        for bad in [None, {}, "x", 5, True, (),
+                    [{"contact_id": "A", "expected_tags": [],
+                      "add_tags": [], "remove_tags": []}]]:
+            with self.assertRaises(ValueError):
+                self.app.change_contact_tags(bad)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.change_contact_tags()
+
+    def test_change_contact_tags_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.change_contact_tags([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.change_contact_tags([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_change_contact_tags_validates_item_shape_without_partial_changes(self):
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        valid = {"contact_id": "A", "expected_tags": ["vip", "华东"],
+                 "add_tags": ["lead"], "remove_tags": []}
+        bad_batches = [
+            [None], [5], ["x"], [[]], [True],
+            [{}],
+            [{"contact_id": "A", "add_tags": [], "remove_tags": []}],
+            [{"contact_id": "A", "expected_tags": [], "remove_tags": []}],
+            [{"contact_id": "A", "expected_tags": [], "add_tags": []}],
+            [{"expected_tags": [], "add_tags": [], "remove_tags": []}],
+            [dict(valid, extra=1)],
+            [{"contact_id": "", "expected_tags": [], "add_tags": [], "remove_tags": []}],
+            [{"contact_id": "   ", "expected_tags": [], "add_tags": [], "remove_tags": []}],
+            [{"contact_id": None, "expected_tags": [], "add_tags": [], "remove_tags": []}],
+            [{"contact_id": 5, "expected_tags": [], "add_tags": [], "remove_tags": []}],
+            [{"contact_id": ["A"], "expected_tags": [], "add_tags": [], "remove_tags": []}],
+        ]
+        for field in ("expected_tags", "add_tags", "remove_tags"):
+            for value in ["vip", None, 5, True, {"vip": 1}, ("vip",)]:
+                row = dict(valid)
+                row[field] = value
+                bad_batches.append([row])
+            for value in [[None], [5], [True], [["vip"]], [""], ["   "], [" VIP ", "  "]]:
+                row = dict(valid)
+                row[field] = value
+                bad_batches.append([row])
+        # The two normalized sets intersect (casefold), even with different casing.
+        bad_batches.append([{"contact_id": "A", "expected_tags": ["vip", "华东"],
+                             "add_tags": ["VIP"], "remove_tags": ["vip"]}])
+        # A valid first item followed by an invalid second item rolls both back.
+        bad_batches.append([
+            valid,
+            {"contact_id": "B", "expected_tags": [], "add_tags": [], "remove_tags": []},
+        ])
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.change_contact_tags(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_change_contact_tags_rejects_unknown_and_duplicate_ids(self):
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        # Unknown contact, including a case-sensitive miss.
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "Z", "expected_tags": [], "add_tags": ["x"], "remove_tags": []}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "a", "expected_tags": [], "add_tags": ["x"], "remove_tags": []}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # An unknown id in a nonexistent store leaves no directory or file.
+        fresh = ContactFlow(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.change_contact_tags([
+                {"contact_id": "A", "expected_tags": [], "add_tags": ["x"], "remove_tags": []}])
+        self.assertFalse((self.root / "fresh").exists())
+        # Duplicate normalized ids reject the batch, even when items are identical.
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": " A ", "expected_tags": ["vip", "华东"],
+                 "add_tags": ["lead"], "remove_tags": []},
+                {"contact_id": "A", "expected_tags": ["vip", "华东"],
+                 "add_tags": ["lead"], "remove_tags": []},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.change_contact_tags([
+                {"contact_id": "B", "expected_tags": ["north", "vip"],
+                 "add_tags": [], "remove_tags": ["north"]},
+                {"contact_id": " B ", "expected_tags": ["north", "vip"],
+                 "add_tags": [], "remove_tags": ["north"]},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_change_contact_tags_all_noop_returns_sets_without_rewrite(self):
+        self.seed_change_tag_contacts()
+        before = self.app.path.read_bytes()
+        # Adding present tags, removing absent tags, and an empty adjustment
+        # all leave every final set equal to its pre-call set.
+        result = self.app.change_contact_tags([
+            {"contact_id": "A", "expected_tags": ["vip", "华东"],
+             "add_tags": [" VIP "], "remove_tags": ["ghost"]},
+            {"contact_id": "B", "expected_tags": ["north", "vip"],
+             "add_tags": [], "remove_tags": []},
+            {"contact_id": "C", "expected_tags": [],
+             "add_tags": [], "remove_tags": ["anything"]},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["vip", "华东"]},
+            {"contact_id": "B", "tags": ["north", "vip"]},
+            {"contact_id": "C", "tags": []},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(ContactFlow(self.root).get_tags("D"), ["keep"])
+
+    def test_change_contact_tags_clearing_drops_collection_and_legacy_reads_empty(self):
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps({
+            "contacts": {
+                "A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                      "organization": "Books"},
+                "B": {"contact_id": "B", "name": "Bob", "email": "b@example.test",
+                      "organization": "Music"}}}), encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        # Old data without a tags collection reads as the empty set.
+        result = legacy.change_contact_tags([
+            {"contact_id": "A", "expected_tags": [], "add_tags": [" VIP "], "remove_tags": []},
+            {"contact_id": "B", "expected_tags": [], "add_tags": [], "remove_tags": []},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["vip"]},
+            {"contact_id": "B", "tags": []},
+        ])
+        self.assertEqual(ContactFlow(legacy_root).get_tags("A"), ["vip"])
+        # A nonempty expectation against the empty legacy set rejects without touching bytes.
+        other_root = self.root / "other"
+        other_root.mkdir()
+        (other_root / "data.json").write_text(json.dumps({
+            "contacts": {"A": {"contact_id": "A", "name": "Alice", "email": "a@example.test",
+                               "organization": "Books"}}}), encoding="utf-8")
+        other = ContactFlow(other_root)
+        before = other.path.read_bytes()
+        with self.assertRaises(ValueError):
+            other.change_contact_tags([
+                {"contact_id": "A", "expected_tags": ["vip"],
+                 "add_tags": [], "remove_tags": ["vip"]}])
+        self.assertEqual(other.path.read_bytes(), before)
+        # Removing the last tag clears it: get-tags returns [] and the stored
+        # document carries no tags collection.
+        cleared = legacy.change_contact_tags([
+            {"contact_id": "A", "expected_tags": ["vip"], "add_tags": [], "remove_tags": ["vip"]}])
+        self.assertEqual(cleared, [{"contact_id": "A", "tags": []}])
+        self.assertEqual(ContactFlow(legacy_root).get_tags("A"), [])
+        self.assertNotIn("tags", json.loads((legacy_root / "data.json").read_text(encoding="utf-8")))
+
+    def test_change_contact_tags_preserves_everything_else_and_reflects_in_reports(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Music")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.set_tags("B", ["vip"])
+        self.app.follow_up("A", "2026-10-01", "first")
+        self.app.add_opportunity("O1", "A", "Deal one")
+        self.app.set_stage("O1", "qualified", on="2026-09-01")
+        self.app.set_opportunity_amount("O1", "100.5")
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-12-01"}])
+        self.app.set_reminder("A", "2026-11-05", "call back", repeat_monthly=True)
+        before_funnel = self.app.funnel_report()
+        before_amounts = self.app.opportunity_amount_report()
+        result = self.app.change_contact_tags([
+            {"contact_id": "A", "expected_tags": ["vip", "华东"],
+             "add_tags": ["lead"], "remove_tags": ["vip"]},
+            {"contact_id": "B", "expected_tags": ["vip"],
+             "add_tags": [], "remove_tags": ["vip"]},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "tags": ["lead", "华东"]},
+            {"contact_id": "B", "tags": []},
+        ])
+        reopened = ContactFlow(self.root)
+        # The new tags drive find conditions, expressions and report filters.
+        self.assertEqual([c["contact_id"] for c in reopened.find(tags=["lead"])], ["A"])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='"lead" && !"华东"')], [])
+        self.assertEqual([c["contact_id"] for c in reopened.find(tag_expression='!"lead"')], ["B"])
+        self.assertEqual(reopened.funnel_report(tags=["lead"])["total"]["contacts"], 1)
+        self.assertEqual(reopened.followup_report("2026-01-01", "2026-12-31",
+                                                  tags=["lead"])["records"][0]["contact_id"], "A")
+        self.assertEqual(reopened.funnel_report(tags=["vip"])["total"]["contacts"], 0)
+        # Unfiltered counts and amounts, profiles, followups, opportunities,
+        # history, amounts, close dates and reminders keep their values.
+        self.assertEqual(reopened.funnel_report(), before_funnel)
+        self.assertEqual(reopened.opportunity_amount_report(), before_amounts)
+        self.assertEqual(reopened.find()[0],
+            {"contact_id": "A", "name": "Alice", "email": "a@example.test", "organization": "Books"})
+        self.assertEqual(reopened.timeline("A"), [{"contact_id": "A", "on": "2026-10-01", "note": "first"}])
+        self.assertEqual(reopened.find_opportunities(contact_id="A"), [
+            {"opportunity_id": "O1", "contact_id": "A", "title": "Deal one",
+             "stage": "qualified", "amount": "100.50", "expected_close_on": "2026-12-01"}])
+        self.assertEqual(reopened.stage_history("O1"), [
+            {"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"}])
+        self.assertEqual(reopened.due_reminders("2099-01-01"), [
+            {"contact_id": "A", "due_on": "2026-11-05", "note": "call back",
+             "repeat_monthly": True, "anchor_day": 5}])
+
+    def test_cli_change_contact_tags_success_failure_and_outer_array(self):
+        self.seed_change_tag_contacts()
+        payload = self.root / "changes.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "change-contact-tags", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"updates": [
+            {"contact_id": " A ", "expected_tags": [" VIP ", "华东"],
+             "add_tags": [" Lead "], "remove_tags": []},
+            {"contact_id": "B", "expected_tags": ["north", "vip"],
+             "add_tags": [], "remove_tags": ["VIP"]},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "tags": ["lead", "vip", "华东"]},
+            {"contact_id": "B", "tags": ["north"]},
+        ])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"updates": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"updates": [
+            {"contact_id": "A", "expected_tags": ["lead", "vip", "华东"],
+             "add_tags": ["x"], "remove_tags": []},
+            {"contact_id": "B", "expected_tags": ["north", "vip"],
+             "add_tags": [], "remove_tags": []},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # updates must be a list.
+        not_list = cli({"updates": {"contact_id": "A"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"updates": [
+            {"contact_id": "A", "expected_tags": [], "add_tags": ["x"], "remove_tags": []}]},
+            root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+        # An outer array runs whole batches independently; a later failed batch
+        # keeps the earlier successful batch.
+        payload.write_text(json.dumps([
+            {"updates": [{"contact_id": "C", "expected_tags": [],
+                          "add_tags": ["warm"], "remove_tags": []}]},
+            {"updates": [{"contact_id": "Z", "expected_tags": [],
+                          "add_tags": ["x"], "remove_tags": []}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "change-contact-tags", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(ContactFlow(self.root).get_tags("C"), ["warm"])
+
     def seed_followups(self):
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
         self.app.add_contact("B", "Bob", "b@example.test", "books")
