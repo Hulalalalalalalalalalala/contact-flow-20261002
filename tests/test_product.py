@@ -6126,6 +6126,327 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(reopened.timeline("B"),
                          [{"contact_id": "B", "on": "2026-10-02", "note": "b corrected"}])
 
+    def test_remove_followups_positions_results_and_post_state(self):
+        self.seed_corrections()
+        # Indices address the pre-call timeline (date ascending, save order on
+        # ties): the first item deletes A's index 1, yet the second item still
+        # resolves against the pre-call index 3 (the untouched identical twin).
+        result = self.app.remove_followups([
+            {"contact_id": " A ", "index": 1, "expected_on": "2026-10-02",
+             "expected_note": "a second day first save"},
+            {"contact_id": "A", "index": 3, "expected_on": "2026-10-02",
+             "expected_note": "a second day second save"},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-02",
+             "expected_note": "b same day"},
+        ])
+        # Removed records in input order, carrying exactly contact_id, on, note.
+        self.assertEqual(result, [
+            {"contact_id": "A", "on": "2026-10-02", "note": "a second day first save"},
+            {"contact_id": "A", "on": "2026-10-02", "note": "a second day second save"},
+            {"contact_id": "B", "on": "2026-10-02", "note": "b same day"},
+        ])
+        reopened = ContactFlow(self.root)
+        # The twin at pre-call index 2 survives; B's timeline is now empty.
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")], [
+            ("2026-10-01", "a first day"),
+            ("2026-10-02", "a second day second save"),
+            ("2026-10-03", "a third day"),
+        ])
+        self.assertEqual(reopened.timeline("B"), [])
+        # Survivors keep their content and relative save order in storage.
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))["followups"]
+        self.assertEqual([(f["contact_id"], f["on"], f["note"]) for f in stored], [
+            ("A", "2026-10-03", "a third day"),
+            ("A", "2026-10-01", "a first day"),
+            ("A", "2026-10-02", "a second day second save"),
+        ])
+        # The followup report and its CSV recompute from the remaining records.
+        report = reopened.followup_report("2026-09-01", "2026-10-31")
+        self.assertEqual([(r["contact_id"], r["on"], r["note"]) for r in report["records"]], [
+            ("A", "2026-10-01", "a first day"),
+            ("A", "2026-10-02", "a second day second save"),
+            ("A", "2026-10-03", "a third day"),
+        ])
+        rows = list(csv.reader(io.StringIO(report["csv"])))
+        self.assertEqual(rows[0], ["contact_id", "name", "email", "organization", "on", "note"])
+        self.assertEqual([dict(zip(rows[0], row)) for row in rows[1:]], report["records"])
+        # Inactivity uses the remaining latest dates: A idles 2 days from
+        # 2026-10-03, B and C now read as never followed up.
+        inactive = reopened.inactive_contacts("2026-10-05", 3)
+        self.assertEqual([(r["contact"]["contact_id"], r["last_followup"], r["idle_days"])
+                          for r in inactive],
+                         [("B", None, None), ("C", None, None)])
+        rows = {r["contact"]["contact_id"]: r
+                for r in reopened.inactive_contacts("2026-10-05", 1)}
+        self.assertEqual(rows["A"]["last_followup"],
+                         {"contact_id": "A", "on": "2026-10-03", "note": "a third day"})
+        self.assertEqual(rows["A"]["idle_days"], 2)
+        # Contacts, tags, opportunities with history and amounts, and reminders
+        # are all preserved.
+        self.assertEqual(reopened.get_tags("A"), ["vip"])
+        self.assertEqual(reopened.find_opportunities(), [
+            {"opportunity_id": "O1", "contact_id": "A", "title": "Deal",
+             "stage": "qualified", "amount": "10.00"}])
+        self.assertEqual(reopened.stage_history("O1"),
+                         [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-15"}])
+        self.assertEqual(reopened.due_reminders("2099-01-01"),
+                         [{"contact_id": "B", "due_on": "2026-11-05", "note": "call back"}])
+
+    def test_remove_followups_deleting_everything_restores_no_followup_behavior(self):
+        self.seed_corrections()
+        result = self.app.remove_followups([
+            {"contact_id": "A", "index": index, "expected_on": on, "expected_note": note}
+            for index, (on, note) in enumerate([
+                ("2026-10-01", "a first day"),
+                ("2026-10-02", "a second day first save"),
+                ("2026-10-02", "a second day second save"),
+                ("2026-10-02", "a second day second save"),
+                ("2026-10-03", "a third day"),
+            ])
+        ] + [{"contact_id": "B", "index": 0, "expected_on": "2026-10-02",
+              "expected_note": "b same day"}])
+        self.assertEqual(len(result), 6)
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.timeline("A"), [])
+        self.assertEqual(reopened.timeline("B"), [])
+        # An emptied collection reads as absent, like old data without followups.
+        self.assertNotIn("followups", json.loads(self.app.path.read_text(encoding="utf-8")))
+        report = reopened.followup_report("2026-01-01", "2026-12-31")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(list(csv.reader(io.StringIO(report["csv"]))),
+                         [["contact_id", "name", "email", "organization", "on", "note"]])
+        self.assertEqual([(r["contact"]["contact_id"], r["last_followup"])
+                          for r in reopened.inactive_contacts("2026-10-05", 1)],
+                         [("A", None), ("B", None), ("C", None)])
+        # Appending after a wipe starts a fresh collection.
+        self.app.follow_up("A", "2026-10-06", "back again")
+        self.assertEqual([r["note"] for r in ContactFlow(self.root).timeline("A")],
+                         ["back again"])
+
+    def test_remove_followups_expected_values_are_verbatim(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        base = {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                "expected_note": "a first day"}
+        # Expected values must be strings.
+        for key, bad in [("expected_on", None), ("expected_on", 5),
+                         ("expected_on", ["2026-10-01"]),
+                         ("expected_note", None), ("expected_note", 5),
+                         ("expected_note", ["a first day"])]:
+            with self.assertRaises(ValueError):
+                self.app.remove_followups([dict(base, **{key: bad})])
+        # Strings compare verbatim, never trimmed, casefolded or reformatted.
+        for key, bad in [("expected_on", " 2026-10-01 "), ("expected_on", "2026-10-1"),
+                         ("expected_on", "2026-10-02"),
+                         ("expected_note", " a first day"), ("expected_note", "A FIRST DAY"),
+                         ("expected_note", "a  first day")]:
+            with self.assertRaises(ValueError):
+                self.app.remove_followups([dict(base, **{key: bad})])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_remove_followups_requires_list_and_missing_argument_is_type_error(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        for bad in [None, {}, {"removals": []}, "x", 5, True,
+                    ({"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                      "expected_note": "a first day"},)]:
+            with self.assertRaises(ValueError):
+                self.app.remove_followups(bad)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(TypeError):
+            self.app.remove_followups()
+
+    def test_remove_followups_validates_items_without_partial_changes(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+
+        def item(**overrides):
+            base = {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                    "expected_note": "a first day"}
+            base.update(overrides)
+            return base
+
+        def without(*keys):
+            return {key: value for key, value in item().items() if key not in keys}
+
+        bad_batches = [
+            [None], [5], ["x"], [[]], [{}],
+            [without("contact_id")], [without("index")], [without("expected_on")],
+            [without("expected_note")],
+            [item(extra=1)],
+            # contact_id trims but stays case-sensitive; blanks and non-strings reject.
+            [item(contact_id="")], [item(contact_id="   ")],
+            [item(contact_id=5)], [item(contact_id=None)],
+            [item(contact_id="Z")], [item(contact_id="a")],
+            # index must be a nonnegative integer; bools are not integers here.
+            [item(index=-1)], [item(index=True)], [item(index=False)],
+            [item(index=1.0)], [item(index="0")], [item(index=None)],
+            # Out of range: past A's five entries, past B's single entry, and
+            # any position for C, which has no followups at all.
+            [item(index=5)], [item(index=99)],
+            [item(contact_id="B", index=1, expected_on="2026-10-02",
+                  expected_note="b same day")],
+            [item(contact_id="C", expected_on="2026-10-02", expected_note="x")],
+            # The same normalized contact and position may appear only once,
+            # even when both items are identical.
+            [item(contact_id=" A "), item()],
+            [item(), item()],
+            # A valid first item followed by an invalid second item rolls both back.
+            [item(), item(contact_id="A", index=1, expected_on="2026-10-02",
+                          expected_note="stale note")],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.remove_followups(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_remove_followups_is_atomic_when_a_later_item_fails(self):
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.remove_followups([
+                {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                 "expected_note": "a first day"},
+                {"contact_id": "B", "index": 0, "expected_on": "2026-10-02",
+                 "expected_note": "stale note"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual([r["on"] for r in reopened.timeline("A")],
+                         ["2026-10-01", "2026-10-02", "2026-10-02", "2026-10-02", "2026-10-03"])
+        self.assertEqual(reopened.timeline("B"),
+                         [{"contact_id": "B", "on": "2026-10-02", "note": "b same day"}])
+
+    def test_remove_followups_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.remove_followups([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_corrections()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.remove_followups([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_remove_followups_empty_store_and_legacy_data(self):
+        # Empty store: a nonempty batch rejects as unknown contact, creating nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.remove_followups([{"contact_id": "A", "index": 0,
+                                     "expected_on": "2026-10-01", "expected_note": "x"}])
+        self.assertFalse(fresh_root.exists())
+        # Legacy data without a followups collection: every position is out of
+        # range and the file stays byte-for-byte intact.
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        (legacy_root / "data.json").write_text(json.dumps(
+            {"contacts": {"A": {"contact_id": "A", "name": "Alice",
+                                "email": "a@example.test", "organization": "Books"}}}),
+            encoding="utf-8")
+        legacy = ContactFlow(legacy_root)
+        before = (legacy_root / "data.json").read_bytes()
+        with self.assertRaises(ValueError):
+            legacy.remove_followups([{"contact_id": "A", "index": 0,
+                                      "expected_on": "2026-10-01", "expected_note": "x"}])
+        self.assertEqual((legacy_root / "data.json").read_bytes(), before)
+
+    def test_cli_remove_followups_object_array_and_failure(self):
+        self.seed_corrections()
+        payload = self.root / "removals.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "remove-followups", str(payload)], text=True, capture_output=True)
+
+        ok = cli({"removals": [
+            {"contact_id": " A ", "index": 1, "expected_on": "2026-10-02",
+             "expected_note": "a second day first save"},
+            {"contact_id": "B", "index": 0, "expected_on": "2026-10-02",
+             "expected_note": "b same day"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "on": "2026-10-02", "note": "a second day first save"},
+            {"contact_id": "B", "on": "2026-10-02", "note": "b same day"},
+        ])
+        self.assertEqual([r["on"] for r in ContactFlow(self.root).timeline("A")],
+                         ["2026-10-01", "2026-10-02", "2026-10-02", "2026-10-03"])
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"removals": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+        # Validation failure: exit 2, empty stdout, JSON error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"removals": [
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a first day"},
+            {"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+             "expected_note": "a first day"},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing the required parameter is a TypeError surfaced through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # removals must be a list.
+        not_list = cli({"removals": {"contact_id": "A"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"removals": [{"contact_id": "A", "index": 0,
+                                  "expected_on": "2026-10-01", "expected_note": "x"}]},
+                   root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_remove_followups_outer_array_keeps_earlier_batches(self):
+        self.seed_corrections()
+        payload = self.root / "batches.json"
+        # Each outer item is an independent call: the second batch's positions
+        # and expected values are read against the state left by the first one.
+        payload.write_text(json.dumps([
+            {"removals": [{"contact_id": "A", "index": 0, "expected_on": "2026-10-01",
+                           "expected_note": "a first day"}]},
+            {"removals": [{"contact_id": "A", "index": 0, "expected_on": "2026-10-02",
+                           "expected_note": "a second day first save"}]},
+        ]), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                             "remove-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            [{"contact_id": "A", "on": "2026-10-01", "note": "a first day"}],
+            [{"contact_id": "A", "on": "2026-10-02", "note": "a second day first save"}],
+        ])
+        # A later failed batch keeps the earlier successful batch (unlike
+        # atomicity inside one removals list).
+        payload.write_text(json.dumps([
+            {"removals": [{"contact_id": "B", "index": 0, "expected_on": "2026-10-02",
+                           "expected_note": "b same day"}]},
+            {"removals": [{"contact_id": "ZZZ", "index": 0, "expected_on": "2026-10-02",
+                           "expected_note": "x"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "remove-followups", str(payload)], text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("A")], [
+            ("2026-10-02", "a second day second save"),
+            ("2026-10-02", "a second day second save"),
+            ("2026-10-03", "a third day"),
+        ])
+        self.assertEqual(reopened.timeline("B"), [])
+
     def seed_close_dates(self):
         # Two organizations; opportunities mix stages, amounts, dates and no dates.
         self.app.add_contact("A", "Alice", "a@example.test", "Books")
