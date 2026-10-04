@@ -2147,6 +2147,82 @@ class ContactFlow(JsonStore):
             writer.writerow(tuple(row[field] for field in self.MONTHLY_FORECAST_FIELDS))
         return {"total": money_row(totals), "months": months, "csv": buffer.getvalue()}
 
+    FORECAST_DETAIL_FIELDS = ("opportunity_id", "contact_id", "title", "organization",
+                              "stage", "amount", "forecast_amount")
+
+    def forecast_detail_report(self, probabilities, organization=None, tags=None, tag_mode="all",
+                               start_on=None, end_on=None):
+        # Parameters, defaults and validation mirror forecast_report exactly:
+        # the same probabilities object, the same organization/tag filters and
+        # the same optional all-or-nothing inclusive expected-close window,
+        # all validated before any data is read (an empty store validates too).
+        if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
+            raise ValueError("probabilities must be an object containing exactly new and qualified")
+        rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
+                 for stage in ("new", "qualified")}
+        if start_on is None and end_on is None:
+            window = None
+        elif start_on is None or end_on is None:
+            raise ValueError("start_on and end_on must be provided together")
+        else:
+            start_on = calendar_day(start_on, "start_on")
+            end_on = calendar_day(end_on, "end_on")
+            if start_on > end_on:
+                raise ValueError("start_on must not be later than end_on")
+            window = (start_on, end_on)
+        _, scoped = self._organization_groups(organization, tags, tag_mode)
+        contacts = self._read().get("contacts", {})
+
+        # Row selection mirrors forecast_report exactly: current new/qualified
+        # deals of matching contacts, windowed by their own maintained
+        # expected close date (never a stage-history date), so the detail
+        # covers precisely the deals behind the summary's overall amount.
+        rows = []
+        for _, opportunity in scoped:
+            stage = opportunity["stage"]
+            if stage not in ("new", "qualified"):
+                continue
+            if window is not None:
+                expected_close_on = opportunity.get("expected_close_on")
+                if expected_close_on is None or not window[0] <= expected_close_on <= window[1]:
+                    continue
+            cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
+            rows.append((opportunity, cents, cents * rates[stage]))
+
+        # The total is forecast_report's half-up-rounded raw sum over the same
+        # deals, so the detail always reconciles with the summary.
+        total_cents = (sum(raw for _, _, raw in rows) + 5000) // 10000
+        # Each row first floors its own weighted amount to the cent; the
+        # leftover cents then go one apiece to the rows whose discarded
+        # fraction is largest, ties broken by ascending opportunity id, so no
+        # row ever gains more than 0.01 and the rows add up to the total.
+        floors = [raw // 10000 for _, _, raw in rows]
+        leftover = total_cents - sum(floors)
+        ranked = sorted(range(len(rows)),
+                        key=lambda index: (-(rows[index][2] % 10000),
+                                           rows[index][0]["opportunity_id"]))
+        for index in ranked[:leftover]:
+            floors[index] += 1
+
+        # One row per deal, ascending opportunity id; values are the current
+        # stored ones, amounts rendered as two-decimal strings.
+        records = []
+        paired = sorted(zip(rows, floors), key=lambda pair: pair[0][0]["opportunity_id"])
+        for (opportunity, cents, _), forecast_cents in paired:
+            records.append({"opportunity_id": opportunity["opportunity_id"],
+                            "contact_id": opportunity["contact_id"],
+                            "title": opportunity["title"],
+                            "organization": contacts[opportunity["contact_id"]]["organization"],
+                            "stage": opportunity["stage"],
+                            "amount": format_cents(cents),
+                            "forecast_amount": format_cents(forecast_cents)})
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(self.FORECAST_DETAIL_FIELDS)
+        for record in records:
+            writer.writerow(tuple(record[field] for field in self.FORECAST_DETAIL_FIELDS))
+        return {"total": format_cents(total_cents), "records": records, "csv": buffer.getvalue()}
+
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
         end_on = calendar_day(end_on, "end_on")
