@@ -2397,11 +2397,10 @@ class ContactFlow(JsonStore):
     QUALIFIED_DURATION_FIELDS = ("opportunity_id", "contact_id", "organization", "entry_index",
                                  "entered_on", "ended_on", "outcome", "days")
 
-    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
-        # One row per qualified stay round: every saved history entry into
-        # qualified whose non-null date is on/before the cutoff opens a round,
-        # including a fresh round after a close and reopen. Read-only: no
-        # directory creation, data rewrite or export file.
+    def _qualified_duration_rounds(self, as_of, organization, tags, tag_mode):
+        # Shared selection for the detail report and the distribution summary:
+        # same date rules, defaults, normalization and filtering, and no system
+        # clock. Read-only: no directory creation, data rewrite or export file.
         as_of = calendar_day(as_of, "as_of")
         if organization is not None and not isinstance(organization, str):
             raise ValueError("organization must be a string")
@@ -2425,7 +2424,6 @@ class ContactFlow(JsonStore):
                     return False
             return True
 
-        cutoff = date.fromisoformat(as_of)
         records = []
         for opportunity in data.get("opportunities", {}).values():
             contact = contacts.get(opportunity["contact_id"])
@@ -2469,6 +2467,13 @@ class ContactFlow(JsonStore):
         # Ascending entry day, then opportunity id code point, then round index.
         records.sort(key=lambda record: (record["entered_on"], record["opportunity_id"],
                                          record["entry_index"]))
+        return records
+
+    def qualified_duration_report(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # One row per qualified stay round: every saved history entry into
+        # qualified whose non-null date is on/before the cutoff opens a round,
+        # including a fresh round after a close and reopen.
+        records = self._qualified_duration_rounds(as_of, organization, tags, tag_mode)
 
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
@@ -2478,6 +2483,75 @@ class ContactFlow(JsonStore):
                 "" if record[field] is None else record[field]
                 for field in self.QUALIFIED_DURATION_FIELDS))
         return {"records": records, "csv": buffer.getvalue()}
+
+    QUALIFIED_DURATION_SUMMARY_FIELDS = ("rounds", "measured", "unmeasured",
+                                         "average", "median", "p90")
+
+    @staticmethod
+    def _qualified_duration_stats(records):
+        # Rounds with an unknown length count as unmeasured and never enter the
+        # average, median or p90; every round still counts toward rounds.
+        rounds = len(records)
+        ordered = sorted(record["days"] for record in records if record["days"] is not None)
+        measured = len(ordered)
+        stats = {"rounds": rounds, "measured": measured, "unmeasured": rounds - measured,
+                 "average": None, "median": None, "p90": None}
+        if measured:
+            total_days = sum(ordered)
+            average = (Decimal(total_days) / Decimal(measured)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+            stats["average"] = format(average, "f")
+            middle = measured // 2
+            if measured % 2:
+                median_value = Decimal(ordered[middle])
+            else:
+                # Even counts average the two middle values exactly before rounding.
+                median_value = (Decimal(ordered[middle - 1]) + Decimal(ordered[middle])) / 2
+            stats["median"] = format(
+                median_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+            # The 90th percentile is the ceil(0.9 * measured)-th value counting
+            # from one; integer rank avoids any float drift, repeats stay in.
+            rank = (9 * measured + 9) // 10
+            stats["p90"] = ordered[rank - 1]
+        return stats
+
+    def qualified_duration_summary(self, as_of, organization=None, tags=None, tag_mode="all"):
+        # Distribution summary over the exact same selected rounds as the detail
+        # report. Read-only: no directory creation, data rewrite or export file.
+        records = self._qualified_duration_rounds(as_of, organization, tags, tag_mode)
+
+        total = self._qualified_duration_stats(records)
+
+        # Only organizations owning at least one selected round get a group; the
+        # display name is the code-point-smallest original value among that
+        # group's rounds, and groups sort by the casefolded key.
+        groups = {}
+        for record in records:
+            key = record["organization"].casefold()
+            group = groups.get(key)
+            if group is None:
+                groups[key] = {"display": record["organization"], "records": []}
+            elif record["organization"] < group["display"]:
+                group["display"] = record["organization"]
+            groups[key]["records"].append(record)
+
+        organizations = []
+        for key in sorted(groups):
+            group = groups[key]
+            row = {"organization": group["display"]}
+            row.update(self._qualified_duration_stats(group["records"]))
+            organizations.append(row)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("organization",) + self.QUALIFIED_DURATION_SUMMARY_FIELDS)
+        for row in organizations:
+            writer.writerow((row["organization"], row["rounds"], row["measured"],
+                             row["unmeasured"],
+                             row["average"] if row["average"] is not None else "",
+                             row["median"] if row["median"] is not None else "",
+                             row["p90"] if row["p90"] is not None else ""))
+        return {"total": total, "organizations": organizations, "csv": buffer.getvalue()}
 
     def timeline(self, contact_id):
         data = self._read()
