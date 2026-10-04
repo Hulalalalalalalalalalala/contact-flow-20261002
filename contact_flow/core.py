@@ -1051,6 +1051,82 @@ class ContactFlow(JsonStore):
         # ascending code point order.
         return [{"contact_id": contact_id, "tags": tags} for contact_id, tags in changed]
 
+    def change_contact_tags(self, updates):
+        # Atomic check-then-modify tag batch: each item pins the contact's
+        # complete pre-call tag set, then adds and removes tags together while
+        # every uninvolved tag survives. The whole batch validates against the
+        # pre-call state before any tag changes, so a rejected item never
+        # leaves part of the batch applied; every change commits in one write.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        update_keys = {"contact_id", "expected_tags", "add_tags", "remove_tags"}
+        entries = []
+        seen = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != update_keys:
+                raise ValueError(
+                    "each update must be an object with exactly contact_id, "
+                    "expected_tags, add_tags and remove_tags")
+            contact_id = text(item["contact_id"], "contact_id")
+            # The three tag fields reuse the set-tags rules exactly: lists of
+            # strings, each trimmed and casefolded, deduplicated, inner
+            # whitespace kept. Only the set is needed for checks and unions.
+            expected = set(normalize_tags(item["expected_tags"]))
+            add = set(normalize_tags(item["add_tags"]))
+            remove = set(normalize_tags(item["remove_tags"]))
+            # A tag normalized into both sets for one contact rejects it all.
+            if add & remove:
+                raise ValueError("add_tags and remove_tags must not overlap")
+            # Normalized ids are case-sensitive; a repeated contact id (even an
+            # identical item) rejects the whole batch.
+            if contact_id in seen:
+                raise ValueError("duplicate contact id in updates")
+            seen.add(contact_id)
+            entries.append((contact_id, expected, add, remove))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        tag_store = data.get("tags", {})
+        planned = []
+        for contact_id, expected, add, remove in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            # Every check uses the pre-call state; old data without a tags
+            # collection, or a contact without an entry, reads as the empty set.
+            current = set(tag_store.get(contact_id, []))
+            if current != expected:
+                raise ValueError("expected_tags does not match the current tags")
+            # Adding an already present tag and removing an absent one both
+            # succeed; any other current tag is carried through untouched.
+            updated = (current | add) - remove
+            planned.append((contact_id, sorted(updated)))
+        # Results are the complete adjusted tag sets in input order, sorted by
+        # Unicode code point. When every final set already matches the stored
+        # one, report them without rewriting the file or creating a directory.
+        results = [{"contact_id": contact_id, "tags": tags}
+                   for contact_id, tags in planned]
+        new_store = dict(tag_store)
+        changed = False
+        for contact_id, tags in planned:
+            if set(tag_store.get(contact_id, [])) != set(tags):
+                changed = True
+            if tags:
+                new_store[contact_id] = tags
+            else:
+                # Clearing a contact's last tags drops the entry, matching
+                # set-tags on an empty list.
+                new_store.pop(contact_id, None)
+        if not changed:
+            return results
+        if new_store:
+            data["tags"] = new_store
+        else:
+            data.pop("tags", None)
+        self._write(data)
+        return results
+
     def add_opportunity(self, opportunity_id, contact_id, title):
         opportunity_id = text(opportunity_id, "opportunity_id")
         title = text(title, "title")
