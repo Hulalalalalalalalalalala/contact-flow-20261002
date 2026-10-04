@@ -7622,6 +7622,227 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(bad.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def test_forecast_detail_report_rows_match_summary_total(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},   # new, 100.00
+            {"opportunity_id": "O2", "expected_close_on": "2026-09-15"},   # qualified, 200.00, out
+            {"opportunity_id": "O3", "expected_close_on": "2026-10-10"},   # won, excluded
+            {"opportunity_id": "O4", "expected_close_on": "2026-10-20"},   # new, no amount
+        ])
+        probs = {"new": "50", "qualified": "25"}
+        # Without a window every open deal is listed, like the legacy forecast.
+        legacy = self.app.forecast_detail_report(probs)
+        self.assertEqual([row["opportunity_id"] for row in legacy["records"]],
+                         ["O1", "O2", "O4"])
+        self.assertEqual(legacy["records"][0], {
+            "opportunity_id": "O1", "contact_id": "A", "title": "Deal one",
+            "organization": "Books", "stage": "new",
+            "amount": "100.00", "forecast_amount": "50.00"})
+        self.assertEqual(legacy["records"][1], {
+            "opportunity_id": "O2", "contact_id": "A", "title": "Deal two",
+            "organization": "Books", "stage": "qualified",
+            "amount": "200.00", "forecast_amount": "50.00"})
+        # An unpriced deal reads as 0.00 and still gets its row.
+        self.assertEqual(legacy["records"][2], {
+            "opportunity_id": "O4", "contact_id": "B", "title": "Deal four",
+            "organization": "Music", "stage": "new",
+            "amount": "0.00", "forecast_amount": "0.00"})
+        self.assertEqual(legacy["total"],
+                         self.app.forecast_report(probs)["total"]["amount"])
+        self.assertEqual(legacy["total"], "100.00")
+        self.assertEqual(legacy["csv"],
+                         "opportunity_id,contact_id,title,organization,stage,amount,forecast_amount\n"
+                         "O1,A,Deal one,Books,new,100.00,50.00\n"
+                         "O2,A,Deal two,Books,qualified,200.00,50.00\n"
+                         "O4,B,Deal four,Music,new,0.00,0.00\n")
+
+        # The window includes both ends and drops undated deals; O2's October
+        # history date is never borrowed, and terminal O3 stays out.
+        report = self.app.forecast_detail_report(probs, start_on="2026-10-01",
+                                                 end_on="2026-10-31")
+        self.assertEqual([row["opportunity_id"] for row in report["records"]], ["O1", "O4"])
+        self.assertEqual(report["total"], "50.00")
+        self.assertEqual(report["total"], self.app.forecast_report(
+            probs, start_on="2026-10-01", end_on="2026-10-31")["total"]["amount"])
+        single = self.app.forecast_detail_report(probs, start_on="2026-10-05",
+                                                 end_on="2026-10-05")
+        self.assertEqual([row["opportunity_id"] for row in single["records"]], ["O1"])
+
+        # Organization/tag filters intersect exactly like forecast_report.
+        music = self.app.forecast_detail_report(probs, organization="music")
+        self.assertEqual([row["opportunity_id"] for row in music["records"]], ["O4"])
+        self.assertEqual(music["total"], "0.00")
+        self.app.set_tags("B", ["VIP"])
+        tagged = self.app.forecast_detail_report(probs, tags=["vip"])
+        self.assertEqual([row["opportunity_id"] for row in tagged["records"]], ["O4"])
+        none = self.app.forecast_detail_report(probs, tags=["missing"])
+        self.assertEqual(none["total"], "0.00")
+        self.assertEqual(none["records"], [])
+        self.assertEqual(none["csv"],
+                         "opportunity_id,contact_id,title,organization,stage,amount,forecast_amount\n")
+
+        # Zero probability keeps the row with a zero forecast.
+        zero = self.app.forecast_detail_report({"new": "0", "qualified": "0"})
+        self.assertEqual([row["forecast_amount"] for row in zero["records"]],
+                         ["0.00", "0.00", "0.00"])
+        self.assertEqual(zero["total"], "0.00")
+
+    def test_forecast_detail_report_apportions_cents_by_remainder(self):
+        # The spec example: three 0.01 deals at 50% each floor to zero cents;
+        # the overall 0.02 is handed to the two code-point-smallest ids.
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        for opportunity_id in ("A", "B", "C"):
+            self.app.add_opportunity(opportunity_id, "A", "Deal " + opportunity_id)
+            self.app.set_opportunity_amount(opportunity_id, "0.01")
+        probs = {"new": "50", "qualified": "50"}
+        report = self.app.forecast_detail_report(probs)
+        self.assertEqual(report["total"], "0.02")
+        self.assertEqual([(row["opportunity_id"], row["forecast_amount"])
+                          for row in report["records"]],
+                         [("A", "0.01"), ("B", "0.01"), ("C", "0.00")])
+        self.assertEqual(report["total"],
+                         self.app.forecast_report(probs)["total"]["amount"])
+
+        # A larger discarded remainder beats the id order: deal "A" discards
+        # 0.25 cent, deal "B" 0.75 cent, so the single handed-back cent goes
+        # to "B" even though "A" sorts first.
+        second = ContactFlow(self.root / "second")
+        second.add_contact("C", "Cara", "c@example.test", "Music")
+        second.add_opportunity("A", "C", "Deal A")
+        second.add_opportunity("B", "C", "Deal B")
+        second.set_opportunity_amount("A", "0.01")
+        second.set_opportunity_amount("B", "0.03")
+        uneven = second.forecast_detail_report({"new": "25", "qualified": "0"})
+        self.assertEqual(uneven["total"], "0.01")
+        self.assertEqual([(row["opportunity_id"], row["forecast_amount"])
+                          for row in uneven["records"]],
+                         [("A", "0.00"), ("B", "0.01")])
+        self.assertEqual(uneven["total"],
+                         second.forecast_report({"new": "25", "qualified": "0"})["total"]["amount"])
+
+        # A deal whose weighted amount lands exactly on the cent has no
+        # discarded remainder and never receives one of the handed-back cents.
+        third = ContactFlow(self.root / "third")
+        third.add_contact("C", "Cara", "c@example.test", "Music")
+        third.add_opportunity("A", "C", "Deal A")
+        third.add_opportunity("B", "C", "Deal B")
+        third.set_opportunity_amount("A", "0.02")   # 50% -> exactly 1 cent
+        third.set_opportunity_amount("B", "0.01")   # 50% -> 0.5 cent discarded
+        exact = third.forecast_detail_report(probs)
+        self.assertEqual(exact["total"], "0.02")
+        self.assertEqual([(row["opportunity_id"], row["forecast_amount"])
+                          for row in exact["records"]],
+                         [("A", "0.01"), ("B", "0.01")])
+        # Row forecasts always add up to the overall amount.
+        self.assertEqual(sum(int(row["forecast_amount"].replace(".", ""))
+                             for row in exact["records"]), 2)
+
+    def test_forecast_detail_report_validation_empty_store_and_readonly(self):
+        probs = {"new": "50", "qualified": "25"}
+        # Missing the probabilities argument is a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            self.app.forecast_detail_report()
+        for kwargs in [
+            {"probabilities": {"new": "50"}},                              # missing stage
+            {"probabilities": {"new": "50", "qualified": "25", "won": "10"}},
+            {"probabilities": {"new": "101", "qualified": "25"}},          # out of range
+            {"probabilities": {"new": "abc", "qualified": "25"}},          # not a number
+            {"probabilities": {"new": 50, "qualified": "25"}},             # not a string
+            {"probabilities": "nope"},                                     # not an object
+            {"start_on": "2026-10-01"},                                    # only one side
+            {"end_on": "2026-10-31"},
+            {"start_on": None, "end_on": "2026-10-31"},
+            {"start_on": "2026-10-01", "end_on": None},
+            {"start_on": "bad", "end_on": "2026-10-31"},                   # bad date
+            {"start_on": "2026-10-01", "end_on": "2026-02-30"},            # not a real date
+            {"start_on": 5, "end_on": "2026-10-31"},                       # wrong type
+            {"start_on": "2026-11-01", "end_on": "2026-10-31"},            # start after end
+            {"organization": 5},                                           # bad filter
+            {"tags": "vip"},
+            {"tag_mode": "some"},
+        ]:
+            arguments = {"probabilities": probs}
+            arguments.update(kwargs)
+            with self.assertRaises(ValueError):
+                self.app.forecast_detail_report(**arguments)
+        # Validation runs even on an empty store, and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.forecast_detail_report(probs, start_on="2026-10-01")
+        report = fresh.forecast_detail_report(probs, start_on="2026-01-01",
+                                              end_on="2026-12-31")
+        self.assertEqual(report["total"], "0.00")
+        self.assertEqual(report["records"], [])
+        self.assertEqual(report["csv"],
+                         "opportunity_id,contact_id,title,organization,stage,amount,forecast_amount\n")
+        self.assertFalse(fresh_root.exists())
+        # A populated store is also untouched by the read-only query.
+        self.seed_close_dates()
+        before = self.app.path.read_bytes()
+        self.app.forecast_detail_report(probs, start_on="2026-10-01", end_on="2026-10-31")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_forecast_detail_report_csv_escaping_and_current_values(self):
+        # Titles and organizations keep their current raw values, with standard
+        # CSV escaping and embedded newlines preserved.
+        self.app.add_contact("A", "Alice", "a@example.test", 'Tea, "Q"\nLine2')
+        self.app.add_opportunity("O1", "A", 'Big, "quoted"\ndeal')
+        self.app.set_opportunity_amount("O1", "10.00")
+        probs = {"new": "100", "qualified": "100"}
+        report = self.app.forecast_detail_report(probs)
+        self.assertEqual(report["records"][0]["organization"], 'Tea, "Q"\nLine2')
+        self.assertEqual(report["records"][0]["title"], 'Big, "quoted"\ndeal')
+        self.assertEqual(report["csv"],
+                         "opportunity_id,contact_id,title,organization,stage,amount,forecast_amount\n"
+                         'O1,A,"Big, ""quoted""\ndeal","Tea, ""Q""\nLine2",new,10.00,10.00\n')
+        # Organization changes are reflected from the current contact data.
+        self.app.update_contact("A", {"organization": "Coffee"})
+        moved = self.app.forecast_detail_report(probs)
+        self.assertEqual(moved["records"][0]["organization"], "Coffee")
+
+    def test_cli_forecast_detail_report(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},
+            {"opportunity_id": "O2", "expected_close_on": "2026-11-15"},
+        ])
+        payload = self.root / "detail.json"
+
+        def cli(action, row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   action, str(payload)],
+                                  text=True, capture_output=True)
+
+        probs = {"new": "50", "qualified": "25"}
+        ok = cli("forecast-detail-report", {"probabilities": probs})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual(result["total"], "100.00")
+        self.assertEqual([row["opportunity_id"] for row in result["records"]],
+                         ["O1", "O2", "O4"])
+        # An outer array is independent calls; results come back in order.
+        array_ok = cli("forecast-detail-report", [
+            {"probabilities": probs, "start_on": "2026-10-01", "end_on": "2026-10-31"},
+            {"probabilities": probs, "organization": "music"},
+        ])
+        self.assertEqual(array_ok.returncode, 0, array_ok.stderr)
+        values = json.loads(array_ok.stdout)
+        self.assertEqual([value["total"] for value in values], ["50.00", "0.00"])
+        # Validation failure: exit 2, empty stdout, JSON error, bytes preserved.
+        before = self.app.path.read_bytes()
+        bad = cli("forecast-detail-report", {"probabilities": probs, "start_on": "2026-10-01"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, "")
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Missing probabilities is a TypeError surfaced through the error envelope.
+        missing = cli("forecast-detail-report", {})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+
     def seed_qualified_durations(self):
         # Cutoff used by the tests: 2026-11-15. The raw document holds history
         # shapes the transition API cannot create (null-date exits, a stray
