@@ -1904,6 +1904,83 @@ class ContactFlow(JsonStore):
         organizations, csv_text = self._organization_result(groups, details, self.FORECAST_FIELDS)
         return {"total": money_row(totals), "organizations": organizations, "csv": csv_text}
 
+    MONTHLY_FORECAST_FIELDS = ("month", "new", "qualified", "amount")
+
+    def monthly_forecast_report(self, probabilities, start_on, end_on,
+                                organization=None, tags=None, tag_mode="all"):
+        if not isinstance(probabilities, dict) or set(probabilities) != {"new", "qualified"}:
+            raise ValueError("probabilities must be an object containing exactly new and qualified")
+        rates = {stage: forecast_probability(probabilities[stage], "probabilities." + stage)
+                 for stage in ("new", "qualified")}
+        # Both dates are required and never null; they reuse the real-calendar
+        # rule and the inclusive range compares before any data is read, so an
+        # empty store validates just the same.
+        start_on = calendar_day(start_on, "start_on")
+        end_on = calendar_day(end_on, "end_on")
+        if start_on > end_on:
+            raise ValueError("start_on must not be later than end_on")
+        _, scoped = self._organization_groups(organization, tags, tag_mode)
+
+        # Every calendar month the window touches appears once, ascending,
+        # even when no opportunity lands in it.
+        month_keys = []
+        year, month = int(start_on[:4]), int(start_on[5:7])
+        last_key = end_on[:7]
+        while True:
+            key = "%04d-%02d" % (year, month)
+            month_keys.append(key)
+            if key == last_key:
+                break
+            month += 1
+            if month > 12:
+                year, month = year + 1, 1
+
+        # Weighted sums stay unrounded: amount cents times probability
+        # hundredths, where weighted cents = raw / 10000. Each stage, month
+        # and the total rounds its own raw sum half up to the cent, never
+        # derived from rounded children.
+        def empty_counts():
+            return {"new": 0, "qualified": 0}
+
+        totals = empty_counts()
+        counts = {key: empty_counts() for key in month_keys}
+        for _, opportunity in scoped:
+            stage = opportunity["stage"]
+            # Only open opportunities count; won and lost never enter the forecast.
+            if stage not in ("new", "qualified"):
+                continue
+            # Only the opportunity's own maintained expected close date
+            # decides: a deal without one is excluded, and stage history dates
+            # are never borrowed as a substitute.
+            expected_close_on = opportunity.get("expected_close_on")
+            if expected_close_on is None or not start_on <= expected_close_on <= end_on:
+                continue
+            cents = amount_cents(opportunity["amount"]) if "amount" in opportunity else 0
+            raw = cents * rates[stage]
+            counts[expected_close_on[:7]][stage] += raw
+            totals[stage] += raw
+
+        def quantized_cents(raw):
+            return (raw + 5000) // 10000
+
+        def money_row(stage_counts):
+            return {"new": format_cents(quantized_cents(stage_counts["new"])),
+                    "qualified": format_cents(quantized_cents(stage_counts["qualified"])),
+                    "amount": format_cents(quantized_cents(stage_counts["new"] + stage_counts["qualified"]))}
+
+        months = []
+        for key in month_keys:
+            row = {"month": key}
+            row.update(money_row(counts[key]))
+            months.append(row)
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(self.MONTHLY_FORECAST_FIELDS)
+        for row in months:
+            writer.writerow(tuple(row[field] for field in self.MONTHLY_FORECAST_FIELDS))
+        return {"total": money_row(totals), "months": months, "csv": buffer.getvalue()}
+
     def followup_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
         end_on = calendar_day(end_on, "end_on")
