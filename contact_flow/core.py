@@ -3,7 +3,7 @@ import io
 import json
 import unicodedata
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from .storage import JsonStore, text, calendar_day, positive, amount_string, amount_cents, format_cents
 
@@ -143,14 +143,22 @@ def _tag_expression_predicate(expression):
         raise ValueError("unexpected content after complete tag expression")
     return predicate
 
-# Distinguishes an omitted next_reminder (auto-renew a monthly reminder) from
+# Distinguishes an omitted next_reminder (auto-renew a repeating reminder) from
 # an explicit None (terminate repetition and clear the reminder).
 _UNSET = object()
+
+def _repeat_days(reminder):
+    # Reminders saved before fixed-interval repetition existed lack the field
+    # and read as one-time reminders.
+    value = reminder.get("repeat_days")
+    return value if type(value) is int and value > 0 else None
 
 def _is_repeating(reminder):
     # Reminders saved before monthly repetition existed lack both fields and
     # read as one-time reminders.
-    return reminder.get("repeat_monthly") is True and type(reminder.get("anchor_day")) is int
+    if reminder.get("repeat_monthly") is True and type(reminder.get("anchor_day")) is int:
+        return True
+    return _repeat_days(reminder) is not None
 
 def _next_monthly_due(due_on, anchor_day, on):
     # Candidates run from the month after the current due date, pinned to the
@@ -171,9 +179,30 @@ def _next_monthly_due(due_on, anchor_day, on):
         if month > 12:
             year, month = year + 1, 1
 
+def _next_interval_due(due_on, days, on):
+    # Candidates step from the current due date in whole intervals; the first
+    # candidate strictly later than the completion date wins, so completing
+    # early still advances at least one period and skipped periods stay skipped.
+    start = date.fromisoformat(due_on)
+    completed = date.fromisoformat(on)
+    limit = date(9999, 12, 31)
+    if days > (limit - start).days:
+        raise ValueError("next reminder due_on would exceed 9999-12-31")
+    periods = max(1, (completed - start).days // days + 1)
+    candidate = start + timedelta(days=periods * days)
+    if candidate > limit:
+        raise ValueError("next reminder due_on would exceed 9999-12-31")
+    return candidate.isoformat()
+
 def _renewed_reminder(current, on):
     # Auto-renewal keeps the original note and repetition rule; the completion
     # note only goes into the followup record.
+    days = _repeat_days(current)
+    if days is not None:
+        return {"contact_id": current["contact_id"],
+                "due_on": _next_interval_due(current["due_on"], days, on),
+                "note": current["note"],
+                "repeat_days": days}
     return {"contact_id": current["contact_id"],
             "due_on": _next_monthly_due(current["due_on"], current["anchor_day"], on),
             "note": current["note"],
@@ -711,13 +740,19 @@ class ContactFlow(JsonStore):
         self._write(data)
         return entry
 
-    def set_reminder(self, contact_id, due_on, note, repeat_monthly=False):
+    def set_reminder(self, contact_id, due_on, note, repeat_monthly=False, repeat_days=None):
         contact_id = text(contact_id, "contact_id")
         note = text(note, "note")
         due_on = calendar_day(due_on, "due_on")
         # Only a real boolean toggles repetition; ints, strings and null reject.
         if type(repeat_monthly) is not bool:
             raise ValueError("repeat_monthly must be a boolean")
+        # An omitted or null repeat_days keeps the reminder non-interval; a
+        # provided one must be a positive integer (bools are not ints here).
+        if repeat_days is not None:
+            repeat_days = positive(repeat_days, "repeat_days")
+            if repeat_monthly:
+                raise ValueError("repeat_days cannot be combined with repeat_monthly")
         data = self._read()
         if contact_id not in data.get("contacts", {}):
             raise ValueError("unknown contact")
@@ -728,6 +763,8 @@ class ContactFlow(JsonStore):
             # The first due date's day of month anchors every later renewal.
             reminder["repeat_monthly"] = True
             reminder["anchor_day"] = int(due_on[8:10])
+        if repeat_days is not None:
+            reminder["repeat_days"] = repeat_days
         data.setdefault("reminders", {})[contact_id] = reminder
         self._write(data)
         return dict(reminder)
@@ -769,8 +806,8 @@ class ContactFlow(JsonStore):
         if current is None:
             raise ValueError("no current reminder")
         if next_reminder is _UNSET and _is_repeating(current):
-            # An omitted next_reminder renews a monthly reminder from its anchor
-            # instead of clearing it; an explicit null still terminates it.
+            # An omitted next_reminder renews a repeating reminder from its
+            # rule instead of clearing it; an explicit null still terminates it.
             pending = _renewed_reminder(current, on)
         # Followup append and reminder clear/replace commit in a single write.
         entry = {"contact_id": contact_id, "on": on, "note": note}
@@ -845,8 +882,8 @@ class ContactFlow(JsonStore):
             if current["due_on"] != expected_due_on:
                 raise ValueError("expected_due_on does not match the current reminder due_on")
             if pending is _UNSET:
-                # Omitted next_reminder: a monthly reminder renews from its
-                # anchor; a one-time reminder simply clears.
+                # Omitted next_reminder: a repeating reminder renews from its
+                # rule; a one-time reminder simply clears.
                 pending = _renewed_reminder(current, on) if _is_repeating(current) else None
             entry = {"contact_id": contact_id, "on": on, "note": note}
             planned.append((contact_id, entry, pending))
@@ -922,8 +959,8 @@ class ContactFlow(JsonStore):
         if all(current == updated for current, updated in planned):
             return [dict(updated) for _, updated in planned]
         # Only due_on changes: the note and any existing repeat_monthly /
-        # anchor_day fields carry over verbatim, and one-time reminders gain no
-        # repetition fields.
+        # anchor_day / repeat_days fields carry over verbatim, and one-time
+        # reminders gain no repetition fields.
         for current, updated in planned:
             current["due_on"] = updated["due_on"]
         self._write(data)
