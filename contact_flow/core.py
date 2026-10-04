@@ -2043,6 +2043,84 @@ class ContactFlow(JsonStore):
         self._write(data)
         return results
 
+    def remove_followups(self, removals):
+        # Delete wrongly recorded followups as one atomic batch. The whole
+        # batch validates against the pre-call timelines before any record is
+        # deleted, so a rejected batch never touches the file; every deletion
+        # commits in a single write.
+        if not isinstance(removals, list):
+            raise ValueError("removals must be a list")
+        if not removals:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        removal_keys = {"contact_id", "index", "expected_on", "expected_note"}
+        entries = []
+        seen = set()
+        for item in removals:
+            if not isinstance(item, dict) or set(item) != removal_keys:
+                raise ValueError(
+                    "each removal must be an object with exactly contact_id, index, "
+                    "expected_on and expected_note")
+            contact_id = text(item["contact_id"], "contact_id")
+            # type(...) is int rejects bools, which are ints in Python but never an index.
+            index = item["index"]
+            if type(index) is not int or index < 0:
+                raise ValueError("index must be a nonnegative integer")
+            # The expected values pin the selected record verbatim: they must be
+            # strings and are compared exactly, never normalized, trimmed or
+            # reformatted into a date.
+            expected_on = item["expected_on"]
+            if not isinstance(expected_on, str):
+                raise ValueError("expected_on must be a string")
+            expected_note = item["expected_note"]
+            if not isinstance(expected_note, str):
+                raise ValueError("expected_note must be a string")
+            # Normalized ids are case-sensitive; the same timeline position of
+            # one contact may appear only once, even when both items are identical.
+            if (contact_id, index) in seen:
+                raise ValueError("duplicate removal for the same contact and index")
+            seen.add((contact_id, index))
+            entries.append((contact_id, index, expected_on, expected_note))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        followups = data.get("followups", [])
+        # Indices address the timeline as it was when the call started: date
+        # ascending, save order on ties. Resolving every record before deleting
+        # anything keeps later positions pointing at the same pre-call records,
+        # so an earlier deletion never shifts what a later index selects.
+        timelines = {}
+        doomed = set()
+        results = []
+        for contact_id, index, expected_on, expected_note in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            timeline = timelines.get(contact_id)
+            if timeline is None:
+                # Contacts without any followups (including old data) read as empty.
+                timeline = sorted((entry for entry in followups if entry["contact_id"] == contact_id),
+                                  key=lambda entry: entry["on"])
+                timelines[contact_id] = timeline
+            if index >= len(timeline):
+                raise ValueError("index out of range for followup timeline")
+            record = timeline[index]
+            if record["on"] != expected_on or record["note"] != expected_note:
+                raise ValueError("expected values do not match the followup record")
+            # Content-identical records stay distinct by position; only the
+            # selected records are removed, by object identity in the stored list.
+            doomed.add(id(record))
+            results.append({"contact_id": contact_id, "on": record["on"], "note": record["note"]})
+        # Everything validated; surviving records keep their content and their
+        # relative save order within the stored collection. A nonempty valid
+        # batch always removes at least one record, so the file is rewritten.
+        remaining = [entry for entry in followups if id(entry) not in doomed]
+        if remaining:
+            data["followups"] = remaining
+        else:
+            # The collection is empty afterwards: drop it, matching no-followups behavior.
+            data.pop("followups", None)
+        self._write(data)
+        return results
+
     def stage_change_report(self, start_on, end_on, organization=None, tags=None, tag_mode="all"):
         start_on = calendar_day(start_on, "start_on")
         end_on = calendar_day(end_on, "end_on")
