@@ -5067,6 +5067,314 @@ class ProductTests(unittest.TestCase):
                          [{"contact_id": "B", "due_on": "2026-10-05", "note": "b note"}])
         self.assertEqual(reopened.timeline("B"), [])
 
+    def seed_postpone(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("陈", "Chen", "c@example.test", "Games")
+        self.app.set_tags("A", ["vip", "华东"])
+        self.app.follow_up("A", "2026-10-01", "first")
+        self.app.add_opportunity("O1", "A", "Deal one")
+        self.app.set_stage("O1", "qualified", on="2026-09-01")
+        self.app.set_reminder("A", "2026-10-05", "  keep note  ")
+        self.app.set_reminder("B", "2026-09-30", "b note")
+        self.app.set_reminder("陈", "2026-11-05", "每月", repeat_monthly=True)
+
+    def test_postpone_reminders_moves_only_due_on_and_returns_full_reminders_in_order(self):
+        self.seed_postpone()
+        # A past due date can move to a later past date, including a legal leap day.
+        self.app.set_reminder("A", "2024-01-31", "  keep note  ")
+        result = self.app.postpone_reminders([
+            {"contact_id": " B ", "expected_due_on": " 2026-09-30 ", "due_on": " 2026-12-01 "},
+            {"contact_id": "陈", "expected_due_on": "2026-11-05", "due_on": "2027-02-28"},
+            {"contact_id": "A", "expected_due_on": "2024-01-31", "due_on": "2024-02-29"},
+        ])
+        # Input order, complete reminders with every existing field preserved.
+        self.assertEqual(result, [
+            {"contact_id": "B", "due_on": "2026-12-01", "note": "b note"},
+            {"contact_id": "陈", "due_on": "2027-02-28", "note": "每月",
+             "repeat_monthly": True, "anchor_day": 5},
+            # Past dates, cross-year and legal leap days are allowed.
+            {"contact_id": "A", "due_on": "2024-02-29", "note": "keep note"},
+        ])
+        # One-time reminders gain no repetition fields; repeating ones keep theirs.
+        self.assertTrue(all(set(r) == {"contact_id", "due_on", "note"} for r in result[:1] + result[2:]))
+        reopened = ContactFlow(self.root)
+        self.assertEqual(reopened.due_reminders("2099-12-31"), [
+            {"contact_id": "A", "due_on": "2024-02-29", "note": "keep note"},
+            {"contact_id": "B", "due_on": "2026-12-01", "note": "b note"},
+            {"contact_id": "陈", "due_on": "2027-02-28", "note": "每月",
+             "repeat_monthly": True, "anchor_day": 5},
+        ])
+        # due-reminders judges by the new dates: nothing is due before them.
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2026-10-05")],
+                         [("A", "2024-02-29")])
+        # No followup is appended by postponing.
+        self.assertEqual([(r["on"], r["note"]) for r in reopened.timeline("B")], [])
+        self.assertEqual(len(reopened.timeline("A")), 1)
+
+    def test_postpone_reminders_equal_date_returns_original_without_rewrite(self):
+        self.seed_postpone()
+        before = self.app.path.read_bytes()
+        result = self.app.postpone_reminders([
+            {"contact_id": " A ", "expected_due_on": " 2026-10-05 ", "due_on": "2026-10-05"},
+            {"contact_id": "陈", "expected_due_on": "2026-11-05", "due_on": "2026-11-05"},
+        ])
+        self.assertEqual(result, [
+            {"contact_id": "A", "due_on": "2026-10-05", "note": "keep note"},
+            {"contact_id": "陈", "due_on": "2026-11-05", "note": "每月",
+             "repeat_monthly": True, "anchor_day": 5},
+        ])
+        # An all-equal batch reports the reminders but never rewrites the file.
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_postpone_reminders_mixed_equal_and_changed_writes_once(self):
+        self.seed_postpone()
+        result = self.app.postpone_reminders([
+            {"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2026-10-05"},
+            {"contact_id": "B", "expected_due_on": "2026-09-30", "due_on": "2026-10-20"},
+        ])
+        self.assertEqual([r["due_on"] for r in result], ["2026-10-05", "2026-10-20"])
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2099-12-31")
+                          if r["contact_id"] in ("A", "B")],
+                         [("A", "2026-10-05"), ("B", "2026-10-20")])
+
+    def test_postpone_reminders_requires_list_and_missing_argument_is_type_error(self):
+        for bad in [None, {}, "x", 5, True, ({"contact_id": "A"},)]:
+            with self.assertRaises(ValueError):
+                self.app.postpone_reminders(bad)
+        self.assertFalse(self.app.path.exists())
+        with self.assertRaises(TypeError):
+            self.app.postpone_reminders()
+
+    def test_postpone_reminders_empty_list_writes_nothing(self):
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        self.assertEqual(fresh.postpone_reminders([]), [])
+        self.assertFalse(fresh_root.exists())
+        self.seed_postpone()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.postpone_reminders([]), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_postpone_reminders_validates_item_shape_and_fields_without_partial_changes(self):
+        self.seed_postpone()
+        before = self.app.path.read_bytes()
+        good = {"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2026-11-01"}
+        bad_batches = [
+            [None], [5], ["x"], [[]], [{}],
+            [{"contact_id": "A", "expected_due_on": "2026-10-05"}],
+            [{"contact_id": "A", "due_on": "2026-11-01"}],
+            [{"expected_due_on": "2026-10-05", "due_on": "2026-11-01"}],
+            [dict(good, extra="y")],
+            [dict(good, contact_id=None)], [dict(good, contact_id=5)], [dict(good, contact_id="  ")],
+            [dict(good, expected_due_on=None)], [dict(good, expected_due_on=5)],
+            [dict(good, expected_due_on="not-a-date")], [dict(good, expected_due_on="2026-02-30")],
+            [dict(good, expected_due_on="2026-1-1")], [dict(good, expected_due_on="2023-02-29")],
+            [dict(good, due_on=None)], [dict(good, due_on=5)],
+            [dict(good, due_on="not-a-date")], [dict(good, due_on="2026-02-30")],
+            # The new date must not be earlier than the (validated) expected date.
+            [{"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2026-10-04"}],
+            [{"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2024-02-28"}],
+            # A valid first item followed by an invalid second item rolls both back.
+            [good,
+             {"contact_id": "B", "expected_due_on": "2026-09-30", "due_on": "bad"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError):
+                self.app.postpone_reminders(batch)
+            self.assertEqual(self.app.path.read_bytes(), before)
+        # No rejection moved a reminder.
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2099-12-31")],
+                         [("B", "2026-09-30"), ("A", "2026-10-05"), ("陈", "2026-11-05")])
+
+    def test_postpone_reminders_rejects_duplicate_unknown_missing_and_mismatch_atomically(self):
+        self.seed_postpone()
+        before = self.app.path.read_bytes()
+        good_a = {"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}
+        # Duplicate normalized id, even after trimming or with a different date,
+        # rejects the whole batch.
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([
+                dict(good_a, contact_id=" A "),
+                dict(good_a, contact_id="A", due_on="2026-12-02")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([good_a, dict(good_a, due_on="2027-01-01")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Ids are case-sensitive: lowercase a is unknown.
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([dict(good_a, contact_id="a")])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Unknown contact rejects even when it is the only item.
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([
+                {"contact_id": "ZZZ", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A contact without a reminder rejects a batch where an earlier item is valid.
+        self.app.add_contact("N", "Nina", "n@example.test", "Books")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([
+                good_a,
+                {"contact_id": "N", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # An expected-due mismatch rejects the batch, even though the new date
+        # is later than both.
+        with self.assertRaises(ValueError):
+            self.app.postpone_reminders([
+                good_a,
+                {"contact_id": "B", "expected_due_on": "2026-09-29", "due_on": "2026-12-01"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        reopened = ContactFlow(self.root)
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2099-12-31")],
+                         [("B", "2026-09-30"), ("A", "2026-10-05"), ("陈", "2026-11-05")])
+        # A rejected batch against a root that never existed creates neither directory nor file.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.postpone_reminders([
+                {"contact_id": "ZZZ", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}])
+        self.assertFalse(fresh_root.exists())
+
+    def test_postpone_reminders_on_legacy_data_missing_reminders(self):
+        # Legacy document with contacts but no reminders collection: every
+        # reminder is absent, so a nonempty batch is rejected and bytes stay.
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        contact = {"contact_id": "L", "name": "Lee", "email": "l@example.test",
+                   "organization": "Old"}
+        (legacy / "data.json").write_text(json.dumps({"contacts": {"L": contact}}),
+                                          encoding="utf-8")
+        app = ContactFlow(legacy)
+        before = (legacy / "data.json").read_bytes()
+        with self.assertRaises(ValueError):
+            app.postpone_reminders([
+                {"contact_id": "L", "expected_due_on": "2026-10-05", "due_on": "2026-11-01"}])
+        self.assertEqual((legacy / "data.json").read_bytes(), before)
+        self.assertEqual(ContactFlow(legacy).due_reminders("2099-01-01"), [])
+
+    def test_postpone_reminders_preserves_contacts_tags_deals_and_later_renewal(self):
+        self.seed_postpone()
+        before_contacts = {c["contact_id"]: dict(c) for c in self.app.find()}
+        funnel_before = self.app.funnel_report()
+        self.app.postpone_reminders([
+            {"contact_id": "陈", "expected_due_on": "2026-11-05", "due_on": "2027-01-31"}])
+        reopened = ContactFlow(self.root)
+        # Contact profile, tags, followups, opportunity and stage history stay.
+        self.assertEqual({c["contact_id"]: c for c in reopened.find()}, before_contacts)
+        self.assertEqual(reopened.get_tags("A"), ["vip", "华东"])
+        self.assertEqual(reopened.find_opportunities(contact_id="A"),
+                         [{"opportunity_id": "O1", "contact_id": "A", "title": "Deal one",
+                           "stage": "qualified"}])
+        self.assertEqual(reopened.stage_history("O1"),
+                         [{"from_stage": "new", "to_stage": "qualified", "on": "2026-09-01"}])
+        self.assertEqual(reopened.funnel_report(), funnel_before)
+        self.assertEqual([r["note"] for r in reopened.timeline("A")], ["first"])
+        # The repeating reminder keeps its original anchor day; completing it
+        # later renews from the postponed due month, pinned to the anchor.
+        done = reopened.complete_reminder("陈", "2027-01-31", "done")
+        self.assertEqual(done["reminder"],
+                         {"contact_id": "陈", "due_on": "2027-02-05", "note": "每月",
+                          "repeat_monthly": True, "anchor_day": 5})
+
+    def test_cli_postpone_reminders_object_array_and_failure(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.add_contact("C", "Cara", "c@example.test", "Music")
+        self.app.set_reminder("A", "2026-10-05", "a note")
+        self.app.set_reminder("B", "2026-10-05", "b note")
+        self.app.set_reminder("C", "2026-10-05", "c note")
+        payload = self.root / "postpones.json"
+
+        def cli(row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   "postpone-reminders", str(payload)],
+                                  text=True, capture_output=True)
+
+        # Object input: one atomic batch, exit 0, JSON array on stdout.
+        ok = cli({"updates": [
+            {"contact_id": " A ", "expected_due_on": " 2026-10-05 ", "due_on": " 2026-12-01 "},
+            {"contact_id": "B", "expected_due_on": "2026-10-05", "due_on": "2026-10-05"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), [
+            {"contact_id": "A", "due_on": "2026-12-01", "note": "a note"},
+            {"contact_id": "B", "due_on": "2026-10-05", "note": "b note"},
+        ])
+
+        # Empty list prints [] and creates nothing in a fresh root.
+        empty_root = self.root / "empty"
+        quiet = cli({"updates": []}, root=empty_root)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(json.loads(quiet.stdout), [])
+        self.assertFalse(empty_root.exists())
+
+        # Validation failure (due date mismatch): exit 2, empty stdout, JSON
+        # error on stderr, byte-for-byte rollback.
+        before = self.app.path.read_bytes()
+        failed = cli({"updates": [
+            {"contact_id": "C", "expected_due_on": "2026-10-04", "due_on": "2026-12-01"},
+        ]})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A's earlier successful batch still stands at December; C is untouched.
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in ContactFlow(self.root).due_reminders("2026-10-05")],
+                         [("B", "2026-10-05"), ("C", "2026-10-05")])
+        # updates not a list surfaces as an error envelope.
+        not_list = cli({"updates": {"contact_id": "C"}})
+        self.assertEqual(not_list.returncode, 2)
+        self.assertEqual(not_list.stdout, "")
+        self.assertIn("error", json.loads(not_list.stderr))
+        # Missing the required parameter is a TypeError through the same envelope.
+        missing = cli({})
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("error", json.loads(missing.stderr))
+        # A failure against a nonexistent root leaves no directory or file behind.
+        gone_root = self.root / "gone"
+        gone = cli({"updates": [
+            {"contact_id": "ZZZ", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}]},
+            root=gone_root)
+        self.assertEqual(gone.returncode, 2)
+        self.assertEqual(gone.stdout, "")
+        self.assertFalse(gone_root.exists())
+
+    def test_cli_postpone_reminders_outer_array_keeps_earlier_batches(self):
+        self.app.add_contact("A", "Alice", "a@example.test", "Books")
+        self.app.add_contact("B", "Bob", "b@example.test", "Books")
+        self.app.set_reminder("A", "2026-10-05", "a note")
+        self.app.set_reminder("B", "2026-10-05", "b note")
+        payload = self.root / "batches.json"
+        # Outer array runs whole batches independently; a later failed batch
+        # keeps the earlier successful batch.
+        payload.write_text(json.dumps([
+            {"updates": [
+                {"contact_id": "A", "expected_due_on": "2026-10-05", "due_on": "2026-12-01"}]},
+            {"updates": [
+                {"contact_id": "B", "expected_due_on": "2026-09-30", "due_on": "2026-12-01"}]},
+        ]), encoding="utf-8")
+        partial = subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(self.root),
+                                  "postpone-reminders", str(payload)],
+                                 text=True, capture_output=True)
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        reopened = ContactFlow(self.root)
+        # Batch one committed; batch two (mismatched expected date) did not.
+        self.assertEqual([(r["contact_id"], r["due_on"])
+                          for r in reopened.due_reminders("2099-01-01")],
+                         [("B", "2026-10-05"), ("A", "2026-12-01")])
+
     def seed_stage_deals(self):
         self.app.add_contact("A", "Alice", "alice@example.test", "Books")
         self.app.add_contact("B", "Bob", "bob@example.test", "Music")

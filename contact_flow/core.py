@@ -866,6 +866,69 @@ class ContactFlow(JsonStore):
         self._write(data)
         return results
 
+    def postpone_reminders(self, updates):
+        # Move reminders' due dates only: no followup is appended and no
+        # reminder is rebuilt. The whole batch validates against the pre-call
+        # reminders before any due date changes, so a rejected item never
+        # leaves part of the batch postponed; every change commits in one write.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be a list")
+        if not updates:
+            # An empty batch succeeds with an empty result and never touches storage.
+            return []
+        update_keys = {"contact_id", "expected_due_on", "due_on"}
+        entries = []
+        seen = set()
+        for item in updates:
+            if not isinstance(item, dict) or set(item) != update_keys:
+                raise ValueError(
+                    "each update must be an object with exactly contact_id, "
+                    "expected_due_on and due_on")
+            contact_id = text(item["contact_id"], "contact_id")
+            # Both dates reuse the real-calendar rule (trimmed YYYY-MM-DD, past,
+            # future, cross-year and legal leap days allowed, no system clock).
+            expected_due_on = calendar_day(item["expected_due_on"], "expected_due_on")
+            due_on = calendar_day(item["due_on"], "due_on")
+            # The new due date may stay the same but must not move backwards.
+            if due_on < expected_due_on:
+                raise ValueError("due_on must not be earlier than expected_due_on")
+            # Normalized ids are case-sensitive; a repeated contact id (even an
+            # identical item) rejects the whole batch.
+            if contact_id in seen:
+                raise ValueError("duplicate contact id in updates")
+            seen.add(contact_id)
+            entries.append((contact_id, expected_due_on, due_on))
+        data = self._read()
+        contacts = data.get("contacts", {})
+        store = data.get("reminders", {})
+        planned = []
+        for contact_id, expected_due_on, due_on in entries:
+            if contact_id not in contacts:
+                raise ValueError("unknown contact")
+            current = store.get(contact_id)
+            if current is None:
+                raise ValueError("no current reminder")
+            # Every check uses the pre-call state: the current due date must
+            # equal the expected one, even when the same contact appears only
+            # once in the batch.
+            if current["due_on"] != expected_due_on:
+                raise ValueError("expected_due_on does not match the current reminder due_on")
+            updated = dict(current)
+            updated["due_on"] = due_on
+            planned.append((current, updated))
+        # Results are the complete reminders in input order; an unchanged item
+        # reports its original reminder. When every date already matches, report
+        # the reminders without rewriting the file.
+        if all(current == updated for current, updated in planned):
+            return [dict(updated) for _, updated in planned]
+        # Only due_on changes: the note and any existing repeat_monthly /
+        # anchor_day fields carry over verbatim, and one-time reminders gain no
+        # repetition fields.
+        for current, updated in planned:
+            current["due_on"] = updated["due_on"]
+        self._write(data)
+        return [dict(updated) for _, updated in planned]
+
     def due_reminders(self, as_of):
         as_of = calendar_day(as_of, "as_of")
         data = self._read()
