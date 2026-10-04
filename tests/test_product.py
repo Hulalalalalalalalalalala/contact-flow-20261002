@@ -6810,6 +6810,166 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(window_bad.stdout, "")
         self.assertIn("error", json.loads(window_bad.stderr))
 
+    def test_monthly_forecast_report_groups_by_month_and_matches_windowed_total(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},   # new, 100.00
+            {"opportunity_id": "O2", "expected_close_on": "2026-11-15"},   # qualified, 200.00
+            {"opportunity_id": "O3", "expected_close_on": "2026-10-10"},   # won, excluded
+            {"opportunity_id": "O4", "expected_close_on": "2026-12-31"},   # new, no amount
+        ])
+        probs = {"new": "50", "qualified": "25"}
+        report = self.app.monthly_forecast_report(probs, "2026-10-01", "2026-12-31")
+        # Every month the window touches appears, including the empty December
+        # (O4 has no amount, so it contributes 0.00 there).
+        self.assertEqual(report["months"], [
+            {"month": "2026-10", "new": "50.00", "qualified": "0.00", "amount": "50.00"},
+            {"month": "2026-11", "new": "0.00", "qualified": "50.00", "amount": "50.00"},
+            {"month": "2026-12", "new": "0.00", "qualified": "0.00", "amount": "0.00"},
+        ])
+        # The total equals the windowed forecast_report total for the same input.
+        windowed = self.app.forecast_report(probs, start_on="2026-10-01", end_on="2026-12-31")
+        self.assertEqual(report["total"], windowed["total"])
+        self.assertEqual(report["total"], {"new": "50.00", "qualified": "50.00", "amount": "100.00"})
+        self.assertEqual(set(report), {"total", "months", "csv"})
+        self.assertEqual(report["csv"],
+                         "month,new,qualified,amount\n"
+                         "2026-10,50.00,0.00,50.00\n"
+                         "2026-11,0.00,50.00,50.00\n"
+                         "2026-12,0.00,0.00,0.00\n")
+
+        # Cross-year windows list every touched month in ascending order, and
+        # the first/last months only count in-window dates.
+        spanning = self.app.monthly_forecast_report(probs, "2026-12-15", "2027-02-10")
+        self.assertEqual([row["month"] for row in spanning["months"]],
+                         ["2026-12", "2027-01", "2027-02"])
+        self.assertEqual(spanning["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        # A legal leap day is accepted and lands in its month.
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2028-02-29"}])
+        leap = self.app.monthly_forecast_report(probs, "2028-02-01", "2028-02-29")
+        self.assertEqual(leap["months"],
+                         [{"month": "2028-02", "new": "50.00", "qualified": "0.00", "amount": "50.00"}])
+        self.app.set_close_dates([{"opportunity_id": "O1", "expected_close_on": "2026-10-05"}])
+
+        # Independent per-level rounding: two 0.01 deals at 50% in different
+        # months each round half a cent up to 0.01, while the total carries
+        # the combined raw cent and stays 0.01 instead of the summed 0.02.
+        self.app.set_opportunity_amount("O4", "0.01")
+        self.app.add_contact("D", "Dan", "d@example.test", "Games")
+        self.app.add_opportunity("O7", "D", "Small games deal")
+        self.app.set_opportunity_amount("O7", "0.01")
+        self.app.set_close_dates([{"opportunity_id": "O7", "expected_close_on": "2026-11-20"}])
+        rounded = self.app.monthly_forecast_report(probs, "2026-11-01", "2026-12-31")
+        by_month = {row["month"]: row for row in rounded["months"]}
+        self.assertEqual(by_month["2026-11"]["new"], "0.01")
+        self.assertEqual(by_month["2026-12"]["new"], "0.01")
+        self.assertEqual(rounded["total"]["new"], "0.01")
+
+        # Organization/tag filters intersect the window exactly like forecast_report.
+        music = self.app.monthly_forecast_report(probs, "2026-10-01", "2026-12-31",
+                                                 organization="music")
+        self.assertEqual(music["total"], {"new": "0.01", "qualified": "0.00", "amount": "0.01"})
+        self.app.set_tags("A", ["vip"])
+        tagged = self.app.monthly_forecast_report(probs, "2026-10-01", "2026-12-31", tags=["vip"])
+        self.assertEqual(tagged["total"], windowed["total"])
+        none_matched = self.app.monthly_forecast_report(probs, "2026-10-01", "2026-12-31",
+                                                        tags=["missing"])
+        self.assertEqual(none_matched["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual([row["month"] for row in none_matched["months"]],
+                         ["2026-10", "2026-11", "2026-12"])
+        self.assertTrue(all(row["amount"] == "0.00" for row in none_matched["months"]))
+
+    def test_monthly_forecast_report_validation_empty_store_and_readonly(self):
+        probs = {"new": "50", "qualified": "25"}
+        # Missing any required argument is a TypeError, not a ValueError.
+        with self.assertRaises(TypeError):
+            self.app.monthly_forecast_report()
+        with self.assertRaises(TypeError):
+            self.app.monthly_forecast_report(probs)
+        with self.assertRaises(TypeError):
+            self.app.monthly_forecast_report(probs, "2026-10-01")
+        for kwargs in [
+            {"probabilities": {"new": "50"}},                              # missing stage
+            {"probabilities": {"new": "50", "qualified": "25", "won": "10"}},
+            {"probabilities": {"new": "101", "qualified": "25"}},          # out of range
+            {"probabilities": {"new": "abc", "qualified": "25"}},          # not a number
+            {"probabilities": {"new": 50, "qualified": "25"}},             # not a string
+            {"start_on": None},                                            # null date
+            {"end_on": None},
+            {"start_on": "bad"},                                           # bad date
+            {"start_on": "2026-10-01", "end_on": "2026-02-30"},            # not a real date
+            {"start_on": 5},                                               # wrong type
+            {"start_on": "2026-11-01", "end_on": "2026-10-31"},            # start after end
+            {"organization": 5},                                           # bad filter
+            {"tags": "vip"},
+            {"tag_mode": "some"},
+        ]:
+            arguments = {"probabilities": probs, "start_on": "2026-10-01", "end_on": "2026-12-31"}
+            arguments.update(kwargs)
+            with self.assertRaises(ValueError):
+                self.app.monthly_forecast_report(**arguments)
+        # Validation runs even on an empty store, and creates nothing.
+        fresh_root = self.root / "fresh"
+        fresh = ContactFlow(fresh_root)
+        with self.assertRaises(ValueError):
+            fresh.monthly_forecast_report(probs, "2026-10-01", None)
+        report = fresh.monthly_forecast_report(probs, "2026-10-01", "2026-12-31")
+        self.assertEqual(report["total"], {"new": "0.00", "qualified": "0.00", "amount": "0.00"})
+        self.assertEqual(report["months"], [
+            {"month": "2026-10", "new": "0.00", "qualified": "0.00", "amount": "0.00"},
+            {"month": "2026-11", "new": "0.00", "qualified": "0.00", "amount": "0.00"},
+            {"month": "2026-12", "new": "0.00", "qualified": "0.00", "amount": "0.00"},
+        ])
+        self.assertEqual(report["csv"],
+                         "month,new,qualified,amount\n"
+                         "2026-10,0.00,0.00,0.00\n"
+                         "2026-11,0.00,0.00,0.00\n"
+                         "2026-12,0.00,0.00,0.00\n")
+        self.assertFalse(fresh_root.exists())
+        # A populated store is also untouched by the read-only query.
+        self.seed_close_dates()
+        before = self.app.path.read_bytes()
+        self.app.monthly_forecast_report(probs, "2026-10-01", "2026-12-31")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_monthly_forecast_report(self):
+        self.seed_close_dates()
+        self.app.set_close_dates([
+            {"opportunity_id": "O1", "expected_close_on": "2026-10-05"},
+            {"opportunity_id": "O2", "expected_close_on": "2026-11-15"},
+        ])
+        payload = self.root / "monthly.json"
+
+        def cli(action, row, root=self.root):
+            payload.write_text(json.dumps(row), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "contact_flow", "--root", str(root),
+                                   action, str(payload)],
+                                  text=True, capture_output=True)
+
+        probs = {"new": "50", "qualified": "25"}
+        ok = cli("monthly-forecast-report",
+                 {"probabilities": probs, "start_on": "2026-10-01", "end_on": "2026-12-31"})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual(result["total"], {"new": "50.00", "qualified": "50.00", "amount": "100.00"})
+        self.assertEqual([row["month"] for row in result["months"]],
+                         ["2026-10", "2026-11", "2026-12"])
+        # An outer array is independent calls; results come back in order.
+        array_ok = cli("monthly-forecast-report", [
+            {"probabilities": probs, "start_on": "2026-10-01", "end_on": "2026-10-31"},
+            {"probabilities": probs, "start_on": "2026-11-01", "end_on": "2026-11-30"},
+        ])
+        self.assertEqual(array_ok.returncode, 0, array_ok.stderr)
+        values = json.loads(array_ok.stdout)
+        self.assertEqual([value["total"]["amount"] for value in values], ["50.00", "50.00"])
+        # Validation failure: exit 2, empty stdout, JSON error, bytes preserved.
+        before = self.app.path.read_bytes()
+        bad = cli("monthly-forecast-report", {"probabilities": probs, "start_on": "2026-10-01"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, "")
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def seed_qualified_durations(self):
         # Cutoff used by the tests: 2026-11-15. The raw document holds history
         # shapes the transition API cannot create (null-date exits, a stray
